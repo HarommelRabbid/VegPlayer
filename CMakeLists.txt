@@ -27,6 +27,7 @@ add_executable(${PROJECT_NAME}
   src/mp4.c
   src/gpu.c
   src/scale.c
+  src/sharptext.c
   src/vdec.c
   src/adec.c
   src/image.c

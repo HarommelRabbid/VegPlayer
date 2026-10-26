@@ -476,7 +476,13 @@ static int new_event(St *s, const uint8_t *b, size_t bl)
         float lv = rdf(b + 0x6c);
         if (lv >= 0 && lv <= 16) e->level = lv;
     }
-    if (bl >= 0x98 && e->kind == VEG_KIND_AUDIO) {
+    e->fade_in_curve = e->fade_out_curve = e->kind == VEG_KIND_VIDEO ? VEG_CURVE_SMOOTH : VEG_CURVE_LINEAR;
+    if (bl >= 0x7c) {
+        int ci = (int32_t)rd32(b + 0x74), co = (int32_t)rd32(b + 0x78);
+        if (ci == 1 || ci == 2 || ci == -2 || ci == 4 || ci == -4) e->fade_in_curve = ci;
+        if (co == 1 || co == 2 || co == -2 || co == 4 || co == -4) e->fade_out_curve = co;
+    }
+    if (bl >= 0x98 && (e->kind == VEG_KIND_AUDIO || e->kind == VEG_KIND_VIDEO)) {
         e->fade_in = (double)rd64(b + 0x88) / VEG_TICKS;
         e->fade_out = (double)rd64(b + 0x90) / VEG_TICKS;
         if (e->fade_in > e->length) e->fade_in = e->length;
@@ -572,6 +578,8 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
             t->kind = ty == 3 ? VEG_KIND_VIDEO : ty == 2 ? VEG_KIND_AUDIO : VEG_KIND_OTHER;
         } else if (gpre(&c, G_COMP) && bl >= 0x84 && !in_event) {
             t->has_comp = 1; t->comp_a = rd32(b + 0x60); t->comp_b = (int32_t)rd32(b + 0x64);
+            float lv = rdf(b + 0x68);   /* track Level (opacity) */
+            if (lv >= 0 && lv <= 1) t->level = lv;
         } else if (gpre(&c, G_TRACKMOTION) && bl >= 136 && !in_event) {
             t->has_motion = 1;
             t->tm_x = rdd(b + 88); t->tm_y = rdd(b + 96); t->tm_w = rdd(b + 120); t->tm_h = rdd(b + 128);
@@ -610,6 +618,7 @@ static int find_tracks(St *s, size_t off, size_t end, int *tcap)
             VegTrack *t = &p->tracks[p->ntracks];
             memset(t, 0, sizeof *t);
             t->kind = VEG_KIND_OTHER;
+            t->level = 1.0f;
             s->track = p->ntracks++;
             s->cur = -1;
             if (walk_track(s, c.body, c.body + c.blen, 0) < 0) return -1;
@@ -619,6 +628,19 @@ static int find_tracks(St *s, size_t off, size_t end, int *tcap)
 }
 
 /* ------------------------------------------------------------------ public */
+
+float veg_fade_shape(int curve, double u)
+{
+    if (u <= 0) return 0;
+    if (u >= 1) return 1;
+    switch (curve) {
+    case VEG_CURVE_FAST:   return (float)(1 - (1 - u) * (1 - u));        /* rises quickly, then levels off */
+    case VEG_CURVE_SLOW:   return (float)(u * u);                        /* starts slowly */
+    case VEG_CURVE_SMOOTH: return (float)(u * u * (3 - 2 * u));          /* S-curve */
+    case VEG_CURVE_SHARP:  return (float)(0.5 - sin(asin(1 - 2 * u) / 3));   /* inverse S-curve */
+    default:               return (float)u;
+    }
+}
 
 static int cmp_ev(const void *a, const void *b)
 {

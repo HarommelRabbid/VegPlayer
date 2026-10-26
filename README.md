@@ -66,8 +66,10 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   saturation, luminance), Sepia and Brightness/Contrast. Each is an affine colour transform, so the whole chain is
   folded into one 3×4 matrix and applied by one GPU pass per layer. Unknown effects are listed on the Sources screen.
 - **Pan/Crop** keyframes (linear between keys, mirroring, rotation; like Vegas, the window is rescaled to the
-  source when the file you pick has another size or shape than the one the project was made with), **Track Motion** (first keyframe), event
-  opacity, crossfades between overlapping events, generator-track Add/Subtract compositing (guessed, like vegtool).
+  source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
+  (first keyframe), generator-track Add/Subtract compositing (guessed, like vegtool).
+- **Opacity**: video track Level, event fade-in/fade-out with their curves (Linear, Fast, Slow, Smooth, Sharp),
+  crossfades between overlapping events (dissolve).
 - **Audio pitch attribute** (Event Properties → Time stretch/pitch shift):
   - *None*: pitch follows the playback rate (plain resampling, cubic interpolation).
   - *élastique*: WSOLA time-stretch/pitch-shift (grains aligned by cross-correlation). zplane's élastique is
@@ -91,8 +93,18 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Vibrato plug-in | name match; parameter layout unknown | **guessed** (defaults: 5 Hz, 0.5 st) |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
+| Video track Level | `69d46c29` (compositing): float @0x68 | solid (Pinkiety: 0 %, 32.8 %, 35 %) |
+| Fade curves | event @0x74 (in) / @0x78 (out): 1 Linear, 2 Fast, −2 Slow, 4 Smooth, −4 Sharp | codes match Vegas's defaults (audio 2/−2, video 4); which word is in/out **guessed** |
 
 Options can override the guessed parts (stretch method, Pitch Shift mode, event level) if a project sounds wrong.
+
+## Text
+
+The UI draws text with `src/sharptext.c`, a drop-in replacement for `vita2d_pgf/pvf_draw_text`. vita2d renders each
+glyph once at its base size and scales the quads (point-sampled, pen truncated to whole pixels), which looks crusty
+below 1.0 and soft above it. sharptext makes the glyph image for the size it is drawn at and draws it 1:1 on whole
+pixels: PVF fonts (vector) are rasterised at that exact size; PGF fonts (bitmaps) are resampled once per size (area
+average when shrinking, Catmull-Rom when enlarging). Same arguments as vita2d, so it can be reused in other projects.
 
 ## How it stays fast
 

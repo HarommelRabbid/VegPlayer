@@ -11,9 +11,9 @@ vegdump: vegdump.c ../src/veg.c
 mp4test: mp4test.c ../src/mp4.c
 	$(CC) $(CFLAGS) $^ -o $@
 mixtest: mixtest.c ../src/mixer.c
-	$(CC) $(CFLAGS) -I$(VITAHEADERS) $^ -lm -o $@
+	$(CC) $(CFLAGS) -idirafter $(VITAHEADERS) $^ -lm -o $@
 pipetest: pipetest.c ../src/veg.c ../src/mixer.c ../src/scale.c
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -I$(VITAHEADERS) $^ -lm -o $@
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -idirafter $(VITAHEADERS) $^ -lm -o $@
 
 clean:
 	rm -f vegdump mp4test mixtest pipetest mix.raw

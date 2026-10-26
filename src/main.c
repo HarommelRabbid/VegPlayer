@@ -24,12 +24,13 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <vita2d.h>
+#include "sharptext.h"
 
 unsigned int _newlib_heap_size_user = 112 * 1024 * 1024;
 
 /* ------------------------------------------------------------------ drawing helpers */
 
-static vita2d_pgf *g_font;
+static stext_font *g_font;   /* sharptext: glyphs rendered at the size they're drawn (see sharptext.h) */
 #define COL_BG      RGBA8(18, 20, 26, 255)
 #define COL_PANEL   RGBA8(32, 36, 46, 255)
 #define COL_SEL     RGBA8(52, 92, 160, 255)
@@ -42,7 +43,7 @@ static vita2d_pgf *g_font;
 
 static int is_cjk(unsigned int c) { return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFF00 && c <= 0xFFEF) || (c >= 0x3000 && c <= 0x30FF); }
 
-static void text(int x, int y, unsigned col, float scale, const char *s) { vita2d_pgf_draw_text(g_font, x, y, col, scale, s); }
+static void text(int x, int y, unsigned col, float scale, const char *s) { stext_draw_text(g_font, x, y, col, scale, s); }
 static void textf(int x, int y, unsigned col, float scale, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
 static void textf(int x, int y, unsigned col, float scale, const char *fmt, ...)
 {
@@ -58,13 +59,13 @@ static void textf(int x, int y, unsigned col, float scale, const char *fmt, ...)
 static void fit(char *out, size_t n, const char *s, int maxw, float scale)
 {
     snprintf(out, n, "%s", s);
-    if (vita2d_pgf_text_width(g_font, scale, out) <= maxw) return;
+    if (stext_text_width(g_font, scale, out) <= maxw) return;
     const char *p = s;
     while (*p) {
         p++;
         while ((*p & 0xC0) == 0x80) p++;
         snprintf(out, n, "...%s", p);
-        if (vita2d_pgf_text_width(g_font, scale, out) <= maxw) return;
+        if (stext_text_width(g_font, scale, out) <= maxw) return;
     }
 }
 
@@ -598,12 +599,18 @@ int main(void)
     vita2d_init_advanced(4 * 1024 * 1024);   /* bigger per-frame pool: many layers + text */
     vita2d_set_clear_color(COL_BG);
     vita2d_set_vblank_wait(1);
-    static const vita2d_system_pgf_config fonts[] = {
+    /* PVF (vector) system fonts: sharp at every size; the PGF ones are the fallback */
+    static const vita2d_system_pvf_config pvf[] = {
+        { SCE_PVF_LANGUAGE_J, is_cjk },
+        { SCE_PVF_DEFAULT_LANGUAGE_CODE, NULL },
+    };
+    static const vita2d_system_pgf_config pgf[] = {
         { SCE_FONT_LANGUAGE_JAPANESE, is_cjk },
         { SCE_FONT_LANGUAGE_DEFAULT, NULL },
     };
-    g_font = vita2d_load_system_pgf(2, fonts);
-    if (!g_font) g_font = vita2d_load_default_pgf();
+    g_font = stext_load_system_pvf(2, pvf);
+    if (!g_font) { LOG("PVF fonts unavailable, using PGF"); g_font = stext_load_system_pgf(2, pgf); }
+    if (!g_font) g_font = stext_load_default_pgf();
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
 
     /* shaders first: the first run compiles them (needs ur0:data/libshacccg.suprx), later runs load the .gxp */
@@ -648,7 +655,7 @@ quit:
     audio_stop();
     session_close();
     gpu_fini();
-    if (g_font) vita2d_free_pgf(g_font);
+    if (g_font) stext_free(g_font);
     vita2d_fini();
     sceKernelExitProcess(0);
     return 0;

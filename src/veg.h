@@ -65,7 +65,8 @@ typedef struct {
     int media;              /* index into VegProject.media, -1 if none */
     char take_name[160];
     float level;            /* audio gain / video opacity (1 = 100%) */
-    double fade_in, fade_out; /* seconds */
+    double fade_in, fade_out; /* seconds (audio and video events) */
+    int fade_in_curve, fade_out_curve; /* VEG_CURVE_* */
     double xfade_in, xfade_out; /* overlap with the previous / next event on the same track (crossfade) */
     /* audio time stretch / pitch */
     int has_stretch, stretch_method, stretch_attr;
@@ -77,11 +78,17 @@ typedef struct {
     VegAfx *afx; int nafx;
 } VegEvent;
 
+/* fade curve types, as Vegas stores them (event chunk @0x74 fade in, @0x78 fade out) */
+enum { VEG_CURVE_LINEAR = 1, VEG_CURVE_FAST = 2, VEG_CURVE_SLOW = -2, VEG_CURVE_SMOOTH = 4, VEG_CURVE_SHARP = -4 };
+/* gain 0..1 along a fade-in at progress u (0..1); a fade-out at progress u has gain 1 - veg_fade_shape(curve, u) */
+float veg_fade_shape(int curve, double u);
+
 typedef struct {
     int kind;              /* VEG_KIND_AUDIO / VEG_KIND_VIDEO (from the track header; OTHER if unknown) */
     int first_event, nevents;   /* events of this track are events[first_event .. first_event+nevents) sorted by start */
     int has_motion; double tm_x, tm_y, tm_w, tm_h;  /* Track Motion (first keyframe) */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing mode (codes partly guessed) */
+    float level;           /* video track opacity / composite level (1 = 100%) */
     VegVfx *vfx; int nvfx;  /* track-level video FX */
     VegAfx *afx; int nafx;  /* track-level audio FX */
 } VegTrack;

@@ -262,8 +262,14 @@ static void build(Scene *sc, int buf, double T)
             place(p, e, tr, tau, pw, ph, L->x, L->y);
             chain_matrix(e, tr, L->m);
             L->fx = !cm_is_identity(L->m);
-            float a = tint[3] * (g_cfg.apply_event_level ? e->level : 1.0f);
-            if (e->xfade_in > 0 && tau < e->xfade_in) a *= (float)(tau / e->xfade_in);
+            float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
+            /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
+             * the fade-out is left out where the next event overlaps, since that one dissolves in on top */
+            double fin = e->fade_in > e->xfade_in ? e->fade_in : e->xfade_in;
+            if (fin > 0 && tau < fin) a *= veg_fade_shape(e->fade_in_curve, tau / fin);
+            double rem = e->length - tau;
+            if (e->fade_out > 0 && e->xfade_out <= 0 && rem < e->fade_out)
+                a *= 1.0f - veg_fade_shape(e->fade_out_curve, 1.0 - rem / e->fade_out);
             if (a <= 0.002f) continue;
             L->tint[0] = tint[0]; L->tint[1] = tint[1]; L->tint[2] = tint[2]; L->tint[3] = a > 1 ? 1 : a;
             L->blend = BLEND_NORMAL;

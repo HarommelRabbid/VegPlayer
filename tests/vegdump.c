@@ -29,8 +29,15 @@ int main(int argc, char **argv)
             printf("  track %2d %s events=%4d%s%s", t, tr->kind == VEG_KIND_VIDEO ? "video" : tr->kind == VEG_KIND_AUDIO ? "audio" : "other",
                    tr->nevents, tr->has_motion ? " motion" : "", tr->has_comp ? " comp" : "");
             if (tr->has_comp) printf("(%u,%d)", tr->comp_a, tr->comp_b);
+            if (tr->level != 1.0f) printf(" level=%.1f%%", tr->level * 100);
             if (tr->has_motion) printf(" tm=(%.3f,%.3f,%.3f,%.3f)", tr->tm_x, tr->tm_y, tr->tm_w, tr->tm_h);
             printf("\n");
+        }
+        for (int i = 0; i < p.nevents; i++) {
+            VegEvent *e = &p.events[i];
+            if (e->kind == VEG_KIND_VIDEO && (e->fade_in > 0.001 || e->fade_out > 0.001))
+                printf("  video fade: ev%d trk%d %.3f+%.3f in=%.3f(c%d) out=%.3f(c%d) xf=%.3f/%.3f\n", e->seq, e->track, e->start, e->length,
+                       e->fade_in, e->fade_in_curve, e->fade_out, e->fade_out_curve, e->xfade_in, e->xfade_out);
         }
         for (int i = 0; i < p.nevents; i++) {
             VegEvent *e = &p.events[i];
