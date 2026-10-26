@@ -128,9 +128,12 @@ static void pan_at(const VegEvent *e, double tau, VegPanKey *k)
     *k = e->pan[e->npan - 1];
 }
 
-/* corners of the source picture in project-frame pixels (W x H), following the model vegtool/tved used:
- * the picture is fitted into the Pan/Crop coordinate frame, the window (centre, size, rotation, negative size =
- * mirror) is fitted into the output frame keeping its shape, then Track Motion scales/moves the frame. */
+/* corners of the source picture in project-frame pixels (W x H). Vegas's model:
+ * - the Pan/Crop window (centre, size, rotation, negative size = mirror) is stored in the pixels of the media the
+ *   project was made with (the frame size recorded in the Pan/Crop chunk);
+ * - when the source has another size, Vegas rescales the window with it, separately in x and y, so the whole
+ *   layout takes the new source's shape (a 1:1 source turns a 16:9 grid into a square one);
+ * - the window is fitted into the output frame keeping its shape, then Track Motion scales/moves the frame. */
 static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, float ox[4], float oy[4])
 {
     double W = p->width, H = p->height;
@@ -140,15 +143,15 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         VegPanKey k;
         pan_at(e, tau, &k);
         double SW = e->pan_w ? e->pan_w : pw, SH = e->pan_h ? e->pan_h : ph;
-        double fit = fmin(SW / pw, SH / ph);
-        double offx = (SW - pw * fit) / 2, offy = (SH - ph * fit) / 2;
-        double aw = fabs(k.w), ah = fabs(k.h);
+        double ux = pw / SW, uy = ph / SH;   /* recorded media pixels -> this source's pixels */
+        double kw = k.w * ux, kh = k.h * uy, kcx = k.cx * ux, kcy = k.cy * uy;
+        double aw = fabs(kw), ah = fabs(kh);
         if (aw < 1) aw = 1;
         if (ah < 1) ah = 1;
         double kk = fmin(W / aw, H / ah);
         double c = cos(k.rot), s = sin(k.rot);
         for (int i = 0; i < 4; i++) {
-            double dx = offx + px[i] * fit - k.cx, dy = offy + py[i] * fit - k.cy;
+            double dx = px[i] - kcx, dy = py[i] - kcy;
             if (k.w < 0) dx = -dx;
             if (k.h < 0) dy = -dy;
             qx[i] = W / 2 + kk * (c * dx - s * dy);

@@ -65,7 +65,8 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
 - **Video effects** (event and track level, in chain order): Invert, Black and White (grayscale), HSL Adjust (hue,
   saturation, luminance), Sepia and Brightness/Contrast. Each is an affine colour transform, so the whole chain is
   folded into one 3×4 matrix and applied by one GPU pass per layer. Unknown effects are listed on the Sources screen.
-- **Pan/Crop** keyframes (linear between keys, mirroring, rotation), **Track Motion** (first keyframe), event
+- **Pan/Crop** keyframes (linear between keys, mirroring, rotation; like Vegas, the window is rescaled to the
+  source when the file you pick has another size or shape than the one the project was made with), **Track Motion** (first keyframe), event
   opacity, crossfades between overlapping events, generator-track Add/Subtract compositing (guessed, like vegtool).
 - **Audio pitch attribute** (Event Properties → Time stretch/pitch shift):
   - *None*: pitch follows the playback rate (plain resampling, cubic interpolation).
