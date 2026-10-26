@@ -1,0 +1,287 @@
+/* vdec.c - H.264 through the Vita's hardware decoder (sceAvcdec) into the frame cache.
+ *
+ * Only the frames the project actually shows are kept (Sparta remixes reuse a few seconds of a source thousands
+ * of times), so playback never has to seek a decoder: every visible frame is already a GPU texture.
+ * Frames come out in display order; each access unit carries its display index as PTS. */
+#include "common.h"
+#include "media.h"
+#include "mp4.h"
+
+#include <malloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <psp2/kernel/clib.h>
+#include <psp2/kernel/sysmem.h>
+#include <psp2/sysmodule.h>
+#include <psp2/videodec.h>
+
+/* in the SceVideodec stub but not in vita-headers' videodec.h */
+int sceAvcdecDecodeStop(const SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *array_picture);
+
+#define ALIGN16(x) (((x) + 15) & ~15)
+#define ALIGN_MB(x) (((x) + 0xFFFFF) & ~0xFFFFF)
+
+static int g_vdec_inited;
+static int g_max_w, g_max_h, g_max_refs;
+/* decoder work memory and the output picture are reserved once, for the largest source, before the frame-cache
+ * arenas take what is left of the RAM */
+static SceUID g_dec_mem = -1, g_pic_mem = -1;
+static void *g_dec_base; static uint8_t *g_pic_base;
+static size_t g_dec_size;
+
+int vdec_global_init(int max_w, int max_h, int max_refs)
+{
+    if (g_vdec_inited) return 0;
+    sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);   /* not required on every firmware; harmless */
+    SceVideodecQueryInitInfoHwAvcdec init;
+    memset(&init, 0, sizeof init);
+    init.size = sizeof init;
+    init.horizontal = (uint32_t)ALIGN16(max_w);
+    init.vertical = (uint32_t)ALIGN16(max_h);
+    init.numOfRefFrames = (uint32_t)max_refs;
+    init.numOfStreams = 1;
+    int r = sceVideodecInitLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC, &init);
+    if (r < 0) { LOG("vdec: sceVideodecInitLibrary(%dx%d, refs %d) failed 0x%08X", max_w, max_h, max_refs, r); return r; }
+    g_vdec_inited = 1;
+    g_max_w = (int)init.horizontal; g_max_h = (int)init.vertical; g_max_refs = max_refs;
+
+    SceAvcdecQueryDecoderInfo q;
+    memset(&q, 0, sizeof q);
+    q.horizontal = init.horizontal; q.vertical = init.vertical; q.numOfRefFrames = init.numOfRefFrames;
+    SceAvcdecDecoderInfo info;
+    memset(&info, 0, sizeof info);
+    r = sceAvcdecQueryDecoderMemSize(SCE_VIDEODEC_TYPE_HW_AVCDEC, &q, &info);
+    if (r < 0) { LOG("vdec: size query failed 0x%08X", r); vdec_global_term(); return r; }
+    g_dec_size = ALIGN_MB(info.frameMemSize);
+    g_dec_mem = sceKernelAllocMemBlock("vp_avcdec", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, g_dec_size, NULL);
+    size_t psz = ALIGN_MB((size_t)g_max_w * (size_t)g_max_h * 4);
+    g_pic_mem = sceKernelAllocMemBlock("vp_avcpic", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, psz, NULL);
+    if (g_dec_mem < 0 || g_pic_mem < 0) {
+        LOG("vdec: no physically contiguous memory (%u KB + %u KB)", (unsigned)(g_dec_size >> 10), (unsigned)(psz >> 10));
+        vdec_global_term();
+        return -1;
+    }
+    sceKernelGetMemBlockBase(g_dec_mem, &g_dec_base);
+    sceKernelGetMemBlockBase(g_pic_mem, (void **)&g_pic_base);
+    LOG("vdec: hardware AVC decoder ready (%dx%d, %d refs, %u KB)", g_max_w, g_max_h, max_refs, (unsigned)(g_dec_size >> 10));
+    return 0;
+}
+
+void vdec_global_term(void)
+{
+    if (g_dec_mem >= 0) sceKernelFreeMemBlock(g_dec_mem);
+    if (g_pic_mem >= 0) sceKernelFreeMemBlock(g_pic_mem);
+    g_dec_mem = g_pic_mem = -1;
+    if (!g_vdec_inited) return;
+    sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
+    g_vdec_inited = 0;
+}
+
+typedef struct {
+    SceAvcdecCtrl ctrl;
+    uint8_t *pic;           /* RGBA8888 output picture (physically contiguous, uncached) */
+    int pitch, fw, fh;      /* picture buffer pitch / size in pixels */
+    int created;
+    int w, h, refs;
+} Dec;
+
+static void dec_destroy(Dec *d)
+{
+    if (d->created) sceAvcdecDeleteDecoder(&d->ctrl);
+    d->created = 0;
+}
+
+static int dec_create(Dec *d, int w, int h, int refs, char *err, size_t errlen)
+{
+    memset(d, 0, sizeof *d);
+    if (g_dec_mem < 0) { snprintf(err, errlen, "hardware decoder not initialised"); return -1; }
+    SceAvcdecQueryDecoderInfo q;
+    memset(&q, 0, sizeof q);
+    q.horizontal = (uint32_t)ALIGN16(w);
+    q.vertical = (uint32_t)ALIGN16(h);
+    q.numOfRefFrames = (uint32_t)refs;
+    d->ctrl.frameBuf.pBuf = g_dec_base;
+    d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
+    int r = sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &d->ctrl, &q);
+    if (r < 0) { snprintf(err, errlen, "H.264 decoder creation failed (0x%08X)", r); return -1; }
+    d->created = 1;
+    d->pitch = ALIGN16(w); d->fw = ALIGN16(w); d->fh = ALIGN16(h);
+    d->pic = g_pic_base;
+    d->w = w; d->h = h; d->refs = refs;
+    return 0;
+}
+
+static void pic_setup(Dec *d, SceAvcdecPicture *pic, SceAvcdecPicture **pp, SceAvcdecArrayPicture *arr)
+{
+    memset(pic, 0, sizeof *pic);
+    memset(arr, 0, sizeof *arr);
+    pic->size = sizeof *pic;
+    pic->frame.pixelType = SCE_AVCDEC_PIXELFORMAT_RGBA8888;
+    pic->frame.framePitch = (uint32_t)d->pitch;
+    pic->frame.frameWidth = (uint32_t)d->fw;
+    pic->frame.frameHeight = (uint32_t)d->fh;
+    pic->frame.opt.rgba.alpha = 0xFF;
+    pic->frame.pPicture[0] = d->pic;
+    *pp = pic;
+    arr->numOfElm = 1;
+    arr->pPicture = pp;
+}
+
+typedef struct {
+    VideoCache *vc;
+    const uint8_t *need;
+    int *pending; int npending;     /* display indices fed to the decoder, not yet output */
+    int next_slot;
+    uint8_t *scratch;
+    int src_w, src_h;
+    int produced;
+} Ctx;
+
+static void pending_add(Ctx *c, int k)
+{
+    if (c->npending < 256) c->pending[c->npending++] = k;
+}
+
+/* a picture came out: figure out which display frame it is and keep it if needed */
+static void got_picture(Ctx *c, Dec *d, const SceAvcdecPicture *pic)
+{
+    int k = -1, at = -1;
+    uint32_t pts = pic->info.pts.lower;
+    for (int i = 0; i < c->npending; i++) if ((uint32_t)c->pending[i] == pts && pic->info.pts.upper == 0) { at = i; break; }
+    if (at < 0) {   /* no usable PTS: pictures leave in display order, so it's the smallest pending index */
+        for (int i = 0; i < c->npending; i++) if (at < 0 || c->pending[i] < c->pending[at]) at = i;
+    }
+    if (at < 0) return;
+    k = c->pending[at];
+    c->pending[at] = c->pending[--c->npending];
+    VideoCache *vc = c->vc;
+    if (k < 0 || k >= vc->nframes || !c->need[k] || vc->slot[k] >= 0 || c->next_slot >= vc->nimg) return;
+    int s = c->next_slot++;
+    downscale_rgba(d->pic, d->pitch * 4, c->src_w, c->src_h, &vc->img[s], 0, c->scratch);
+    vc->slot[k] = s;
+    c->produced++;
+}
+
+/* end of a run of access units: get the pictures still held for reordering, then start a fresh decoder so the
+ * next run can begin at any keyframe */
+static void drain(Ctx *c, Dec *d)
+{
+    if (!d->created) return;
+    for (int i = 0; i < 64; i++) {
+        SceAvcdecPicture pic, *pp;
+        SceAvcdecArrayPicture arr;
+        pic_setup(d, &pic, &pp, &arr);
+        int r = sceAvcdecDecodeStop(&d->ctrl, &arr);
+        if (r < 0 || arr.numOfOutput == 0) break;
+        got_picture(c, d, &pic);
+    }
+    c->npending = 0;
+    int w = d->w, h = d->h, refs = d->refs;
+    char err[96];
+    dec_destroy(d);
+    if (dec_create(d, w, h, refs, err, sizeof err) < 0) LOG("vdec: re-create failed: %s", err);
+}
+
+int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen)
+{
+    Mp4Track *t = &mf->video;
+    int w = t->width, h = t->height;
+    if (w <= 0 || h <= 0) { snprintf(err, errlen, "bad video size"); return -1; }
+    if (ALIGN16(w) > g_max_w || ALIGN16(h) > g_max_h) {
+        snprintf(err, errlen, "%dx%d is above the hardware decoder limit (%dx%d)", w, h, g_max_w, g_max_h);
+        return -1;
+    }
+    /* display order <-> decode order */
+    int n = (int)t->n;
+    int *disp_of = malloc(sizeof(int) * (size_t)n), *samp_of = malloc(sizeof(int) * (size_t)n);
+    int *pend = malloc(sizeof(int) * 256);
+    uint8_t *es = memalign(64, 2u << 20);
+    uint8_t *raw = malloc(2u << 20);
+    Ctx c;
+    memset(&c, 0, sizeof c);
+    c.scratch = malloc(downscale_scratch_size(w, h, vc->cache_w, vc->cache_h));
+    if (!disp_of || !samp_of || !pend || !es || !raw || !c.scratch) {
+        free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
+        snprintf(err, errlen, "out of memory");
+        return -1;
+    }
+    /* display index = rank of cts; vc->pts already holds the sorted times, rebuild the mapping the same way */
+    for (int i = 0; i < n; i++) samp_of[i] = i;
+    for (int i = 1; i < n; i++) {   /* insertion sort by cts: input is nearly sorted */
+        int x = samp_of[i], j = i - 1;
+        while (j >= 0 && t->s[samp_of[j]].cts > t->s[x].cts) { samp_of[j + 1] = samp_of[j]; j--; }
+        samp_of[j + 1] = x;
+    }
+    for (int k = 0; k < n; k++) disp_of[samp_of[k]] = k;
+
+    int refs = t->max_ref_frames > 0 ? t->max_ref_frames + 1 : g_max_refs;
+    if (refs > g_max_refs) refs = g_max_refs;
+    Dec d;
+    if (dec_create(&d, w, h, refs, err, errlen) < 0) {
+        free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
+        return -1;
+    }
+    c.vc = vc; c.need = need; c.pending = pend; c.src_w = w; c.src_h = h;
+
+    int total_need = 0;
+    for (int k = 0; k < n; k++) total_need += need[k] ? 1 : 0;
+    int pos = -1;          /* next sample to feed (decode order), -1 = not started */
+    int errors = 0, result = 0;
+    while (!*cancel) {
+        /* next wanted frame */
+        int kt = -1;
+        for (int k = 0; k < n; k++) if (need[k] && vc->slot[k] < 0 && !(need[k] & 2)) { kt = k; break; }
+        if (kt < 0) break;
+        int st = samp_of[kt];
+        int sync = st;
+        while (sync > 0 && !t->s[sync].sync) sync--;
+        if (pos < 0 || sync > pos || st < pos - 64) {   /* jump to the GOP that holds it */
+            if (pos >= 0) drain(&c, &d);
+            pos = sync;
+        }
+        /* decode until the wanted frame has come out (or the GOP ran out) */
+        int fed_target = 0;
+        while (pos < n && !*cancel) {
+            if (t->s[pos].size > (2u << 20) - 1024) { pos++; continue; }
+            if (mp4_read_sample(mf, t, (uint32_t)pos, raw) < 0) { errors++; pos++; continue; }
+            int len = mp4_avcc_to_annexb(t, raw, t->s[pos].size, es, 2u << 20, t->s[pos].sync);
+            if (len <= 0) { pos++; continue; }
+            SceAvcdecAu au;
+            memset(&au, 0, sizeof au);
+            au.pts.upper = 0; au.pts.lower = (uint32_t)disp_of[pos];
+            au.dts.upper = 0xFFFFFFFF; au.dts.lower = 0xFFFFFFFF;
+            au.es.pBuf = es; au.es.size = (uint32_t)len;
+            SceAvcdecPicture pic, *pp;
+            SceAvcdecArrayPicture arr;
+            pic_setup(&d, &pic, &pp, &arr);
+            pending_add(&c, disp_of[pos]);
+            int r = sceAvcdecDecode(&d.ctrl, &au, &arr);
+            if (r < 0) {
+                errors++;
+                if (errors < 8) LOG("vdec: decode error 0x%08X at sample %d", r, pos);
+                c.npending--;   /* this AU produced nothing and never will */
+            } else if (arr.numOfOutput) got_picture(&c, &d, &pic);
+            if (pos == st) fed_target = 1;
+            pos++;
+            if (vc->slot[kt] >= 0) break;
+            /* the target was fed a while ago and still nothing: give up on it (reordering never exceeds 16) */
+            if (fed_target && pos > st + 20) break;
+            if (pos < n && t->s[pos].sync && pos > st) break;   /* next GOP: drain decides */
+        }
+        if (vc->slot[kt] < 0) {
+            drain(&c, &d);
+            pos = -1;
+            if (vc->slot[kt] < 0) ((uint8_t *)need)[kt] |= 2;   /* mark as failed so we don't loop */
+        }
+        if (progress) *progress = total_need ? (float)c.produced / (float)total_need : 1.0f;
+        if (errors > 200) { snprintf(err, errlen, "too many decode errors"); result = -1; break; }
+    }
+    drain(&c, &d);
+    dec_destroy(&d);
+    LOG("vdec: kept %d of %d needed frames (%d errors)", c.produced, total_need, errors);
+    free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
+    if (!c.produced && result == 0) { snprintf(err, errlen, "no frames could be decoded"); result = -1; }
+    return result;
+}

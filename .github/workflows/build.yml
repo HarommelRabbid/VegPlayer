@@ -1,0 +1,20 @@
+name: Build VPK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  vpk:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Libraries
+        run: vdpm libvita2d vitaShaRK SceShaccCgExt taihen freetype libpng libjpeg-turbo zlib || true
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VegPlayer
+          path: build/VegPlayer.vpk

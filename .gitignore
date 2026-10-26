@@ -1,0 +1,10 @@
+build/
+*.vpk
+*.velf
+*.self
+eboot.bin
+tests/*.o
+tests/vegdump
+tests/mp4test
+tests/mixtest
+tests/pipetest
