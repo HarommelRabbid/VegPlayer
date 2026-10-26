@@ -18,3 +18,23 @@ jobs:
         with:
           name: VegPlayer
           path: build/VegPlayer.vpk
+
+  # the bare .vpk as a release download (no zip around it), refreshed on every push to main
+  release:
+    needs: vpk
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: VegPlayer
+      - name: Publish "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --cleanup-tag -y || true
+          gh release create latest VegPlayer.vpk --target "$GITHUB_SHA" --prerelease \
+            --title "Latest build" --notes "Built from ${GITHUB_SHA::7}."
