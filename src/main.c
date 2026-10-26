@@ -539,6 +539,7 @@ static void play_frame(void)
     if (now - g_fps_t >= 1000000) { g_fps = g_frames * 1e6 / (double)(now - g_fps_t); g_frames = 0; g_fps_t = now; }
 
     int show = g_osd && (!audio_playing() || now < g_osd_until || g_panel);
+    if(audio_playing()) sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
     if (show) {
         vita2d_draw_rectangle(0, SCREEN_H - 56, SCREEN_W, 56, RGBA8(0, 0, 0, 170));
         float prog = p->duration > 0 ? (float)(t / p->duration) : 0;
