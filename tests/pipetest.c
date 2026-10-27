@@ -8,7 +8,7 @@
 #include "media.h"
 #include "mixer.h"
 #include "veg.h"
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, 1, "" };
 Session g_s;
 void log_printf(const char *fmt, ...) { (void)fmt; }
 uint64_t time_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000; }
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
     }
     uint64_t t1 = time_us();
     printf("scenes: %d built, max layers %d, bad coords %d, %.1f us/scene on host\n", frames, maxl, bad, (double)(t1 - t0) / frames);
-    printf("  layer passes: matrix %d, gradient map %d, blur %d | blends:", npass[0], npass[1], npass[2]);
+    printf("  layer passes: matrix %d, gradient map %d, blur %d, shadow/glow %d | blends:", npass[0], npass[1], npass[2], npass[3]);
     static const char *BN[BLEND_COUNT] = { "normal", "add", "subtract", "multiply", "screen", "lighten", "darken", "cut" };
     for (int b = 0; b < BLEND_COUNT; b++) if (nblend[b]) printf(" %s %d", BN[b], nblend[b]);
     printf("\n");

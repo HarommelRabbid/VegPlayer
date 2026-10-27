@@ -136,6 +136,7 @@ const char *veg_ext(const char *path)
 #define G_COMP       "69d46c29"
 #define G_ACOMP      "69d46c27"   /* audio track settings: volume (float, linear) @0x0c */
 #define G_TRACKMOTION "cd6915d8"
+static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t);
 #define G_TRACKFX    "f79298f4"   /* audio track FX chain (Track Noise Gate/EQ/Compressor + inserted plug-ins) */
 
 typedef struct { char name[64]; double v[4]; int nv; } OfxParam;
@@ -786,6 +787,7 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
         } else if (gpre(&c, G_TRACKMOTION) && bl >= 136 && !in_event) {
             t->has_motion = 1;
             t->tm_x = rdd(b + 88); t->tm_y = rdd(b + 96); t->tm_w = rdd(b + 120); t->tm_h = rdd(b + 128);
+            track_motion_fx(b, bl, t);
         } else if (!in_event && s->cur < 0 && gpre(&c, G_VFX)) {
             VegVfx v;   /* track-level video FX */
             parse_vfx(s, b, bl, &v);
@@ -801,6 +803,37 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
         }
     }
     return 0;
+}
+
+/* Track Motion chunk (cd6915d8): u32 @0x04 = enabled parts (1 position, 8 2D Shadow, 16 2D Glow), then three
+ * keyframe lists from @0x24 (position, shadow, glow), each: u32 count, then per keyframe a u32 size (counting
+ * itself) and the data. In a keyframe at s (its size field): x @s+0x30, y @+0x38, w @+0x50, h @+0x58 (doubles);
+ * shadow/glow colour @+0xb0 (4 floats, B G R A) and blur @+0xc0 (double). Only the first keyframe is used. */
+static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
+{
+    uint32_t flags = rd32(b + 4);
+    size_t p = 0x24;
+    for (int blk = 0; blk < 3; blk++) {
+        if (p + 8 > bl) return;
+        uint32_t n = rd32(b + p);
+        p += 4;
+        size_t s = p;   /* first keyframe */
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t sz = rd32(b + p);
+            if (sz < 8 || sz > bl - p) return;
+            p += sz;
+        }
+        if (blk == 0 || n == 0 || s + 0xc8 > bl || rd32(b + s) < 0xc8) continue;
+        VegTmFx *f = blk == 1 ? &t->shadow : &t->glow;
+        f->on = !!(flags & (blk == 1 ? 8u : 16u));
+        f->x = rdd(b + s + 0x30); f->y = rdd(b + s + 0x38); f->w = rdd(b + s + 0x50); f->h = rdd(b + s + 0x58);
+        f->rgba[2] = rdf(b + s + 0xb0); f->rgba[1] = rdf(b + s + 0xb4); f->rgba[0] = rdf(b + s + 0xb8); f->rgba[3] = rdf(b + s + 0xbc);
+        f->blur = rdd(b + s + 0xc0);
+        int ok = isfinite(f->x) && isfinite(f->y) && isfinite(f->w) && isfinite(f->h) && isfinite(f->blur) &&
+                 fabs(f->x) < 100 && fabs(f->y) < 100 && fabs(f->w) < 100 && fabs(f->h) < 100 && f->blur >= 0 && f->blur < 100;
+        for (int c = 0; c < 4; c++) { if (!isfinite(f->rgba[c])) ok = 0; else f->rgba[c] = f->rgba[c] < 0 ? 0 : f->rgba[c] > 1 ? 1 : f->rgba[c]; }
+        if (!ok) memset(f, 0, sizeof *f);
+    }
 }
 
 /* a track is a list whose first child is the track header chunk */

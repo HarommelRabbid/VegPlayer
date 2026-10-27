@@ -7,7 +7,7 @@
 #include "media.h"
 #include "mixer.h"
 Session g_s;
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, 1, "" };
 void log_printf(const char *fmt, ...) { (void)fmt; }
 
 int main(void)

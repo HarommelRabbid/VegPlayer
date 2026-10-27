@@ -110,10 +110,20 @@ enum { VEG_CURVE_LINEAR = 1, VEG_CURVE_FAST = 2, VEG_CURVE_SLOW = -2, VEG_CURVE_
 /* gain 0..1 along a fade-in at progress u (0..1); a fade-out at progress u has gain 1 - veg_fade_shape(curve, u) */
 float veg_fade_shape(int curve, double u);
 
+/* Track Motion 2D Shadow / 2D Glow: a soft, coloured copy of the track's shape drawn behind it. Position and
+ * size are relative to the track's frame (the same units as Track Motion: x, y offset; w, h scale, 1 = same size). */
+typedef struct {
+    int on;
+    double x, y, w, h;
+    float rgba[4];         /* colour (stored BGRA) and its alpha */
+    double blur;           /* softness, in the same units as the position */
+} VegTmFx;
+
 typedef struct {
     int kind;              /* VEG_KIND_AUDIO / VEG_KIND_VIDEO (from the track header; OTHER if unknown) */
     int first_event, nevents;   /* events of this track are events[first_event .. first_event+nevents) sorted by start */
     int has_motion; double tm_x, tm_y, tm_w, tm_h;  /* Track Motion (first keyframe) */
+    VegTmFx shadow, glow;  /* Track Motion 2D Shadow / 2D Glow (first keyframe; .on = enabled) */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing chunk words @0x60 / @0x64 */
     int comp_mode;         /* VEG_COMP_* (Source Alpha when absent) */
     float level;           /* video track: opacity (Level); audio track: volume, linear gain (1 = 0 dB) */

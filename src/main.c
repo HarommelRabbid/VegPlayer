@@ -475,7 +475,7 @@ static const int CACHE_OPTS[] = { 0, 64, 96, 128, 176, 224 };
 static void options_frame(void)
 {
     header("Options", "{LEFT}{RIGHT} change   {O} back");
-    char rows[8][160];
+    char rows[9][160];
     static const char *STR[] = { "as in the project", "None (resample)", "Classic", "elastique (WSOLA approx.)" };
     static const char *PSM[] = { "as in the project", "resample (speed + pitch)", "Classic (preserve duration)" };
     snprintf(rows[0], 160, "Audio stretch/pitch method:  %s", STR[g_cfg.force_stretch + 1]);
@@ -487,14 +487,15 @@ static void options_frame(void)
     else snprintf(rows[5], 160, "Frame cache budget:  automatic (176 MB)");
     snprintf(rows[6], 160, "Track Motion with other-shaped sources:  %s", g_cfg.tm_follow_source ? "follows the source (aligned)" : "as in Vegas");
     snprintf(rows[7], 160, "Small-layer frame copies (more memory):  %s", g_cfg.small_copies ? "on" : "off");
-    for (int i = 0; i < 8; i++) {
-        int y = 56 + i * 32;
-        if (i == g_osel) vita2d_draw_rectangle(10, y, SCREEN_W - 20, 32, COL_SEL);
-        text(24, y + 23, COL_TEXT, 0.95f, rows[i]);
+    snprintf(rows[8], 160, "Track Motion shadow and glow:  %s", g_cfg.tm_fx ? "drawn" : "off");
+    for (int i = 0; i < 9; i++) {
+        int y = 54 + i * 30;
+        if (i == g_osel) vita2d_draw_rectangle(10, y, SCREEN_W - 20, 28, COL_SEL);
+        text(24, y + 21, COL_TEXT, 0.95f, rows[i]);
     }
-    text(24, 334, COL_DIM, 0.8f, "The Vegas methods are reverse-engineered: if a project sounds wrong, try forcing them here.");
-    text(24, 358, COL_DIM, 0.8f, "Audio changes apply immediately; the cache budget and frame copies at the next prepare.");
-    list_nav(&g_osel, 8, 8);
+    text(24, 350, COL_DIM, 0.8f, "The Vegas methods are reverse-engineered: if a project sounds wrong, try forcing them here.");
+    text(24, 374, COL_DIM, 0.8f, "Audio changes apply immediately; the cache budget and frame copies at the next prepare.");
+    list_nav(&g_osel, 9, 9);
     int d = (g_repeat & SCE_CTRL_RIGHT) ? 1 : (g_repeat & SCE_CTRL_LEFT) ? -1 : (g_pressed & SCE_CTRL_CROSS) ? 1 : 0;
     if (d) {
         switch (g_osel) {
@@ -513,6 +514,7 @@ static void options_frame(void)
         }
         case 6: g_cfg.tm_follow_source ^= 1; break;
         case 7: g_cfg.small_copies ^= 1; g_s.prepared = 0; break;
+        case 8: g_cfg.tm_fx ^= 1; break;
         }
         config_save();
         if (g_osel <= 2) mixer_reset();
@@ -617,7 +619,8 @@ static void play_frame(void)
     if (g_cfg.show_fps) {
         char st[200];
         snprintf(st, sizeof st, "%.1f fps  layers %d", g_fps, sc ? sc->n : 0);
-        if (sc && (sc->nlut || sc->nblur)) snprintf(st + strlen(st), sizeof st - strlen(st), " (gradient %d, blur %d)", sc->nlut, sc->nblur);
+        if (sc && (sc->nlut || sc->nblur || sc->nshadow))
+            snprintf(st + strlen(st), sizeof st - strlen(st), " (gradient %d, blur %d, shadow/glow %d)", sc->nlut, sc->nblur, sc->nshadow);
         if (sc && sc->cpu_fx) snprintf(st + strlen(st), sizeof st - strlen(st), "  cpu-fx %d", sc->cpu_fx);
         snprintf(st + strlen(st), sizeof st - strlen(st), "  voices %d  audio %d%%  build %u us", mixer_active_voices(), audio_load_pct(),
                  sc ? (unsigned)sc->build_us : 0);

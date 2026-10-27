@@ -37,6 +37,11 @@ int main(int argc, char **argv)
                 else printf(" level=%.1f%%", tr->level * 100);
             }
             if (tr->has_motion) printf(" tm=(%.3f,%.3f,%.3f,%.3f)", tr->tm_x, tr->tm_y, tr->tm_w, tr->tm_h);
+            for (int q = 0; q < 2; q++) {
+                const VegTmFx *fx = q ? &tr->glow : &tr->shadow;
+                if (fx->on) printf(" %s=(%.3f,%.3f %.3fx%.3f rgba %.2f,%.2f,%.2f,%.2f blur %.3f)", q ? "glow" : "shadow", fx->x, fx->y, fx->w, fx->h,
+                                   fx->rgba[0], fx->rgba[1], fx->rgba[2], fx->rgba[3], fx->blur);
+            }
             printf("\n");
         }
         for (int i = 0; i < p.nevents; i++) {

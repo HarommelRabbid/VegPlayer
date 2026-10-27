@@ -297,7 +297,8 @@ static void pan_at(const VegEvent *e, double tau, VegPanKey *k)
  * - when the source has another size, Vegas rescales the window with it, separately in x and y, so the whole
  *   layout takes the new source's shape (a 1:1 source turns a 16:9 grid into a square one);
  * - the window is fitted into the output frame keeping its shape, then Track Motion scales/moves the frame. */
-static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, float ox[4], float oy[4])
+static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, const VegTmFx *fx,
+                  float ox[4], float oy[4])
 {
     double W = p->width, H = p->height;
     double px[4] = { 0, (double)pw, 0, (double)pw }, py[4] = { 0, 0, (double)ph, (double)ph };
@@ -334,6 +335,10 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         double fit = fmin(W / pw, H / ph);
         double bw = pw * fit, bh = ph * fit, x0 = (W - bw) / 2, y0 = (H - bh) / 2;
         for (int i = 0; i < 4; i++) { qx[i] = x0 + px[i] * fit; qy[i] = y0 + py[i] * fit; }
+    }
+    if (fx) {   /* shadow / glow: moved and scaled inside the track's frame, before Track Motion */
+        double cx = W / 2 + fx->x * H / 2 * lx, cy = H / 2 - fx->y * H / 2 * ly;
+        for (int i = 0; i < 4; i++) { qx[i] = cx + (qx[i] - W / 2) * fx->w; qy[i] = cy + (qy[i] - H / 2) * fx->h; }
     }
     if (t->has_motion) {
         double asp = W / H;
@@ -412,11 +417,55 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
 
 /* ------------------------------------------------------------------ building */
 
+/* a Track Motion shadow / glow layer for the picture img placed for event e: its shape, moved/scaled by fx, with edges
+ * softened over the blur width, in the fx colour. Without the shadow shader: a flat, hard-edged quad of the colour. */
+static void tm_fx_layer(const VegProject *p, const VegEvent *e, const VegTrack *tr, double tau, int pw, int ph,
+                        const VegTmFx *fx, const GpuImage *img, float alpha, GpuLayer *L)
+{
+    memset(L, 0, sizeof *L);
+    place(p, e, tr, tau, pw, ph, fx, L->x, L->y);
+    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
+    for (int i = 0; i < 4; i++) { L->u[i] = CU[i]; L->v[i] = CV[i]; }
+    cm_identity(L->m);
+    cm_identity(L->m2);
+    L->blend = BLEND_NORMAL;
+    L->tint[0] = fx->rgba[0]; L->tint[1] = fx->rgba[1]; L->tint[2] = fx->rgba[2]; L->tint[3] = fx->rgba[3] * alpha;
+    if (!gpu_pass_ok(PASS_SHADOW) || fx->blur <= 0) {
+        L->pass = PASS_MATRIX;
+        if (!gpu_pass_ok(PASS_SHADOW) && g_s.white.data) { L->tex = &g_s.white.tex; L->tint[3] *= 0.6f; }
+        else L->tex = &img->tex;
+        if (L->tex == &img->tex) { L->fx = 1; for (int r = 0; r < 3; r++) { L->m[r * 5] = 0; L->m[r * 4 + 3] = 1; } }
+        return;
+    }
+    L->pass = PASS_SHADOW;
+    L->tex = &img->tex;
+    L->fx = 1;
+    /* blur width (each side of the edge) in screen pixels, in the same units as the position, scaled like the track */
+    double th = tr->has_motion && tr->tm_h != 0 ? fabs(tr->tm_h) : 1.0;
+    float r = (float)(fx->blur * p->height / 2 * th * g_vw / p->width);
+    float ax = L->x[1] - L->x[0], ay = L->y[1] - L->y[0], bx = L->x[2] - L->x[0], by = L->y[2] - L->y[0];
+    float la = hypotf(ax, ay), lb = hypotf(bx, by);
+    if (la < 1 || lb < 1) { L->tint[3] = 0; return; }
+    float ex = r / la, ey = r / lb;
+    if (ex < 1e-4f) ex = 1e-4f;
+    if (ey < 1e-4f) ey = 1e-4f;
+    if (ex > 4) ex = 4;
+    if (ey > 4) ey = 4;
+    L->soft[0] = 0.5f / ex; L->soft[1] = 0.5f / ey; L->soft[2] = ex; L->soft[3] = ey;
+    float x0 = L->x[0], y0 = L->y[0];
+    for (int i = 0; i < 4; i++) {
+        float u = CU[i] ? 1 + ex : -ex, w = CV[i] ? 1 + ey : -ey;
+        L->u[i] = u; L->v[i] = w;
+        L->x[i] = x0 + u * ax + w * bx;
+        L->y[i] = y0 + u * ay + w * by;
+    }
+}
+
 static void build(Scene *sc, int buf, double T)
 {
     VegProject *p = &g_s.proj;
     uint64_t t0 = time_us();
-    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = 0;
+    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = 0;
     sc->vx = g_vx; sc->vy = g_vy; sc->vw = g_vw; sc->vh = g_vh;
     int fb_used = 0;
     /* Vegas: the first track is in front, so draw from the last track up */
@@ -445,7 +494,7 @@ static void build(Scene *sc, int buf, double T)
             if (!img || pw <= 0 || ph <= 0) continue;   /* text / noise generators and missing sources */
             if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
-            place(p, e, tr, tau, pw, ph, L->x, L->y);
+            place(p, e, tr, tau, pw, ph, NULL, L->x, L->y);
             if (vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
                 /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
                 float sw = hypotf(L->x[1] - L->x[0], L->y[1] - L->y[0]), sh = hypotf(L->x[2] - L->x[0], L->y[2] - L->y[0]);
@@ -524,6 +573,21 @@ static void build(Scene *sc, int buf, double T)
                     }
                     L->tint[0] = L->tint[1] = L->tint[2] = 1.0f;
                     L->fx = 1;
+                }
+            }
+            /* Track Motion glow / shadow: drawn just behind the layer (glow first, then shadow) */
+            if (g_cfg.tm_fx && (tr->glow.on || tr->shadow.on)) {
+                GpuLayer fxl[2];
+                int nfx = 0;
+                for (int q = 0; q < 2; q++) {
+                    const VegTmFx *fx = q ? &tr->shadow : &tr->glow;
+                    if (fx->on && fx->rgba[3] > 0.002f) tm_fx_layer(p, e, tr, tau, pw, ph, fx, img, a > 1 ? 1 : a, &fxl[nfx++]);
+                }
+                if (nfx && sc->n + nfx < MAX_LAYERS) {
+                    sc->layer[sc->n + nfx] = *L;
+                    for (int q = 0; q < nfx; q++) sc->layer[sc->n + q] = fxl[q];
+                    sc->n += nfx;
+                    sc->nshadow += nfx;
                 }
             }
             sc->n++;

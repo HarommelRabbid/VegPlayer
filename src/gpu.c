@@ -182,14 +182,27 @@ static const char FRAG_BLUR_SRC[] =
     "    return float4(saturate(o), c.a) * uTint;\n"
     "}\n";
 
-#define SHADER_VERSION 4
+/* PASS_SHADOW: Track Motion 2D Shadow / Glow. The shape is the picture's alpha (4 taps, a little softened); its
+ * edges get the exact box-blurred rectangle ramp over +-uSoft.zw (texcoords), so one draw makes the soft shadow. */
+static const char FRAG_SHADOW_SRC[] =
+    "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex, uniform float4 uTint, uniform float4 uSoft) : COLOR\n"
+    "{\n"
+    "    float2 t = vTexcoord;\n"
+    "    float2 r = saturate((t + uSoft.zw) * uSoft.xy) - saturate((t - 1.0f + uSoft.zw) * uSoft.xy);\n"
+    "    float2 h = uSoft.zw * 0.5f;\n"
+    "    float a = tex2D(tex, saturate(t + h)).a + tex2D(tex, saturate(t - h)).a +\n"
+    "              tex2D(tex, saturate(t + float2(h.x, -h.y))).a + tex2D(tex, saturate(t + float2(-h.x, h.y))).a;\n"
+    "    return float4(uTint.rgb, uTint.a * 0.25f * a * r.x * r.y);\n"
+    "}\n";
+
+#define SHADER_VERSION 4   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
     const char *name, *src;
     SceGxmProgram *gxp;
     SceGxmShaderPatcherId id;
     SceGxmFragmentProgram *fp[BLEND_COUNT];
-    const SceGxmProgramParameter *mat[3], *post[3], *tint, *lutp, *dir, *rad, *w[5];
+    const SceGxmProgramParameter *mat[3], *post[3], *tint, *lutp, *dir, *rad, *w[5], *soft;
     int tex_unit, lut_unit;
     int ok;
 } FProg;
@@ -198,6 +211,7 @@ static FProg g_fp[PASS_COUNT] = {
     { .name = "layer", .src = FRAG_MATRIX_SRC },
     { .name = "lut", .src = FRAG_LUT_SRC },
     { .name = "blur", .src = FRAG_BLUR_SRC },
+    { .name = "shadow", .src = FRAG_SHADOW_SRC },
 };
 static SceGxmProgram *g_vprog_gxp;
 static SceGxmShaderPatcherId g_vid;
@@ -306,10 +320,11 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
     static const char *MAT[3] = { "uMatR", "uMatG", "uMatB" }, *POST[3] = { "uPostR", "uPostG", "uPostB" }, *W[5] = { "uW0", "uW1", "uW2", "uW3", "uW4" };
     for (int k = 0; k < 3; k++) { f->mat[k] = par(f->gxp, MAT[k]); f->post[k] = par(f->gxp, POST[k]); }
     for (int k = 0; k < 5; k++) f->w[k] = par(f->gxp, W[k]);
-    f->tint = par(f->gxp, "uTint"); f->lutp = par(f->gxp, "uLut"); f->dir = par(f->gxp, "uDir"); f->rad = par(f->gxp, "uRad");
+    f->tint = par(f->gxp, "uTint"); f->lutp = par(f->gxp, "uLut"); f->dir = par(f->gxp, "uDir"); f->rad = par(f->gxp, "uRad"); f->soft = par(f->gxp, "uSoft");
     f->tex_unit = unit_of(f->gxp, "tex");
     f->lut_unit = unit_of(f->gxp, "lut");
-    if (!f->mat[0] || !f->mat[1] || !f->mat[2] || !f->tint || f->tex_unit < 0) return -1;
+    int shadow = f == &g_fp[PASS_SHADOW];
+    if ((!shadow && (!f->mat[0] || !f->mat[1] || !f->mat[2])) || (shadow && !f->soft) || !f->tint || f->tex_unit < 0) return -1;
     static const struct { int src, dst, func; } BL[BLEND_COUNT] = {
         { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* normal */
         { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_ADD },                   /* add */
@@ -369,8 +384,8 @@ int gpu_init(void)
     for (int i = 1; i < PASS_COUNT; i++)
         if (setup_fprog(&g_fp[i], sp) < 0) LOG("gpu: %s shader unavailable (that effect falls back)", g_fp[i].name);
     g_shaders_ok = 1;
-    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s)",
-             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no");
+    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s, shadow/glow %s)",
+             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no", g_fp[PASS_SHADOW].ok ? "yes" : "no");
     LOG("gpu: %s", g_status);
     return 0;
 }
@@ -430,7 +445,7 @@ void gpu_draw_layer(const GpuLayer *L)
     sceGxmReserveVertexDefaultUniformBuffer(ctx, &vbuf);
     sceGxmSetUniformDataF(vbuf, g_wvp, 0, 16, g_ortho);
     sceGxmReserveFragmentDefaultUniformBuffer(ctx, &fbuf);
-    for (int k = 0; k < 3; k++) sceGxmSetUniformDataF(fbuf, f->mat[k], 0, 4, L->m + 4 * k);
+    for (int k = 0; k < 3; k++) if (f->mat[k]) sceGxmSetUniformDataF(fbuf, f->mat[k], 0, 4, L->m + 4 * k);
     sceGxmSetUniformDataF(fbuf, f->tint, 0, 4, L->tint);
     if (pass == PASS_LUT) {
         for (int k = 0; k < 3; k++) if (f->post[k]) sceGxmSetUniformDataF(fbuf, f->post[k], 0, 4, L->m2 + 4 * k);
@@ -440,6 +455,8 @@ void gpu_draw_layer(const GpuLayer *L)
         if (f->dir) sceGxmSetUniformDataF(fbuf, f->dir, 0, 4, L->dir);
         if (f->rad) sceGxmSetUniformDataF(fbuf, f->rad, 0, 4, L->rad);
         for (int k = 0; k < 5; k++) if (f->w[k]) sceGxmSetUniformDataF(fbuf, f->w[k], 0, 4, L->w + 4 * k);
+    } else if (pass == PASS_SHADOW) {
+        sceGxmSetUniformDataF(fbuf, f->soft, 0, 4, L->soft);
     }
     sceGxmSetFragmentTexture(ctx, (unsigned)f->tex_unit, L->tex);
     sceGxmSetVertexStream(ctx, 0, v);

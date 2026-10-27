@@ -77,6 +77,9 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
   (first keyframe; when the source has another shape, its moves are scaled with the rescaled layout so moved
   tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
+- **Track Motion 2D Shadow and 2D Glow** (first keyframe): a soft copy of each layer's shape in the shadow/glow
+  colour, moved and scaled inside the track's frame and drawn just behind the layer (one extra draw per layer, edges
+  softened in the shader). Without the shader compiler they draw as flat, hard-edged quads. Options can turn them off.
 - **Opacity**: video track Level, event fade-in/fade-out with their curves (Linear, Fast, Slow, Smooth, Sharp),
   crossfades between overlapping events (dissolve).
 - **Audio pitch attribute** (Event Properties → Time stretch/pitch shift):
@@ -115,6 +118,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Audio track FX | `f79298f4`: same records as the event plug-in chain; Sony Reverb i32 params | levels/decay/pre-delay/high cut **guessed** from one project |
 | Audio track volume | `69d46c27` (audio track settings): float @0x0c, linear gain | solid (values land on round dB steps) |
 | Video track Level | `69d46c29` (compositing): float @0x68 | solid (Pinkiety: 0 %, 32.8 %, 35 %) |
+| Track Motion shadow/glow | `cd6915d8`: u32 @0x04 = enabled parts (1 position, 8 2D Shadow, 16 2D Glow); from @0x24 three keyframe lists (count, then keyframes with a size field at s): x/y @s+0x30/0x38, w/h @s+0x50/0x58, colour B,G,R,A floats @s+0xb0, blur @s+0xc0 | flags and colours solid (CTR Custom vs the Veg Custom it came from, scan.veg); how blur and glow intensity map to pixels **guessed** |
 | Fade curves | event @0x74 (in) / @0x78 (out): 1 Linear, 2 Fast, −2 Slow, 4 Smooth, −4 Sharp | codes match Vegas's defaults (audio 2/−2, video 4); which word is in/out **guessed** |
 
 Options can override the guessed parts (stretch method, Pitch Shift mode, event level) if a project sounds wrong.
