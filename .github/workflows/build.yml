@@ -15,7 +15,7 @@ jobs:
           # compiler errors also become annotations (readable through the API without the log)
           if ! { cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4; } > build.log 2>&1; then
             grep -E "error|Error|undefined reference" build.log | head -25 | sed 's/^/::error::/'
-            tail -n 15 build.log | sed 's/^/::error::tail: /'
+            grep -v '^\[' build.log | grep -v '^--' | tail -n 30 | sed 's/^/::error::log: /'
             exit 1
           fi
           tail -n 3 build.log
