@@ -87,6 +87,9 @@ target_link_libraries(${PROJECT_NAME}
   SceLibKernel_stub
 )
 
+# room after the code segment for the SCE data vita-elf-create appends (else: "segment 1 overlaps")
+target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--defsym=__sce_headroom=0x10000")
+
 # UNSAFE: the shader compiler module (ur0:data/libshacccg.suprx) is loaded at run time on first start
 vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
