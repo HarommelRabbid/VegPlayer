@@ -213,10 +213,12 @@ static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
     }
 }
 
-/* blur taps for the shader: step at the outermost tap (texcoords), radial centre/strength, 9 weights */
-static void blur_params(const VegVfx *v, const GpuImage *img, GpuLayer *L)
+/* Blurs, as Vegas applies event effects: after Pan/Crop, over the whole event frame. So the amount is measured
+ * against the output frame, the direction is in output space (also for a rotated picture), and the blur spills past
+ * the picture's edges into the transparent frame around it: the quad is enlarged by the blur's reach and taps that
+ * land outside the picture count as transparent (shader). Called after place() and the default texcoords. */
+static void blur_params(const VegVfx *v, GpuLayer *L, float frame_w, float frame_h, float frame_x, float frame_y)
 {
-    float asp = img->h > 0 ? (float)img->w / img->h : 1.0f;
     memset(L->dir, 0, sizeof L->dir); memset(L->rad, 0, sizeof L->rad);
     int gauss = v->type == VFX_GAUSSBLUR;
     for (int k = 0; k < 17; k++) {   /* Gaussian: binomial weights C(16, k) / 2^16; the others: a box */
@@ -225,14 +227,40 @@ static void blur_params(const VegVfx *v, const GpuImage *img, GpuLayer *L)
         L->w[k] = gauss ? (float)(c / 65536.0) : 1.0f / 17.0f;
     }
     L->w[17] = L->w[18] = L->w[19] = 0;
-    if (v->type == VFX_LINEARBLUR) {
-        float a = (float)(v->angle * M_PI / 180.0), len = (float)v->amount * 0.5f;   /* Amount: blur length / picture width */
-        L->dir[0] = cosf(a) * len; L->dir[1] = -sinf(a) * len * asp;
-    } else if (v->type == VFX_GAUSSBLUR) {
-        if (v->a >= v->b) L->dir[0] = (float)v->a; else L->dir[1] = (float)v->b;   /* the longer axis */
+    /* screen = P0 + u * A + v * B (the picture's quad is a parallelogram); its inverse maps screen vectors to texcoords */
+    float ax = L->x[1] - L->x[0], ay = L->y[1] - L->y[0], bx = L->x[2] - L->x[0], by = L->y[2] - L->y[0];
+    float det = ax * by - ay * bx;
+    if (fabsf(det) < 1e-3f) return;
+    float i00 = by / det, i01 = -bx / det, i10 = -ay / det, i11 = ax / det;
+    float sx = 0, sy = 0;   /* screen-space step to the outermost tap */
+    float ex, ey;           /* how far the quad grows, in texcoords */
+    if (v->type == VFX_LINEARBLUR || v->type == VFX_GAUSSBLUR) {
+        if (v->type == VFX_LINEARBLUR) {
+            float a = (float)(v->angle * M_PI / 180.0), len = (float)v->amount * frame_w * 0.5f;   /* Amount: length / frame width */
+            sx = cosf(a) * len; sy = -sinf(a) * len;
+        } else if (v->a * frame_w >= v->b * frame_h) sx = (float)v->a * frame_w;   /* the longer axis */
+        else sy = (float)v->b * frame_h;
+        L->dir[0] = i00 * sx + i01 * sy;
+        L->dir[1] = i10 * sx + i11 * sy;
+        ex = fabsf(L->dir[0]); ey = fabsf(L->dir[1]);
     } else {
-        L->dir[2] = (float)v->cx; L->dir[3] = (float)v->cy;
+        /* Radial Blur: centre in frame coordinates -> texcoords */
+        float cx = frame_x + (float)v->cx * frame_w - L->x[0], cy = frame_y + (float)v->cy * frame_h - L->y[0];
+        L->dir[2] = i00 * cx + i01 * cy; L->dir[3] = i10 * cx + i11 * cy;
         L->rad[0] = (float)v->amount;
+        ex = ey = (float)v->amount;
+    }
+    if (ex > 2) ex = 2;
+    if (ey > 2) ey = 2;
+    if (ex < 1e-4f && ey < 1e-4f) return;
+    /* enlarge the quad: corners at texcoords (-ex | 1+ex, -ey | 1+ey) */
+    float x0 = L->x[0], y0 = L->y[0];
+    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
+    for (int i = 0; i < 4; i++) {
+        float u = CU[i] ? 1 + ex : -ex, w = CV[i] ? 1 + ey : -ey;
+        L->u[i] = u; L->v[i] = w;
+        L->x[i] = x0 + u * ax + w * bx;
+        L->y[i] = y0 + u * ay + w * by;
     }
 }
 
@@ -388,7 +416,7 @@ static void build(Scene *sc, int buf, double T)
 {
     VegProject *p = &g_s.proj;
     uint64_t t0 = time_us();
-    sc->t = T; sc->n = 0; sc->cpu_fx = 0;
+    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = 0;
     sc->vx = g_vx; sc->vy = g_vy; sc->vw = g_vw; sc->vh = g_vh;
     int fb_used = 0;
     /* Vegas: the first track is in front, so draw from the last track up */
@@ -418,6 +446,8 @@ static void build(Scene *sc, int buf, double T)
             if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
             place(p, e, tr, tau, pw, ph, L->x, L->y);
+            L->u[0] = 0; L->u[1] = 1; L->u[2] = 0; L->u[3] = 1;
+            L->v[0] = 0; L->v[1] = 0; L->v[2] = 1; L->v[3] = 1;
             Chain ch;
             chain_build(e, tr, &ch);
             memcpy(L->m, ch.m, sizeof L->m);
@@ -428,7 +458,10 @@ static void build(Scene *sc, int buf, double T)
                 const Lut *lu = &g_lut[ch.special->lut];
                 L->lut = lu->tex ? &lu->tex->gxm_tex : NULL;
                 L->lutp[0] = (float)ch.special->amount; L->lutp[1] = 255.0f / 256.0f; L->lutp[2] = 0.5f / 256.0f; L->lutp[3] = 0;
-            } else if (ch.pass == PASS_BLUR) blur_params(ch.special, img, L);
+            } else if (ch.pass == PASS_BLUR) {
+                if (gpu_pass_ok(PASS_BLUR)) blur_params(ch.special, L, g_vw, g_vw * p->height / p->width, g_vx, g_vy);
+                else L->pass = PASS_MATRIX;   /* no blur shader: draw unblurred */
+            }
             L->fx = !cm_is_identity(L->m) || ch.pass != PASS_MATRIX;
             float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
             /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
@@ -457,6 +490,8 @@ static void build(Scene *sc, int buf, double T)
                 L->fx = 0;
             }
             if (L->pass == PASS_BLUR && !gpu_pass_ok(PASS_BLUR)) L->pass = PASS_MATRIX;
+            if (L->pass == PASS_LUT) sc->nlut++;
+            else if (L->pass == PASS_BLUR) sc->nblur++;
             /* track compositing mode -> blend */
             if (g_cfg.compositing_guess) {
                 float al = L->tint[3];

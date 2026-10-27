@@ -650,6 +650,17 @@ static void clock_read(int64_t *written, uint64_t *at)
     }
 }
 
+/* audio load: the worst block of the last second, as a share of a block's duration */
+static volatile int g_load_pct;
+static int g_load_cur, g_load_n;
+static void load_note(uint64_t us)
+{
+    int pct = (int)(us * 100 * OUT_RATE / ((uint64_t)BLOCK * 1000000));
+    if (pct > g_load_cur) g_load_cur = pct;
+    if (++g_load_n >= OUT_RATE / BLOCK) { g_load_pct = g_load_cur; g_load_cur = 0; g_load_n = 0; }
+}
+int audio_load_pct(void) { return g_load_pct; }
+
 static int audio_thread(unsigned argc, void *argp)
 {
     (void)argc; (void)argp;
@@ -670,7 +681,11 @@ static int audio_thread(unsigned argc, void *argp)
         int seeked = 0;
         if (g_seek_to >= 0) { pos = g_seek_to; g_seek_to = -1; mixer_reset(); seeked = 1; }
         int playing = g_audio_play;
-        if (playing) mixer_mix(mix, BLOCK, pos);
+        if (playing) {
+            uint64_t m0 = time_us();
+            mixer_mix(mix, BLOCK, pos);
+            load_note(time_us() - m0);
+        }
         mutex_unlock(&g_amtx);
         int16_t *o = pcm[cur];
         if (playing) {

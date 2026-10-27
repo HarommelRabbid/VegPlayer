@@ -613,9 +613,14 @@ static void play_frame(void)
         }
     }
     if (g_cfg.show_fps) {
-        vita2d_draw_rectangle(0, 0, 330, 24, RGBA8(0, 0, 0, 150));
-        textf(8, 18, g_fps >= 15 ? COL_OK : COL_ERR, 0.75f, "%.1f fps  layers %d  voices %d  build %u us%s", g_fps, sc ? sc->n : 0,
-              mixer_active_voices(), sc ? (unsigned)sc->build_us : 0, sc && sc->cpu_fx ? "  cpu-fx" : "");
+        char st[200];
+        snprintf(st, sizeof st, "%.1f fps  layers %d", g_fps, sc ? sc->n : 0);
+        if (sc && (sc->nlut || sc->nblur)) snprintf(st + strlen(st), sizeof st - strlen(st), " (gradient %d, blur %d)", sc->nlut, sc->nblur);
+        if (sc && sc->cpu_fx) snprintf(st + strlen(st), sizeof st - strlen(st), "  cpu-fx %d", sc->cpu_fx);
+        snprintf(st + strlen(st), sizeof st - strlen(st), "  voices %d  audio %d%%  build %u us", mixer_active_voices(), audio_load_pct(),
+                 sc ? (unsigned)sc->build_us : 0);
+        vita2d_draw_rectangle(0, 0, (float)(stext_text_width(g_font, 0.75f, st) + 16), 24, RGBA8(0, 0, 0, 150));
+        textf(8, 18, g_fps >= 15 && audio_load_pct() < 80 ? COL_OK : COL_ERR, 0.75f, "%s", st);
     }
     if (g_panel) {
         vita2d_draw_rectangle(480, 40, 470, 400, RGBA8(10, 12, 18, 225));

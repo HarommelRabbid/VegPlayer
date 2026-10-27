@@ -154,6 +154,7 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_OFX_GUID    "a2fc1a41-01f6-460e-ae5a-2be4af57b92e"   /* OFX host wrapper: the effect is named by an Svfx id */
 #define FX_CHANBLEND_GUID "0bc15b73-83b9-11d4-9f67-00485481bd31" /* Sony Channel Blend (DXT) */
 #define FX_GRADMAP_GUID   "300f2f5f-d7c7-48be-b796-90fc740b654e" /* Sony Gradient Map (DXT) */
+#define FX_LINBLUR_GUID   "8dbe8301-d9a5-4fd5-8901-1d8bf4d3a6c0" /* Sony Linear Blur (DXT, Vegas 8) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
 #define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
@@ -226,9 +227,9 @@ static int parse_media(St *s, const uint8_t *b, size_t bl)
     uint32_t id; size_t path_at;
     if (!memcmp(b + 0x30, MEDIA_ID_MARK, 8)) {
         id = rd32(b + 0x3c);
-        /* the first word is the path's offset: 0x60 in most files, 0x80 in some (scan.veg) */
+        /* the first word is the path's offset: 0x60 in most files, 0x80 in some, 0x50 in Vegas 8 */
         uint32_t po = rd32(b);
-        path_at = po >= 0x60 && po < 0x200 && po < bl ? po : 0x60;
+        path_at = po >= 0x40 && po < 0x200 && po < bl ? po : 0x60;
     }
     else {   /* older layout: search like vegtool did */
         const uint8_t *m = mem_find(b, bl, MEDIA_ID_MARK, 8);
@@ -261,6 +262,20 @@ static int parse_media(St *s, const uint8_t *b, size_t bl)
                 m->rgba[2] = rdf(j + 16 + n); m->rgba[1] = rdf(j + 20 + n);
                 m->rgba[0] = rdf(j + 24 + n); m->rgba[3] = rdf(j + 28 + n);
                 for (int k = 0; k < 4; k++) m->rgba[k] = m->rgba[k] < 0 ? 0 : m->rgba[k] > 1 ? 1 : m->rgba[k];
+            }
+        }
+        if (m->type != VEG_MEDIA_SOLID) {
+            /* Vegas 8 layout: the four floats (B, G, R, A) follow the generator GUID within ~0x60 bytes; take the
+             * first run of four floats in 0..1 whose alpha is 1 */
+            const uint8_t *g = mem_find(b, bl, SOLID_GEN, 16);
+            for (size_t k = (size_t)(g - b) + 16; g && k + 16 <= bl && k < (size_t)(g - b) + 0x80; k += 2) {
+                float c[4] = { rdf(b + k), rdf(b + k + 4), rdf(b + k + 8), rdf(b + k + 12) };
+                int ok = c[3] == 1.0f;
+                for (int q = 0; q < 3 && ok; q++) ok = c[q] >= 0 && c[q] <= 1 && (rd32(b + k + 4 * q) == 0 || rd32(b + k + 4 * q) > 0x30000000u);
+                if (!ok) continue;
+                m->type = VEG_MEDIA_SOLID;
+                m->rgba[2] = c[0]; m->rgba[1] = c[1]; m->rgba[0] = c[2]; m->rgba[3] = 1;
+                break;
             }
         }
     } else if (mem_find(b, bl, TEXT_GEN, 16) || ci_contains(m->path, "titlesandtext") || ci_contains(m->path, ":text}")) {
@@ -384,7 +399,8 @@ static const uint8_t *dxt_params(const uint8_t *b, size_t bl, size_t *len)
     for (size_t k = q + 8; k + 0x1c <= bl; k += 4) {
         if (rd32(b + k) != 0x1c) continue;
         uint32_t S = rd32(b + k + 0x18);
-        if (S == k - q && k + 0x1c + S <= bl) { *len = S; return b + k + 0x1c; }
+        /* the copy has the static block's length (short static blocks, e.g. Linear Blur: 12 vs 16) */
+        if ((S == k - q || (k - q < 32 && S >= 8 && S <= 64)) && k + 0x1c + S <= bl) { *len = S; return b + k + 0x1c; }
     }
     *len = bl - q;
     return b + q;
@@ -477,20 +493,36 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
             v->type = VFX_GRAYSCALE;
             v->amount = dxt_param(b, bl, 1.0);
         } else if (!strcmp(plug, FX_CHANBLEND_GUID)) {
-            /* 2 x 20 doubles; the first block: for each input channel (R,G,B,A) its weight in output R,G,B,A + one
-             * more value. "Red Only" = red copied to R, G and B. The second block stays identity (not applied). */
+            /* 2 x 20 doubles; the first block: for each output channel (R,G,B,A) its weights from input R,G,B,A and
+             * one more value. "Red Only" = red output from R+G+B (normalised), green and blue zero: the picture's
+             * brightness in red. The second block stays identity (not applied). */
             size_t pl;
             const uint8_t *pp = dxt_params(b, bl, &pl);
             if (pp && pl >= 20 * 8) {
                 v->type = VFX_MATRIX;
                 for (int o = 0; o < 3; o++) {
+                    double row[3], sum = 0;
                     for (int in = 0; in < 3; in++) {
-                        double w = rdd(pp + (size_t)(in * 5 + o) * 8);
-                        v->mtx[o * 4 + in] = (float)(w > -16 && w < 16 ? w : 0);
+                        double w = rdd(pp + (size_t)(o * 5 + in) * 8);
+                        row[in] = w > -16 && w < 16 ? w : 0;
+                        sum += row[in];
                     }
+                    double norm = sum > 1 ? sum : 1;   /* weights adding up past 1 are scaled back */
+                    for (int in = 0; in < 3; in++) v->mtx[o * 4 + in] = (float)(row[in] / norm);
                     v->mtx[o * 4 + 3] = 0;
                 }
             } else v->type = VFX_UNKNOWN;
+        } else if (!strcmp(plug, FX_LINBLUR_GUID)) {
+            /* doubles: angle (degrees), amount (as the OFX version) */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            v->type = VFX_LINEARBLUR;
+            v->angle = 0; v->amount = 0.05;
+            if (pp && pl >= 16) {
+                double a = rdd(pp), am = rdd(pp + 8);
+                if (a > -1000 && a < 1000) v->angle = a;
+                if (am >= 0 && am <= 1) v->amount = am;
+            }
         } else if (!strcmp(plug, FX_GRADMAP_GUID)) {
             /* double amount, u32 -, u32 stop count, then 32-byte stops: floats B,G,R,A, double position, double - */
             size_t pl;
@@ -707,11 +739,13 @@ static int event_chunk(St *s, const Chunk *c)
         if (!np) return -1;
         e->vfx = np;
         e->vfx[e->nvfx++] = v;
-    } else if (gpre(c, G_STRETCH) && e && bl >= 0x1c) {
+    } else if (gpre(c, G_STRETCH) && e && bl >= 0x18) {
+        /* method @0x0c; Vegas 9+: attribute @0x10, semitones (double) @0x14; Vegas 8 (24-byte chunk): semitones @0x10 */
+        int v8 = bl < 0x1c;
         e->has_stretch = 1;
         e->stretch_method = (int)rd32(b + 0x0c);
-        e->stretch_attr = (int)rd32(b + 0x10);
-        double ps = rdd(b + 0x14);
+        e->stretch_attr = v8 ? 0 : (int)rd32(b + 0x10);
+        double ps = rdd(b + (v8 ? 0x10 : 0x14));
         e->pitch_semis = (ps > -100 && ps < 100) ? ps : 0;
     } else if (gpre(c, G_AFX_CHAIN) && e) {
         if (parse_afx_chain(s, b, bl, &e->afx, &e->nafx) < 0) return -1;

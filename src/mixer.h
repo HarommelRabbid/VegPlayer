@@ -15,6 +15,7 @@ void mixer_reset(void);                                   /* drop all voices (af
 /* mix `frames` stereo frames starting at timeline sample `start` (OUT_RATE units) into out (interleaved float) */
 void mixer_mix(float *out, int frames, int64_t start);
 int mixer_active_voices(void);
+int audio_load_pct(void);       /* time the last second's worst audio block took to mix, % of its duration */
 
 
 /* Vita output thread: the audio clock drives the picture */

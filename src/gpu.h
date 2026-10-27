@@ -41,6 +41,7 @@ const char *gpu_status(void);  /* human-readable shader status */
 typedef struct {
     const SceGxmTexture *tex;
     float x[4], y[4];   /* screen-space corners of the source picture: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right */
+    float u[4], v[4];   /* texcoords of those corners (0..1; beyond for a blur that spills past the picture) */
     float m[12];        /* colour matrix rows R,G,B: (r, g, b, constant) */
     float tint[4];      /* final multiplier (r, g, b, a) */
     int blend;          /* BLEND_* */

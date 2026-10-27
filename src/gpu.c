@@ -147,8 +147,11 @@ static const char FRAG_LUT_SRC[] =
     "}\n";
 
 /* PASS_BLUR: 17 taps along a line (Linear/Gaussian Blur: uDir.xy) or towards a centre (Radial Blur:
- * (texcoord - uDir.zw) * uRad.x), weighted by uW0..uW4 (17 used), then the colour matrix */
+ * (texcoord - uDir.zw) * uRad.x), weighted by uW0..uW4 (17 used), then the colour matrix. Taps outside the picture
+ * count as transparent (the quad is enlarged so the blur spills past the edges, like Vegas); the sum is
+ * un-premultiplied so soft edges keep their colour. */
 static const char FRAG_BLUR_SRC[] =
+    "float inside(float2 t) { float2 s = step(float2(0.0f, 0.0f), t) * step(t, float2(1.0f, 1.0f)); return s.x * s.y; }\n"
     "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex,\n"
     "            uniform float4 uMatR, uniform float4 uMatG, uniform float4 uMatB, uniform float4 uTint,\n"
     "            uniform float4 uDir, uniform float4 uRad, uniform float4 uW0, uniform float4 uW1, uniform float4 uW2,\n"
@@ -156,29 +159,30 @@ static const char FRAG_BLUR_SRC[] =
     "{\n"
     "    float2 d = (uDir.xy + (vTexcoord - uDir.zw) * uRad.x) * 0.125f;\n"
     "    float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
-    "    c += tex2D(tex, vTexcoord - 8.0f * d) * uW0.x;\n"
-    "    c += tex2D(tex, vTexcoord - 7.0f * d) * uW0.y;\n"
-    "    c += tex2D(tex, vTexcoord - 6.0f * d) * uW0.z;\n"
-    "    c += tex2D(tex, vTexcoord - 5.0f * d) * uW0.w;\n"
-    "    c += tex2D(tex, vTexcoord - 4.0f * d) * uW1.x;\n"
-    "    c += tex2D(tex, vTexcoord - 3.0f * d) * uW1.y;\n"
-    "    c += tex2D(tex, vTexcoord - 2.0f * d) * uW1.z;\n"
-    "    c += tex2D(tex, vTexcoord - d) * uW1.w;\n"
-    "    c += tex2D(tex, vTexcoord ) * uW2.x;\n"
-    "    c += tex2D(tex, vTexcoord + d) * uW2.y;\n"
-    "    c += tex2D(tex, vTexcoord + 2.0f * d) * uW2.z;\n"
-    "    c += tex2D(tex, vTexcoord + 3.0f * d) * uW2.w;\n"
-    "    c += tex2D(tex, vTexcoord + 4.0f * d) * uW3.x;\n"
-    "    c += tex2D(tex, vTexcoord + 5.0f * d) * uW3.y;\n"
-    "    c += tex2D(tex, vTexcoord + 6.0f * d) * uW3.z;\n"
-    "    c += tex2D(tex, vTexcoord + 7.0f * d) * uW3.w;\n"
-    "    c += tex2D(tex, vTexcoord + 8.0f * d) * uW4.x;\n"
-    "    float4 p = float4(c.rgb, 1.0f);\n"
+    "    float2 t;\n"
+    "    t = vTexcoord - 8.0f * d; c += tex2D(tex, t) * (uW0.x * inside(t));\n"
+    "    t = vTexcoord - 7.0f * d; c += tex2D(tex, t) * (uW0.y * inside(t));\n"
+    "    t = vTexcoord - 6.0f * d; c += tex2D(tex, t) * (uW0.z * inside(t));\n"
+    "    t = vTexcoord - 5.0f * d; c += tex2D(tex, t) * (uW0.w * inside(t));\n"
+    "    t = vTexcoord - 4.0f * d; c += tex2D(tex, t) * (uW1.x * inside(t));\n"
+    "    t = vTexcoord - 3.0f * d; c += tex2D(tex, t) * (uW1.y * inside(t));\n"
+    "    t = vTexcoord - 2.0f * d; c += tex2D(tex, t) * (uW1.z * inside(t));\n"
+    "    t = vTexcoord - d; c += tex2D(tex, t) * (uW1.w * inside(t));\n"
+    "    t = vTexcoord; c += tex2D(tex, t) * (uW2.x * inside(t));\n"
+    "    t = vTexcoord + d; c += tex2D(tex, t) * (uW2.y * inside(t));\n"
+    "    t = vTexcoord + 2.0f * d; c += tex2D(tex, t) * (uW2.z * inside(t));\n"
+    "    t = vTexcoord + 3.0f * d; c += tex2D(tex, t) * (uW2.w * inside(t));\n"
+    "    t = vTexcoord + 4.0f * d; c += tex2D(tex, t) * (uW3.x * inside(t));\n"
+    "    t = vTexcoord + 5.0f * d; c += tex2D(tex, t) * (uW3.y * inside(t));\n"
+    "    t = vTexcoord + 6.0f * d; c += tex2D(tex, t) * (uW3.z * inside(t));\n"
+    "    t = vTexcoord + 7.0f * d; c += tex2D(tex, t) * (uW3.w * inside(t));\n"
+    "    t = vTexcoord + 8.0f * d; c += tex2D(tex, t) * (uW4.x * inside(t));\n"
+    "    float4 p = float4(c.rgb / max(c.a, 0.0001f), 1.0f);\n"
     "    float3 o = float3(dot(uMatR, p), dot(uMatG, p), dot(uMatB, p));\n"
     "    return float4(saturate(o), c.a) * uTint;\n"
     "}\n";
 
-#define SHADER_VERSION 3
+#define SHADER_VERSION 4
 
 typedef struct {
     const char *name, *src;
@@ -398,8 +402,7 @@ void gpu_draw_layer(const GpuLayer *L)
 {
     vita2d_texture_vertex *v = vita2d_pool_memalign(4 * sizeof(vita2d_texture_vertex), sizeof(vita2d_texture_vertex));
     if (!v) return;
-    static const float U[4] = { 0, 1, 0, 1 }, V[4] = { 0, 0, 1, 1 };
-    for (int i = 0; i < 4; i++) { v[i].x = L->x[i]; v[i].y = L->y[i]; v[i].z = 0.5f; v[i].u = U[i]; v[i].v = V[i]; }
+    for (int i = 0; i < 4; i++) { v[i].x = L->x[i]; v[i].y = L->y[i]; v[i].z = 0.5f; v[i].u = L->u[i]; v[i].v = L->v[i]; }
 
     if (!g_shaders_ok) {
         /* vita2d's own textured program: transforms, opacity and add-blend only (effects were baked on the CPU) */

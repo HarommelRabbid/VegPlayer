@@ -88,13 +88,19 @@ int main(int argc, char **argv)
     float *blk = malloc(sizeof(float) * 2048);
     int maxv = 0; double peak = 0;
     t0 = time_us();
+    double worst = 0; int worst_at = 0;
     for (int s = 0; s < total; s += 1024) {
+        uint64_t b0 = time_us();
         mixer_mix(blk, 1024, s);
+        double bt = (double)(time_us() - b0);
+        if (bt > worst) { worst = bt; worst_at = s; }
         int v = mixer_active_voices(); if (v > maxv) maxv = v;
         for (int k = 0; k < 2048; k++) if (fabs(blk[k]) > peak) peak = fabs(blk[k]);
     }
     t1 = time_us();
     printf("mixer: %.1f s of audio in %.2f s on host (%.0fx realtime), max voices %d, peak %.2f\n", p->duration, (t1 - t0) / 1e6,
            p->duration / ((t1 - t0) / 1e6), maxv, peak);
+    printf("  worst block: %.0f us at %.2f s (a block lasts %.0f us; average %.0f us)\n", worst, worst_at / (double)OUT_RATE,
+           1024e6 / OUT_RATE, (double)(t1 - t0) / (total / 1024.0));
     return 0;
 }
