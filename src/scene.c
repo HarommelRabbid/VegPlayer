@@ -446,6 +446,13 @@ static void build(Scene *sc, int buf, double T)
             if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
             place(p, e, tr, tau, pw, ph, L->x, L->y);
+            if (vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
+                /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
+                float sw = hypotf(L->x[1] - L->x[0], L->y[1] - L->y[0]), sh = hypotf(L->x[2] - L->x[0], L->y[2] - L->y[0]);
+                int slot = (int)(img - m->vc.img);
+                if (slot >= 0 && slot < m->vc.nimg && m->vc.imgq[slot].data &&
+                    sw <= 0.4f * img->w && sh <= 0.4f * img->h) img = &m->vc.imgq[slot];
+            }
             L->u[0] = 0; L->u[1] = 1; L->u[2] = 0; L->u[3] = 1;
             L->v[0] = 0; L->v[1] = 0; L->v[2] = 1; L->v[3] = 1;
             Chain ch;

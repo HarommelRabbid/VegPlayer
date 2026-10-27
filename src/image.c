@@ -37,6 +37,9 @@ int image_load_to_cache(const char *path, VideoCache *vc, int max_w, int max_h, 
     uint8_t *scratch = malloc(downscale_scratch_size(w, h, cw, chh));
     if (!scratch) { stbi_image_free(px); snprintf(err, errlen, "out of memory"); return -1; }
     downscale_rgba(px, w * 4, w, h, &vc->img[0], 1, scratch);
+    vc->imgq = calloc(1, sizeof(GpuImage));
+    if (vc->imgq && gpu_image_alloc(&vc->imgq[0], QUARTER(cw), QUARTER(chh), 4) == 0)
+        downscale_rgba(px, w * 4, w, h, &vc->imgq[0], 1, scratch);
     free(scratch);
     stbi_image_free(px);
     vc->nimg = 1; vc->nframes = 1; vc->pts[0] = 0; vc->slot[0] = 0;

@@ -15,6 +15,7 @@ typedef struct {
     float *pts;             /* nframes presentation times (seconds), ascending */
     int *slot;              /* per frame: index into img, or -1 */
     GpuImage *img; int nimg;
+    GpuImage *imgq;         /* per slot: a quarter-size copy (or NULL): small layers sample it, faster and no shimmer */
     int cache_w, cache_h, bpp;
 } VideoCache;
 
@@ -88,6 +89,7 @@ int image_load_to_cache(const char *path, VideoCache *vc, int max_w, int max_h, 
 
 /* shared downscaler: RGBA8888 rows -> cache image (box filter) */
 void downscale_rgba(const uint8_t *src, int src_pitch_bytes, int sw, int sh, GpuImage *dst, int keep_alpha, uint8_t *scratch);
+#define QUARTER(n) ((n) / 4 > 8 ? (n) / 4 : 8)   /* size of the quarter-size copy */
 size_t downscale_scratch_size(int sw, int sh, int dw, int dh);
 
 #endif

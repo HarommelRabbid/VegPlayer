@@ -160,6 +160,7 @@ static void got_picture(Ctx *c, Dec *d, const SceAvcdecPicture *pic)
     if (k < 0 || k >= vc->nframes || !c->need[k] || vc->slot[k] >= 0 || c->next_slot >= vc->nimg) return;
     int s = c->next_slot++;
     downscale_rgba(d->pic, d->pitch * 4, c->src_w, c->src_h, &vc->img[s], 0, c->scratch);
+    if (vc->imgq && vc->imgq[s].data) downscale_rgba(d->pic, d->pitch * 4, c->src_w, c->src_h, &vc->imgq[s], 0, c->scratch);
     vc->slot[k] = s;
     c->produced++;
 }

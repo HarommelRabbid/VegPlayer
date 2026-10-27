@@ -137,6 +137,8 @@ so preparing decodes only the frames the timeline shows, with the hardware H.264
 GPU memory (CDRAM first, then mapped RAM; RGBA or RGB565, sized to fit the budget). Playback never seeks a decoder.
 
 - **main thread**: UI and sceGxm submission (vita2d context), vsync'd at 60 Hz.
+- Every cached frame also gets a quarter-size copy; layers drawn small sample that one, which keeps the GPU's texture
+  cache happy (and stops small tiles shimmering).
 - **vp_scene** (core 2): builds the layer list for the audio clock's current time: frame lookup, Pan/Crop and Track
   Motion maths, effect matrices. Scenes are triple-buffered between this thread and the render thread.
 - **vp_audio** (core 1, top priority): mixer and `sceAudioOut`. Its clock drives the picture.
