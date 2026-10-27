@@ -1,6 +1,7 @@
 #include <math.h>
 /* Host-side check of the .veg reader:  cc -O2 -I../src vegdump.c ../src/veg.c -lm -o vegdump */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "veg.h"
 
@@ -71,16 +72,18 @@ int main(int argc, char **argv)
                nostr, meth[0], meth[1], meth[2], pitched, minpitch, maxpitch, panned, nomedia, xf);
         if (p.unknown_fx[0]) printf("  unknown fx: %s\n", p.unknown_fx);
         /* a few sample events */
+        /* VD_T0 / VD_T1 (seconds): list every event starting in that range instead of a few samples */
+        double vt0 = getenv("VD_T0") ? atof(getenv("VD_T0")) : -1, vt1 = getenv("VD_T1") ? atof(getenv("VD_T1")) : 1e9;
         int shown = 0;
-        for (int i = 0; i < p.nevents && shown < 6; i++) {
+        for (int i = 0; i < p.nevents && (vt0 >= 0 || shown < 6); i++) {
             VegEvent *e = &p.events[i];
-            if (!(e->nvfx || e->nafx || e->pitch_semis != 0 || e->rate != 1)) continue;
+            if (vt0 >= 0 ? (e->start + e->length < vt0 || e->start > vt1) : !(e->nvfx || e->nafx || e->pitch_semis != 0 || e->rate != 1)) continue;
             shown++;
             printf("   ev%d trk%d %s %.3f+%.3f rate=%.3f off=%.3f lvl=%.3f fade=%.3f/%.3f pitch=%.1f m=%d", e->seq, e->track,
                    e->kind ? "V" : "A", e->start, e->length, e->rate, e->offset, e->level, e->fade_in, e->fade_out, e->pitch_semis, e->stretch_method);
             for (int k = 0; k < e->nvfx; k++) printf(" [vfx %s %s amt=%.2f h=%.2f s=%.2f l=%.2f]", VFXN[e->vfx[k].type], e->vfx[k].name, e->vfx[k].amount, e->vfx[k].hue, e->vfx[k].sat, e->vfx[k].lum);
             for (int k = 0; k < e->nafx; k++) printf(" [afx %s '%s' semis=%.2f preserve=%d mode=%d]", AFXN[e->afx[k].type], e->afx[k].name, e->afx[k].semitones, e->afx[k].preserve, e->afx[k].mode);
-            if (e->npan) printf(" pan[%d] %dx%d k0=(%.1f,%.1f %.1fx%.1f r%.2f)", e->npan, e->pan_w, e->pan_h, e->pan[0].cx, e->pan[0].cy, e->pan[0].w, e->pan[0].h, e->pan[0].rot);
+            if (e->npan) printf(" pan[%d] %dx%d k0=(%.1f,%.1f %.1fx%.1f r%.2f) media=%d", e->npan, e->pan_w, e->pan_h, e->pan[0].cx, e->pan[0].cy, e->pan[0].w, e->pan[0].h, e->pan[0].rot, e->media);
             printf("\n");
         }
         veg_free(&p);

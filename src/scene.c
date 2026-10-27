@@ -324,12 +324,16 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
             double w1 = a1 >= ap ? W : H * a1, h1 = a1 >= ap ? W / a1 : H;
             lx = w1 / w0; ly = h1 / h0;
         }
+        /* the window is rotated by k.rot in the source, so the picture turns the other way in the output; a mirrored
+         * window (negative size) flips the picture inside the rotated window, i.e. after the rotation. Both matter
+         * only together: scan.veg's 90-degree mirrored boxes land on the opposite side to the plain ones. */
         for (int i = 0; i < 4; i++) {
             double dx = px[i] - kcx, dy = py[i] - kcy;
-            if (k.w < 0) dx = -dx;
-            if (k.h < 0) dy = -dy;
-            qx[i] = W / 2 + kk * (c * dx - s * dy);
-            qy[i] = H / 2 + kk * (s * dx + c * dy);
+            double rx = c * dx + s * dy, ry = -s * dx + c * dy;
+            if (k.w < 0) rx = -rx;
+            if (k.h < 0) ry = -ry;
+            qx[i] = W / 2 + kk * rx;
+            qy[i] = H / 2 + kk * ry;
         }
     } else {
         double fit = fmin(W / pw, H / ph);
