@@ -475,7 +475,7 @@ static const int CACHE_OPTS[] = { 0, 64, 96, 128, 176, 224 };
 static void options_frame(void)
 {
     header("Options", "{LEFT}{RIGHT} change   {O} back");
-    char rows[6][160];
+    char rows[7][160];
     static const char *STR[] = { "as in the project", "None (resample)", "Classic", "elastique (WSOLA approx.)" };
     static const char *PSM[] = { "as in the project", "resample (speed + pitch)", "Classic (preserve duration)" };
     snprintf(rows[0], 160, "Audio stretch/pitch method:  %s", STR[g_cfg.force_stretch + 1]);
@@ -485,14 +485,15 @@ static void options_frame(void)
     snprintf(rows[4], 160, "Generator compositing guesses (add/subtract):  %s", g_cfg.compositing_guess ? "on" : "off");
     if (g_cfg.cache_mb) snprintf(rows[5], 160, "Frame cache budget:  %d MB", g_cfg.cache_mb);
     else snprintf(rows[5], 160, "Frame cache budget:  automatic (176 MB)");
-    for (int i = 0; i < 6; i++) {
+    snprintf(rows[6], 160, "Track Motion with other-shaped sources:  %s", g_cfg.tm_follow_source ? "follows the source (aligned)" : "as in Vegas");
+    for (int i = 0; i < 7; i++) {
         int y = 60 + i * 34;
         if (i == g_osel) vita2d_draw_rectangle(10, y, SCREEN_W - 20, 32, COL_SEL);
         text(24, y + 23, COL_TEXT, 0.95f, rows[i]);
     }
-    text(24, 300, COL_DIM, 0.8f, "The Vegas methods are reverse-engineered: if a project sounds wrong, try forcing them here.");
-    text(24, 324, COL_DIM, 0.8f, "Changes to audio apply immediately; the cache budget applies at the next prepare.");
-    list_nav(&g_osel, 6, 6);
+    text(24, 334, COL_DIM, 0.8f, "The Vegas methods are reverse-engineered: if a project sounds wrong, try forcing them here.");
+    text(24, 358, COL_DIM, 0.8f, "Changes to audio apply immediately; the cache budget applies at the next prepare.");
+    list_nav(&g_osel, 7, 7);
     int d = (g_repeat & SCE_CTRL_RIGHT) ? 1 : (g_repeat & SCE_CTRL_LEFT) ? -1 : (g_pressed & SCE_CTRL_CROSS) ? 1 : 0;
     if (d) {
         switch (g_osel) {
@@ -509,6 +510,7 @@ static void options_frame(void)
             g_s.prepared = 0;
             break;
         }
+        case 6: g_cfg.tm_follow_source ^= 1; break;
         }
         config_save();
         if (g_osel <= 2) mixer_reset();

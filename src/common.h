@@ -54,6 +54,7 @@ typedef struct {
     int show_fps;
     int cache_mb;             /* frame cache budget, MB */
     int compositing_guess;    /* apply guessed track compositing codes to generator tracks */
+    int tm_follow_source;     /* scale Track Motion moves with a source of another shape (Vegas doesn't) */
     char last_dir[512];
 } Config;
 extern Config g_cfg;

@@ -67,7 +67,8 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   folded into one 3×4 matrix and applied by one GPU pass per layer. Unknown effects are listed on the Sources screen.
 - **Pan/Crop** keyframes (linear between keys, mirroring, rotation; like Vegas, the window is rescaled to the
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
-  (first keyframe), generator-track Add/Subtract compositing (guessed, like vegtool).
+  (first keyframe; when the source has another shape, its moves are scaled with the rescaled layout so moved
+  tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
 - **Opacity**: video track Level, event fade-in/fade-out with their curves (Linear, Fast, Slow, Smooth, Sharp),
   crossfades between overlapping events (dissolve).
 - **Audio pitch attribute** (Event Properties → Time stretch/pitch shift):

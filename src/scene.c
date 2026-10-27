@@ -139,6 +139,7 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
     double W = p->width, H = p->height;
     double px[4] = { 0, (double)pw, 0, (double)pw }, py[4] = { 0, 0, (double)ph, (double)ph };
     double qx[4], qy[4];
+    double lx = 1, ly = 1;   /* how much the layout shrank/grew because the source has another shape (see below) */
     if (e->npan) {
         VegPanKey k;
         pan_at(e, tau, &k);
@@ -150,6 +151,15 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         if (ah < 1) ah = 1;
         double kk = fmin(W / aw, H / ah);
         double c = cos(k.rot), s = sin(k.rot);
+        /* the full recorded frame fitted into the output, before and after the rescale: a 16:9 layout played with
+         * a 1:1 source becomes a square layout, lx = 0.5625. Track Motion moves are scaled the same way below,
+         * so tracks moved by Track Motion stay on the layout's grid (Vegas doesn't do this; it's an option). */
+        if (g_cfg.tm_follow_source) {
+            double a0 = SW / SH, a1 = (double)pw / ph, ap = W / H;
+            double w0 = a0 >= ap ? W : H * a0, h0 = a0 >= ap ? W / a0 : H;
+            double w1 = a1 >= ap ? W : H * a1, h1 = a1 >= ap ? W / a1 : H;
+            lx = w1 / w0; ly = h1 / h0;
+        }
         for (int i = 0; i < 4; i++) {
             double dx = px[i] - kcx, dy = py[i] - kcy;
             if (k.w < 0) dx = -dx;
@@ -166,7 +176,7 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         double asp = W / H;
         double tw = t->tm_w != 0 ? t->tm_w : asp, th = t->tm_h != 0 ? t->tm_h : 1.0;
         double sx = fabs(tw) / asp, sy = fabs(th);
-        double cx = W / 2 + t->tm_x * H / 2, cy = H / 2 - t->tm_y * H / 2;
+        double cx = W / 2 + t->tm_x * H / 2 * lx, cy = H / 2 - t->tm_y * H / 2 * ly;
         for (int i = 0; i < 4; i++) {
             double dx = (qx[i] - W / 2) * sx, dy = (qy[i] - H / 2) * sy;
             if (tw < 0) dx = -dx;
