@@ -5,7 +5,7 @@
 #include <string.h>
 #include "veg.h"
 
-static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon", "chanblend", "lab", "colorcorr", "gradient", "linearblur", "radialblur", "noop", "gaussblur" };
+static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon", "chanblend", "lab", "colorcorr", "gradient", "linearblur", "radialblur", "noop", "gaussblur", "glow" };
 static const char *AFXN[] = { "unknown", "pitchshift", "vibrato", "reverb", "noop" };
 
 int main(int argc, char **argv)
@@ -64,7 +64,7 @@ int main(int argc, char **argv)
             if (e->xfade_in > 0) xf++;
         }
         printf("  vfx:");
-        for (int k = 1; k < 14; k++) if (vfxc[k]) printf(" %s=%d", VFXN[k], vfxc[k]);
+        for (int k = 1; k < (int)(sizeof VFXN / sizeof *VFXN); k++) if (vfxc[k]) printf(" %s=%d", VFXN[k], vfxc[k]);
         printf(" unknown=%d | afx:", vfxc[0]);
         for (int k = 1; k < 5; k++) if (afxc[k]) printf(" %s=%d", AFXN[k], afxc[k]);
         printf(" unknown=%d\n", afxc[0]);

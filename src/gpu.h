@@ -11,7 +11,9 @@
 enum { BLEND_NORMAL = 0, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_LIGHTEN, BLEND_DARKEN, BLEND_CUT, BLEND_COUNT };
 /* layer passes: colour matrix; matrix -> brightness lookup (Gradient Map) -> matrix; blur along a line / towards a centre */
 /* PASS_SHADOW: the picture's shape (its alpha) with softened edges, filled with the tint colour (Track Motion shadow/glow) */
-enum { PASS_MATRIX = 0, PASS_LUT, PASS_BLUR, PASS_SHADOW, PASS_COUNT };
+/* PASS_GLOW: the Glow effect's light, drawn additively over the layer: bright parts (after the colour matrix) above a
+ * threshold, spread over a small disc, in the glow colour */
+enum { PASS_MATRIX = 0, PASS_LUT, PASS_BLUR, PASS_SHADOW, PASS_GLOW, PASS_COUNT };
 
 /* ---- memory: big mapped blocks carved into textures (CDRAM first, then main RAM) */
 size_t gpu_arena_reserve(size_t want);       /* main thread; returns bytes actually reserved */
@@ -54,7 +56,8 @@ typedef struct {
     float dir[4];       /* PASS_BLUR: step (texcoords, at the outermost tap) and radial centre */
     float rad[4];       /* PASS_BLUR: x = radial strength */
     float w[20];        /* PASS_BLUR: 17 tap weights (sum 1) */
-    float soft[4];      /* PASS_SHADOW: 1 / (2 * edge), edge (texcoords, x and y); the quad is enlarged by edge */
+    float soft[4];      /* PASS_SHADOW: 1 / (2 * edge), edge (texcoords, x and y); the quad is enlarged by edge.
+                           PASS_GLOW: radius (texcoords x, y), threshold, 1 / (1 - threshold) */
 } GpuLayer;
 
 void gpu_draw_layer(const GpuLayer *L);

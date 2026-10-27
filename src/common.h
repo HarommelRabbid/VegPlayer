@@ -57,6 +57,7 @@ typedef struct {
     int tm_follow_source;     /* scale Track Motion moves with a source of another shape (Vegas doesn't) */
     int small_copies;         /* keep quarter-size frame copies for layers shown small (more memory) */
     int tm_fx;                /* draw Track Motion 2D Shadow / 2D Glow */
+    int glow;                 /* draw the Glow video effect */
     char last_dir[512];
 } Config;
 extern Config g_cfg;

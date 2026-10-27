@@ -43,6 +43,7 @@ enum {
     VFX_RADIALBLUR,  /* Radial Blur: amount, centre (cx, cy 0..1) */
     VFX_NOOP,        /* recognised, nothing to do (e.g. default Color Corrector) */
     VFX_GAUSSBLUR,   /* Gaussian Blur: a = horizontal range, b = vertical range (fractions of the picture) */
+    VFX_GLOW,        /* Glow: amount = glow percent, a = intensity, b = suppression, color = glow colour */
 };
 #define VFX_MAX_STOPS 8
 typedef struct {
@@ -55,6 +56,7 @@ typedef struct {
     double angle, cx, cy;             /* blurs */
     float mtx[12];                    /* VFX_MATRIX / VFX_COLORCORR */
     int nstops; float stop_pos[VFX_MAX_STOPS], stop_rgb[VFX_MAX_STOPS][3];   /* Gradient Map */
+    float color[3];                   /* Glow colour (r, g, b 0..1) */
     int lut;                          /* player side: gradient texture slot (-1 = none) */
 } VegVfx;
 

@@ -185,18 +185,19 @@ static void luts_build(void)
 /* The chain (event effects, then track effects) becomes one GPU pass: colour effects fold into the matrix m;
  * a Gradient Map splits the chain (m before it, m2 after it); a blur is applied when sampling (it commutes with
  * the colour matrix). One special effect per layer: the first one wins. */
-typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; } Chain;
+typedef struct { int pass; float m[12], m2[12]; const VegVfx *special, *glow; } Chain;   /* glow: first Glow effect */
 
 static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
 {
     cm_identity(c->m); cm_identity(c->m2);
-    c->pass = PASS_MATRIX; c->special = NULL;
+    c->pass = PASS_MATRIX; c->special = NULL; c->glow = NULL;
     for (int pass = 0; pass < 2; pass++) {
         const VegVfx *fx = pass ? t->vfx : e->vfx;
         int n = pass ? t->nvfx : e->nvfx;
         for (int i = 0; i < n; i++) {
             const VegVfx *v = &fx[i];
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
+            if (v->type == VFX_GLOW) { if (!c->glow) c->glow = v; continue; }   /* an extra additive layer (build) */
             if (v->type == VFX_GRADIENT || v->type == VFX_LINEARBLUR || v->type == VFX_RADIALBLUR || v->type == VFX_GAUSSBLUR) {
                 if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
                     c->special = v;
@@ -421,6 +422,39 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
 
 /* ------------------------------------------------------------------ building */
 
+/* the Glow effect's light for layer S (drawn already): the same picture through the same colour matrix, its parts
+ * above the threshold spread over a small disc, added on top in the glow colour. Guessed mapping: glow percent sets
+ * both the threshold (1 - percent) and the radius (percent x 12 % of the frame height); intensity scales the light. */
+static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, GpuLayer *L)
+{
+    if (S->pass == PASS_BLUR || S->blend != BLEND_NORMAL || S->tint[3] <= 0.002f) return 0;
+    *L = *S;
+    float ax = S->x[1] - S->x[0], ay = S->y[1] - S->y[0], bx = S->x[2] - S->x[0], by = S->y[2] - S->y[0];
+    float la = hypotf(ax, ay), lb = hypotf(bx, by);
+    if (la < 2 || lb < 2) return 0;
+    float r = (float)g->amount * 0.12f * frame_h;
+    float rx = r / la, ry = r / lb;
+    if (rx > 0.5f) rx = 0.5f;
+    if (ry > 0.5f) ry = 0.5f;
+    float thr = 1.0f - (float)g->amount;
+    thr = thr < 0.05f ? 0.05f : thr > 0.95f ? 0.95f : thr;
+    L->soft[0] = rx; L->soft[1] = ry; L->soft[2] = thr; L->soft[3] = 1.0f / (1.0f - thr);
+    L->pass = PASS_GLOW;
+    L->blend = BLEND_ADD;
+    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a;
+    L->tint[3] = S->tint[3];
+    L->fx = 1;
+    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
+    float x0 = S->x[0], y0 = S->y[0];
+    for (int i = 0; i < 4; i++) {
+        float u = CU[i] ? 1 + rx : -rx, w = CV[i] ? 1 + ry : -ry;
+        L->u[i] = u; L->v[i] = w;
+        L->x[i] = x0 + u * ax + w * bx;
+        L->y[i] = y0 + u * ay + w * by;
+    }
+    return 1;
+}
+
 /* a Track Motion shadow / glow layer for the picture img placed for event e: its shape, moved/scaled by fx, with edges
  * softened over the blur width, in the fx colour. Without the shadow shader: a flat, hard-edged quad of the colour. */
 static void tm_fx_layer(const VegProject *p, const VegEvent *e, const VegTrack *tr, double tau, int pw, int ph,
@@ -469,7 +503,7 @@ static void build(Scene *sc, int buf, double T)
 {
     VegProject *p = &g_s.proj;
     uint64_t t0 = time_us();
-    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = 0;
+    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = sc->nglow = 0;
     sc->vx = g_vx; sc->vy = g_vy; sc->vw = g_vw; sc->vh = g_vh;
     int fb_used = 0;
     /* Vegas: the first track is in front, so draw from the last track up */
@@ -595,6 +629,12 @@ static void build(Scene *sc, int buf, double T)
                 }
             }
             sc->n++;
+            /* Glow: its light goes on top of the layer, added */
+            if (ch.glow && g_cfg.glow && gpu_pass_ok(PASS_GLOW) && sc->n < MAX_LAYERS &&
+                glow_layer(&sc->layer[sc->n - 1], ch.glow, g_vw * p->height / p->width, &sc->layer[sc->n])) {
+                sc->n++;
+                sc->nglow++;
+            }
         }
     }
     sc->build_us = time_us() - t0;
