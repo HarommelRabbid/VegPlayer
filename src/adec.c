@@ -497,7 +497,9 @@ static int dec_at9(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
     if (!work) { snprintf(err, errlen, "out of memory"); return -1; }
     int r = sceAtracCreateDecoderGroup(SCE_ATRAC_TYPE_AT9, &grp, work, 1);
     if (r < 0) { free(work); snprintf(err, errlen, "AT9 decoder creation failed (0x%08X)", r); return -1; }
-    int h = sceAtracSetDataAndAcquireHandle(a->buf, (SceUInt32)a->len, (SceUInt32)a->len);
+    /* the buffer size must be a multiple of SCE_ATRAC_ALIGNMENT_SIZE (else 0x80630005 INVALID_ALIGNMENT):
+     * file_read_all allocated it rounded up and zeroed the tail; the read size is the real file size */
+    int h = sceAtracSetDataAndAcquireHandle(a->buf, (SceUInt32)a->len, (SceUInt32)SCE_ATRAC_ROUND_UP(a->len));
     int result = 0;
     if (h < 0) { snprintf(err, errlen, "AT9 data rejected (0x%08X)", h); result = -1; }
     else {

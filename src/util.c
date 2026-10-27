@@ -94,6 +94,7 @@ uint8_t *file_read_all(const char *path, size_t *len, size_t align)
     }
     sceIoClose(fd);
     if (got != n) { free(b); return NULL; }
+    if (align) memset(b + n, 0, ((n + align - 1) & ~(align - 1)) - n);   /* aligned buffers: zero the padding */
     *len = n;
     return b;
 }
