@@ -53,7 +53,7 @@ int main(int argc, char **argv)
         for (int k = 0; k < 4; k++) gpu_image_wrap(&vc->img[k], px, 64, 36, 4);
         for (int k = 0; k < vc->nframes; k++) { vc->pts[k] = k / 30.0f; vc->slot[k] = k % 4; }
         AudioCache *ac = &g_s.m[i].ac;
-        ac->ok = 1; ac->rate = 44100; ac->total = 44100 * 200; ac->nseg = 1;
+        ac->ok = 1; ac->rate = getenv("PT_RATE") ? atoi(getenv("PT_RATE")) : 44100; ac->total = (int64_t)ac->rate * (getenv("PT_LEN") ? atof(getenv("PT_LEN")) : 200); ac->nseg = 1;
         ac->seg = calloc(1, sizeof(PcmSeg)); ac->seg[0].start = 0; ac->seg[0].count = ac->total;
         ac->seg[0].pcm = malloc(sizeof(int16_t) * 2 * ac->total);
         for (int64_t k = 0; k < ac->total; k++) ac->seg[0].pcm[2 * k] = ac->seg[0].pcm[2 * k + 1] = (int16_t)(8000 * sin(k * 0.05) + 3000 * sin(k * 0.011));
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
         for (int k = 0; k < 2048; k++) if (fabs(blk[k]) > peak) peak = fabs(blk[k]);
     }
     t1 = time_us();
-    printf("mixer: %.1f s of audio in %.2f s on host (%.0fx realtime), max voices %d, peak %.2f\n", p->duration, (t1 - t0) / 1e6,
+    { extern long g_slow; printf("slow frame_at: %ld\n", g_slow); } printf("mixer: %.1f s of audio in %.2f s on host (%.0fx realtime), max voices %d, peak %.2f\n", p->duration, (t1 - t0) / 1e6,
            p->duration / ((t1 - t0) / 1e6), maxv, peak);
     printf("  worst block: %.0f us at %.2f s (a block lasts %.0f us; average %.0f us)\n", worst, worst_at / (double)OUT_RATE,
            1024e6 / OUT_RATE, (double)(t1 - t0) / (total / 1024.0));

@@ -84,8 +84,15 @@ static const float *hann(int L)
 
 /* ------------------------------------------------------------------ source access */
 
+#ifdef MIXSTAT
+long g_slow;
+#define SLOW() g_slow++
+#else
+#define SLOW()
+#endif
 static inline void frame_at(const AudioCache *ac, int64_t i, int *segc, float *l, float *r)
 {
+    SLOW();
     if (ac->total > 0 && (i >= ac->total || i < 0)) { i %= ac->total; if (i < 0) i += ac->total; }
     const PcmSeg *s = &ac->seg[*segc];
     if (i < s->start || i >= s->start + s->count) {
@@ -103,10 +110,16 @@ static inline void frame_at(const AudioCache *ac, int64_t i, int *segc, float *l
     *r = p[1] * (1.0f / 32768.0f);
 }
 
-static inline void seg_remember(Voice *v)
+/* Remember the segment frame_at just used for source frame i. A looping source wraps positions, so the cache is
+ * kept in unwrapped coordinates (segment start + the loop multiple of i): later reads past the loop point then stay
+ * on the fast path instead of paying a 64-bit modulo and a binary search per sample. */
+static inline void seg_remember(Voice *v, int64_t i)
 {
-    const PcmSeg *sg = &v->ac->seg[v->segc];
-    v->cs = sg->start; v->cn = sg->count; v->cp = sg->pcm;
+    const AudioCache *ac = v->ac;
+    const PcmSeg *sg = &ac->seg[v->segc];
+    int64_t shift = 0;
+    if (ac->total > 0 && (i >= ac->total || i < 0)) { int64_t w = i % ac->total; if (w < 0) w += ac->total; shift = i - w; }
+    v->cs = sg->start + shift; v->cn = sg->count; v->cp = sg->pcm;
 }
 
 static inline int ifloor(double x) { int i = (int)x; return (double)i > x ? i - 1 : i; }
@@ -127,7 +140,8 @@ static inline void fetch_linear(Voice *v, double pos, float *l, float *r)
     float l0, r0, l1, r1;
     frame_at(v->ac, i, &v->segc, &l0, &r0);
     frame_at(v->ac, (int64_t)i + 1, &v->segc, &l1, &r1);
-    seg_remember(v);
+    frame_at(v->ac, i, &v->segc, &l0, &r0);   /* leave the cache on frame i's segment */
+    seg_remember(v, i);
     *l = l0 + (l1 - l0) * t;
     *r = r0 + (r1 - r0) * t;
 }
@@ -147,7 +161,8 @@ static inline void fetch_cubic(Voice *v, double pos, float *l, float *r)
     }
     float a[4], b[4];
     for (int k = 0; k < 4; k++) frame_at(v->ac, (int64_t)i - 1 + k, &v->segc, &a[k], &b[k]);
-    seg_remember(v);
+    frame_at(v->ac, i, &v->segc, &a[1], &b[1]);   /* leave the cache on frame i's segment */
+    seg_remember(v, i);
     *l = a[0] * c0 + a[1] * c1 + a[2] * c2 + a[3] * c3;
     *r = b[0] * c0 + b[1] * c1 + b[2] * c2 + b[3] * c3;
 }
@@ -159,7 +174,7 @@ static inline float mono1(Voice *v, int64_t i)
     if (o >= 0 && o < v->cn) { const int16_t *q = v->cp + o * 2; return ((float)q[0] + (float)q[1]) * (1.0f / 32768.0f); }
     float l, r;
     frame_at(v->ac, i, &v->segc, &l, &r);
-    seg_remember(v);
+    seg_remember(v, i);
     return l + r;
 }
 
@@ -302,7 +317,7 @@ static void voice_setup(Voice *v, int ei, double t0)
     v->level = (g_cfg.apply_event_level ? e->level : 1.0f) * tr->level;   /* event gain x track volume */
     v->fi = e->fade_in; v->fo = e->fade_out; v->xi = e->xfade_in; v->xo = e->xfade_out;
     v->segc = 0;
-    seg_remember(v);
+    seg_remember(v, v->ac->seg[0].start);
     v->rpos = v->src0 + (double)v->n * v->ksrc * v->S;
     if (v->mode) {
         v->gki = v->n >= 0 ? v->n / v->H : -((-v->n + v->H - 1) / v->H);   /* once per voice */
