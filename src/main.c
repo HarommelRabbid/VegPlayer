@@ -201,7 +201,7 @@ static const char *DRIVES[] = { "ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "grw0
 
 static int wanted(const char *name)
 {
-    if (g_bmode == 0) return str_iends(name, ".veg");
+    if (g_bmode == 0) return str_iends(name, ".veg") || str_iends(name, ".vf");
     int k = media_kind_of_file(name);
     return g_pick_audio ? (k & 2) != 0 : (k & 1) != 0;
 }
