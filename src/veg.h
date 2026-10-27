@@ -128,7 +128,8 @@ typedef struct {
     VegTmFx shadow, glow;  /* Track Motion 2D Shadow / 2D Glow (first keyframe; .on = enabled) */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing chunk words @0x60 / @0x64 */
     int comp_mode;         /* VEG_COMP_* (Source Alpha when absent) */
-    float level;           /* video track: opacity (Level); audio track: volume, linear gain (1 = 0 dB) */
+    float level;           /* video track: opacity (Level); audio track: volume, linear gain (1 = 0 dB); the UI can change it */
+    float level_veg;       /* the project's own value (the sliders' reset) */
     VegVfx *vfx; int nvfx;  /* track-level video FX */
     VegAfx *afx; int nafx;  /* track-level audio FX */
 } VegTrack;

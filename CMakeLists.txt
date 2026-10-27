@@ -34,7 +34,22 @@ add_executable(${PROJECT_NAME}
   src/prepare.c
   src/mixer.c
   src/scene.c
+  src/export.c
+  src/pfs.c
+  third_party/shine/bitstream.c
+  third_party/shine/huffman.c
+  third_party/shine/l3bitstream.c
+  third_party/shine/l3loop.c
+  third_party/shine/l3mdct.c
+  third_party/shine/l3subband.c
+  third_party/shine/layer3.c
+  third_party/shine/reservoir.c
+  third_party/shine/tables.c
 )
+
+# shine (MP3 encoder): ARM mode so its fixed-point multiply macros use the ARM instructions
+file(GLOB SHINE_SRC third_party/shine/*.c)
+set_source_files_properties(${SHINE_SRC} PROPERTIES COMPILE_FLAGS "-marm -O3 -w")
 
 # third_party/*.h and stb_vorbis.c are compiled through image.c / adec.c
 set_source_files_properties(src/adec.c src/image.c PROPERTIES COMPILE_FLAGS "-Wno-unused-function -Wno-unused-value -Wno-unused-but-set-variable -Wno-maybe-uninitialized -Wno-implicit-fallthrough")

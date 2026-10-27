@@ -1,6 +1,7 @@
 /* prepare.c - session (project + chosen sources) and the loader that fills the frame caches and PCM buffers.
  * Loading runs on worker threads: one for the hardware H.264 decoder, two for audio, while the UI keeps drawing. */
 #include "common.h"
+#include "pfs.h"
 #include "media.h"
 #include "mp4.h"
 #include "veg.h"
@@ -32,7 +33,8 @@ int media_kind_of_file(const char *path)
     return 0;
 }
 
-static int is_image(const char *path) { return media_kind_of_file(path) == 1; }
+/* a picture source: a picture file, or an MP3 (its cover art) */
+static int is_image(const char *path) { return media_kind_of_file(path) == 1 || str_iends(path, ".mp3"); }
 
 /* ------------------------------------------------------------------ session */
 
@@ -156,7 +158,8 @@ int session_open(const char *veg_path, char *err, size_t errlen)
     g_s.m = calloc((size_t)(g_s.proj.nmedia ? g_s.proj.nmedia : 1), sizeof(MediaRt));
     g_s.track_on = calloc((size_t)(g_s.proj.ntracks ? g_s.proj.ntracks : 1), sizeof(int));
     if (!g_s.m || !g_s.track_on) { snprintf(err, errlen, "out of memory"); session_close(); return -1; }
-    for (int t = 0; t < g_s.proj.ntracks; t++) g_s.track_on[t] = 1;
+    for (int t = 0; t < g_s.proj.ntracks; t++) { g_s.track_on[t] = 1; g_s.proj.tracks[t].level_veg = g_s.proj.tracks[t].level; }
+    g_s.master = 1.0f;
     load_sidecar();
     session_auto_find_sources();
     LOG("project %s: %dx%d %.3f fps, %d tracks, %d events, %d media", veg_path, g_s.proj.width, g_s.proj.height, g_s.proj.fps,
@@ -391,9 +394,25 @@ static int monitor_thread(unsigned argc, void *argp)
 
 /* ------------------------------------------------------------------ start: probe, budget, allocate, spawn */
 
+/* sources inside an official (encrypted) game/app: mount that title first. One title at a time (the first found). */
+static void prepare_mount_titles(void)
+{
+    for (int i = 0; i < g_s.proj.nmedia; i++) {
+        MediaRt *m = &g_s.m[i];
+        const char *f[2] = { m->vstate != MS_SKIP ? m->vfile : "", m->astate != MS_SKIP ? m->afile : "" };
+        for (int k = 0; k < 2; k++) {
+            if (!f[k][0]) continue;
+            int r = pfs_ensure_for(f[k]);
+            if (r > 0) { LOG("prepare: sources from %s (decrypted)", pfs_mounted_title()); return; }
+            if (r < 0) LOG("prepare: can't decrypt %s (0x%08X)", f[k], (unsigned)r);
+        }
+    }
+}
+
 int prepare_start(void)
 {
     VegProject *p = &g_s.proj;
+    prepare_mount_titles();
     session_free_caches();
     memset(&g_prep, 0, sizeof g_prep);
     g_prep.running = 1;

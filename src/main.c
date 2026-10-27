@@ -9,6 +9,8 @@
 #include "gpu.h"
 #include "media.h"
 #include "mixer.h"
+#include "export.h"
+#include "pfs.h"
 #include "scene.h"
 #include "veg.h"
 
@@ -172,7 +174,8 @@ static int list_nav(int *sel, int n, int page)
 
 /* ------------------------------------------------------------------ states */
 
-enum { ST_BROWSE, ST_PROJECT, ST_TRACKS, ST_OPTIONS, ST_PREPARE, ST_PLAY };
+enum { ST_BROWSE, ST_PROJECT, ST_TRACKS, ST_OPTIONS, ST_PREPARE, ST_PLAY, ST_EXPORT };
+static int g_export_after_prepare;   /* the prepare was started from the export screen */
 static int g_state = ST_BROWSE, g_tracks_back = ST_PROJECT;
 static char g_msg[256];
 static uint64_t g_msg_until;
@@ -197,13 +200,13 @@ static int g_bsel, g_btop;
 static int g_bmode;            /* 0 = open a project, 1 = pick a source */
 static int g_pick_media, g_pick_audio;
 
-static const char *DRIVES[] = { "ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "grw0:", "ud0:", "host0:", "vs0:", "pd0:", NULL };
+static const char *DRIVES[] = { "ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "gro0:", "grw0:", "ud0:", "host0:", "vs0:", "pd0:", NULL };
 
 static int wanted(const char *name)
 {
     if (g_bmode == 0) return str_iends(name, ".veg") || str_iends(name, ".vf");
     int k = media_kind_of_file(name);
-    return g_pick_audio ? (k & 2) != 0 : (k & 1) != 0;
+    return g_pick_audio ? (k & 2) != 0 : (k & 1) != 0 || str_iends(name, ".mp3");   /* MP3: its cover picture */
 }
 
 static int cmp_ent(const void *a, const void *b)
@@ -226,6 +229,10 @@ static void browse_load(const char *dir)
         }
         return;
     }
+    /* an official game/app folder: open it decrypted (like VitaShell), so its videos, pictures and sounds can be used */
+    int pr = pfs_ensure_for(dir);
+    if (pr == 2) flash("%s opened decrypted", pfs_mounted_title());
+    else if (pr < 0) flash("Couldn't open %s decrypted (0x%08X)", dir, (unsigned)pr);
     SceUID d = sceIoDopen(dir);
     if (d < 0) { flash("Can't open %s", dir); return; }
     SceIoDirent e;
@@ -346,7 +353,7 @@ static void project_frame(void)
     build_rows();
     char t[300];
     snprintf(t, sizeof t, "%s", veg_basename(g_s.veg_path));
-    header(t, "{X} choose file   {S} skip   {T} tracks   {SELECT} options   {START} play   {O} close");
+    header(t, "{X} file  {S} skip  {T} tracks  {RIGHT} export audio  {SELECT} options  {START} play  {O} close");
     textf(20, 66, COL_DIM, 0.85f, "%dx%d  %.3f fps  %d Hz  %d:%05.2f   %d tracks  %d events  %d sources", p->width, p->height, p->fps,
           p->sample_rate, (int)(p->duration / 60), fmod(p->duration, 60), p->ntracks, p->nevents, p->nmedia);
     textf(20, 88, gpu_shaders_ok() ? COL_OK : COL_WARN, 0.8f, "Effects: %s", gpu_status());
@@ -410,9 +417,10 @@ static void project_frame(void)
     }
     if (g_pressed & SCE_CTRL_TRIANGLE) { g_tracks_back = ST_PROJECT; g_state = ST_TRACKS; }
     if (g_pressed & SCE_CTRL_SELECT) g_state = ST_OPTIONS;
+    if (g_pressed & SCE_CTRL_RIGHT) g_state = ST_EXPORT;
     if (g_pressed & SCE_CTRL_START) {
-        if (g_s.prepared) { g_state = ST_PLAY; scene_start(); audio_seek(0); audio_play(1); }
-        else { prepare_start(); g_state = ST_PREPARE; }
+        if (g_s.prepared) { g_state = ST_PLAY; scene_start(); mixer_project_changed(); audio_seek(0); audio_play(1); }
+        else { g_export_after_prepare = 0; prepare_start(); g_state = ST_PREPARE; }
     }
     if (g_pressed & SCE_CTRL_CIRCLE) { session_close(); browse_open(0, 0, 0, g_cfg.last_dir); }
 }
@@ -421,22 +429,74 @@ static void project_frame(void)
 
 static int g_tsel, g_ttop;
 
+/* gain shown as dB (audio, master) or % (video level) */
+static void gain_text(char *out, size_t n, float lin, int video)
+{
+    if (video) snprintf(out, n, "%3d %%", (int)lroundf(lin * 100));
+    else if (lin < 0.0005f) snprintf(out, n, "-inf dB");
+    else snprintf(out, n, "%+.1f dB", 20.0 * log10(lin));
+}
+
+/* a small slider: video 0..100 %, audio -40..+12 dB (left end = off) */
+static void gain_bar(int x, int y, int w, float lin, int video, int on)
+{
+    float f;
+    if (video) f = lin;
+    else f = lin < 0.0005f ? 0 : (float)((20.0 * log10(lin) + 40.0) / 52.0);
+    f = f < 0 ? 0 : f > 1 ? 1 : f;
+    vita2d_draw_rectangle(x, y, w, 6, RGBA8(70, 70, 80, 255));
+    vita2d_draw_rectangle(x, y, w * f, 6, on ? COL_ACCENT : RGBA8(110, 110, 120, 255));
+    if (!video) vita2d_draw_rectangle(x + w * (40.0f / 52.0f), y - 2, 2, 10, RGBA8(200, 200, 210, 255));   /* 0 dB mark */
+}
+
+/* row 0 = master volume, rows 1.. = tracks */
 static void tracks_draw_list(int x0, int y0, int w, int rows, int interactive)
 {
     VegProject *p = &g_s.proj;
     const int lh = 26;
+    int n = p->ntracks + 1;
+    if (g_tsel >= n) g_tsel = n - 1;
     if (g_tsel < g_ttop) g_ttop = g_tsel;
     if (g_tsel >= g_ttop + rows) g_ttop = g_tsel - rows + 1;
-    for (int r = 0; r < rows && g_ttop + r < p->ntracks; r++) {
-        int t = g_ttop + r, y = y0 + r * lh;
+    int bw = w > 600 ? 200 : 110, bx = x0 + w - bw - 92;
+    char gt[32];
+    for (int r = 0; r < rows && g_ttop + r < n; r++) {
+        int row = g_ttop + r, y = y0 + r * lh;
+        if (row == g_tsel && interactive) vita2d_draw_rectangle(x0, y, w, lh, COL_SEL);
+        if (row == 0) {
+            textf(x0 + 36, y + 19, COL_ACCENT, 0.85f, "Master volume");
+            gain_bar(bx, y + 10, bw, g_s.master, 0, 1);
+            gain_text(gt, sizeof gt, g_s.master, 0);
+            textf(bx + bw + 10, y + 19, COL_TEXT, 0.8f, "%s", gt);
+            continue;
+        }
+        int t = row - 1;
         VegTrack *tr = &p->tracks[t];
-        if (t == g_tsel && interactive) vita2d_draw_rectangle(x0, y, w, lh, COL_SEL);
-        int on = g_s.track_on[t];
+        int on = g_s.track_on[t], video = tr->kind == VEG_KIND_VIDEO;
         vita2d_draw_rectangle(x0 + 10, y + 6, 14, 14, on ? COL_OK : RGBA8(70, 70, 80, 255));
-        textf(x0 + 36, y + 19, on ? COL_TEXT : COL_DIM, 0.85f, "Track %2d   %s   %d events%s", t + 1,
-              tr->kind == VEG_KIND_VIDEO ? "VIDEO" : tr->kind == VEG_KIND_AUDIO ? "AUDIO" : "other", tr->nevents,
-              tr->has_motion ? "   (track motion)" : "");
+        if (w > 600)
+            textf(x0 + 36, y + 19, on ? COL_TEXT : COL_DIM, 0.85f, "Track %2d   %s   %d events%s", t + 1,
+                  video ? "VIDEO" : tr->kind == VEG_KIND_AUDIO ? "AUDIO" : "other", tr->nevents, tr->has_motion ? "   (track motion)" : "");
+        else
+            textf(x0 + 36, y + 19, on ? COL_TEXT : COL_DIM, 0.8f, "%2d %s %d ev", t + 1, video ? "VIDEO" : tr->kind == VEG_KIND_AUDIO ? "AUDIO" : "other",
+                  tr->nevents);
+        if (tr->kind == VEG_KIND_VIDEO || tr->kind == VEG_KIND_AUDIO) {
+            gain_bar(bx, y + 10, bw, tr->level, video, on);
+            gain_text(gt, sizeof gt, tr->level, video);
+            textf(bx + bw + 10, y + 19, fabsf(tr->level - tr->level_veg) > 1e-4f ? COL_ACCENT : (on ? COL_TEXT : COL_DIM), 0.8f, "%s", gt);
+        }
     }
+}
+
+/* one step of a gain slider: audio/master in 1 dB steps (-40 dB and below = off, up to +12 dB), video in 2 % steps */
+static float gain_step(float lin, int video, int d)
+{
+    if (video) { lin += d * 0.02f; return lin < 0 ? 0 : lin > 1 ? 1 : lin; }
+    if (lin < 0.0005f) return d > 0 ? (float)pow(10.0, -40.0 / 20.0) : 0;
+    double db = round(20.0 * log10(lin)) + d;
+    if (db < -40) return 0;
+    if (db > 12) db = 12;
+    return (float)pow(10.0, db / 20.0);
 }
 
 static void tracks_toggle_kind(int kind)
@@ -449,8 +509,18 @@ static void tracks_toggle_kind(int kind)
 static void tracks_input(void)
 {
     int changed = 0;
-    list_nav(&g_tsel, g_s.proj.ntracks, 10);
-    if (g_pressed & SCE_CTRL_CROSS) { g_s.track_on[g_tsel] = !g_s.track_on[g_tsel]; changed = 1; }
+    list_nav(&g_tsel, g_s.proj.ntracks + 1, 10);
+    int t = g_tsel - 1, d = (g_repeat & SCE_CTRL_RIGHT) ? 1 : (g_repeat & SCE_CTRL_LEFT) ? -1 : 0;
+    VegTrack *tr = t >= 0 ? &g_s.proj.tracks[t] : NULL;
+    int has_gain = !tr || tr->kind == VEG_KIND_VIDEO || tr->kind == VEG_KIND_AUDIO;
+    if (d && has_gain) {
+        if (tr) tr->level = gain_step(tr->level, tr->kind == VEG_KIND_VIDEO, d);
+        else g_s.master = gain_step(g_s.master, 0, d);
+    }
+    if ((g_pressed & SCE_CTRL_SELECT) && has_gain) {   /* back to the project's value */
+        if (tr) tr->level = tr->level_veg; else g_s.master = 1.0f;
+    }
+    if ((g_pressed & SCE_CTRL_CROSS) && t >= 0) { g_s.track_on[t] = !g_s.track_on[t]; changed = 1; }
     if (g_pressed & SCE_CTRL_SQUARE) { tracks_toggle_kind(VEG_KIND_VIDEO); changed = 1; }
     if (g_pressed & SCE_CTRL_TRIANGLE) { tracks_toggle_kind(VEG_KIND_AUDIO); changed = 1; }
     if (changed) {
@@ -461,7 +531,7 @@ static void tracks_input(void)
 
 static void tracks_frame(void)
 {
-    header("Tracks (first = front)", "{X} toggle   {S} all video   {T} all audio   {O} back");
+    header("Tracks (first = front)", "{X} toggle  {LEFT}{RIGHT} level  {SELECT} reset  {S} all video  {T} all audio  {O} back");
     tracks_draw_list(10, 56, SCREEN_W - 20, 17, 1);
     tracks_input();
     if (g_pressed & SCE_CTRL_CIRCLE) g_state = g_tracks_back;
@@ -555,14 +625,67 @@ static void prepare_frame(void)
     if (g_pressed & SCE_CTRL_CIRCLE) g_prep.cancel = 1;
     if (g_prep.done) {
         prepare_finish();
-        if (g_prep.cancel) { g_state = ST_PROJECT; flash("Cancelled"); return; }
+        if (g_prep.cancel) { g_export_after_prepare = 0; g_state = ST_PROJECT; flash("Cancelled"); return; }
         LOG("prepared: GPU cache %u KB used of %u KB", (unsigned)(gpu_arena_used() >> 10), (unsigned)(gpu_arena_capacity() >> 10));
+        if (g_export_after_prepare) { g_state = ST_EXPORT; return; }
         scene_start();
+        mixer_project_changed();
         audio_seek(0);
         audio_play(1);
         g_state = ST_PLAY;
     }
     sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+}
+
+/* ------------------------------------------------------------------ audio export */
+
+static int g_esel = 2;
+static const struct { int fmt, kbps; const char *label; } EXPORTS[] = {
+    { EXPORT_WAV, 0, "WAV  (48 kHz, 16-bit, uncompressed)" },
+    { EXPORT_MP3, 128, "MP3  128 kbps" },
+    { EXPORT_MP3, 192, "MP3  192 kbps" },
+    { EXPORT_MP3, 256, "MP3  256 kbps" },
+    { EXPORT_MP3, 320, "MP3  320 kbps" },
+};
+
+static void export_frame(void)
+{
+    const int n = (int)(sizeof EXPORTS / sizeof *EXPORTS);
+    if (g_export.running) {
+        header("Exporting audio", "{O} cancel");
+        float pr = g_export.progress;
+        double el = (time_us() - g_export.t0) / 1e6;
+        textf(40, 120, COL_TEXT, 0.9f, "%s", veg_basename(g_export.path));
+        vita2d_draw_rectangle(40, 150, SCREEN_W - 80, 14, RGBA8(70, 70, 80, 255));
+        vita2d_draw_rectangle(40, 150, (SCREEN_W - 80) * pr, 14, COL_ACCENT);
+        if (pr > 0.02f) textf(40, 196, COL_DIM, 0.85f, "%d %%   %.0f s elapsed, about %.0f s left", (int)(pr * 100), el, el / pr - el);
+        else textf(40, 196, COL_DIM, 0.85f, "%d %%   %.0f s elapsed", (int)(pr * 100), el);
+        if (g_pressed & SCE_CTRL_CIRCLE) g_export.cancel = 1;
+        if (g_export.done) {
+            export_finish();
+            flash("%s", g_export.cancel ? "Export cancelled" : g_export.msg);
+            g_state = ST_PROJECT;
+        }
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+        return;
+    }
+    header("Export audio", "{X} export   {O} back");
+    textf(40, 76, COL_DIM, 0.8f, "The mix as it plays: track toggles, track sliders and the master volume apply.");
+    textf(40, 98, COL_DIM, 0.8f, "Saved to %s (the Music app lists it)", export_dir());
+    for (int i = 0; i < n; i++) {
+        int y = 130 + i * 34;
+        if (i == g_esel) vita2d_draw_rectangle(30, y, SCREEN_W - 60, 30, COL_SEL);
+        text(50, y + 22, COL_TEXT, 0.9f, EXPORTS[i].label);
+    }
+    if (!g_s.prepared) textf(40, 330, COL_WARN, 0.8f, "The sources are prepared first (as for playback).");
+    list_nav(&g_esel, n, n);
+    if (g_pressed & SCE_CTRL_CROSS) {
+        if (!g_s.prepared) { g_export_after_prepare = 1; prepare_start(); g_state = ST_PREPARE; return; }
+        g_export_after_prepare = 0;
+        audio_play(0);
+        if (export_start(EXPORTS[g_esel].fmt, EXPORTS[g_esel].kbps) < 0) flash("Couldn't start the export");
+    }
+    if (g_pressed & SCE_CTRL_CIRCLE) { g_export_after_prepare = 0; g_state = ST_PROJECT; }
 }
 
 /* ------------------------------------------------------------------ player */
@@ -633,7 +756,7 @@ static void play_frame(void)
     }
     if (g_panel) {
         vita2d_draw_rectangle(480, 40, 470, 400, RGBA8(10, 12, 18, 225));
-        btext(496, 64, COL_ACCENT, 0.9f, "Tracks:  {X} toggle  {S} video  {T} audio");
+        btext(496, 64, COL_ACCENT, 0.8f, "{X} on/off  {LEFT}{RIGHT} level  {SELECT} reset  {S}/{T} all");
         tracks_draw_list(484, 76, 462, 13, 1);
         tracks_input();
         if (g_pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_START)) g_panel = 0;
@@ -716,6 +839,7 @@ int main(void)
         case ST_OPTIONS: options_frame(); break;
         case ST_PREPARE: prepare_frame(); break;
         case ST_PLAY: play_frame(); break;
+        case ST_EXPORT: export_frame(); break;
         }
         if (time_us() < g_msg_until && g_state != ST_PLAY) {
             vita2d_draw_rectangle(0, SCREEN_H - 64, SCREEN_W, 32, RGBA8(60, 30, 30, 230));

@@ -314,7 +314,7 @@ static void voice_setup(Voice *v, int ei, double t0)
     v->len = e->length;
     v->len_n = (int64_t)llround(e->length * OUT_RATE);
     v->n = (int64_t)llround((t0 - e->start) * OUT_RATE);
-    v->level = (g_cfg.apply_event_level ? e->level : 1.0f) * tr->level;   /* event gain x track volume */
+    v->level = g_cfg.apply_event_level ? e->level : 1.0f;   /* event gain (the track volume is applied live in voice_render) */
     v->fi = e->fade_in; v->fo = e->fade_out; v->xi = e->xfade_in; v->xo = e->xfade_out;
     v->segc = 0;
     seg_remember(v, v->ac->seg[0].start);
@@ -348,6 +348,7 @@ static inline float ramp(double x, double len) { return len > 1e-6 && x < len ? 
 /* render into out[from..to) (block-relative), add to the mix */
 static void voice_render(Voice *v, float *out, int from, int to)
 {
+    const float tvol = g_s.proj.tracks[v->track].level;   /* track volume: the UI slider changes it while playing */
     double inv = 1.0 / OUT_RATE;
     double p = v->ksrc * v->S;          /* resampling: source frames per output frame */
     double gstep = v->ksrc * v->P;      /* granular: source frames per output frame inside a grain */
@@ -381,7 +382,7 @@ static void voice_render(Voice *v, float *out, int from, int to)
             r = v->dl[i0 * 2 + 1] + (v->dl[i1 * 2 + 1] - v->dl[i0 * 2 + 1]) * t;
             v->dlw = v->dlw + 1 == DL_LEN ? 0 : v->dlw + 1;
         }
-        float g = v->level;
+        float g = v->level * tvol;
         if (v->n < v->fz_in || v->n >= v->fz_out) {
             double tau = (double)v->n * inv, rem = v->len - tau;
             g *= ramp(tau, v->fi) * ramp(rem, v->fo) * ramp(tau, v->xi) * ramp(rem, v->xo);
@@ -416,6 +417,8 @@ typedef struct {
 
 static Reverb *g_rv[RV_MAX];
 static int g_nrv;
+static int g_rv_ntracks;                /* tracks g_track_rv covers */
+static volatile int g_reinit;           /* a new project: rebuild the reverbs before the next mix */
 static signed char *g_track_rv;         /* per track: reverb index or -1 */
 
 static float db2lin(double db) { return db <= -96 ? 0.0f : (float)pow(10.0, db / 20.0); }
@@ -436,6 +439,7 @@ static void reverbs_free(void)
 {
     for (int i = 0; i < g_nrv; i++) { free(g_rv[i]->mem); free(g_rv[i]); g_rv[i] = NULL; }
     g_nrv = 0;
+    g_rv_ntracks = 0;
     free(g_track_rv); g_track_rv = NULL;
 }
 
@@ -447,6 +451,7 @@ static void reverbs_init(void)
     if (!p->ntracks) return;
     g_track_rv = malloc((size_t)p->ntracks);
     if (!g_track_rv) return;
+    g_rv_ntracks = p->ntracks;
     for (int t = 0; t < p->ntracks; t++) {
         g_track_rv[t] = -1;
         const VegAfx *a = NULL;
@@ -577,8 +582,12 @@ static void restart_at(double t0)
 
 static void mix_block(float *out, int frames, int64_t start);
 
+/* the reverbs are built from the project's tracks: called when a project has been loaded (before playback) */
+void mixer_project_changed(void) { g_reinit = 1; }
+
 void mixer_mix(float *out, int frames, int64_t start)
 {
+    if (g_reinit) { g_reinit = 0; reverbs_init(); mixer_reset(); }
     for (int done = 0; done < frames;) {   /* reverb buses hold RV_BUS frames */
         int n = frames - done < RV_BUS ? frames - done : RV_BUS;
         mix_block(out + (size_t)done * 2, n, start + done);
@@ -614,7 +623,7 @@ static void mix_block(float *out, int frames, int64_t start)
         int from = (int)(es > start ? es - start : 0);
         int64_t stop = es + v->len_n - start;
         int to = stop < frames ? (int)stop : frames;
-        int ri = g_track_rv ? g_track_rv[v->track] : -1;
+        int ri = g_track_rv && v->track < g_rv_ntracks ? g_track_rv[v->track] : -1;
         if (from < to) {
             voice_render(v, ri >= 0 ? g_rv[ri]->bus : out, from, to);
             if (ri >= 0) g_rv[ri]->idle = 0;
@@ -626,6 +635,18 @@ static void mix_block(float *out, int frames, int64_t start)
         if (r->idle >= r->tail || !g_s.track_on[r->track]) continue;   /* nothing playing and the tail has died away */
         rv_process(r, out, frames);
         r->idle += frames;
+    }
+}
+
+/* master volume, then a soft knee above -3 dBFS so dense remixes don't hard-clip */
+void mixer_to_pcm(const float *mix, int16_t *o, int n)
+{
+    float m = g_s.master;
+    for (int i = 0; i < n; i++) {
+        float x = mix[i] * m;
+        if (x > 0.7f) x = 0.7f + 0.3f * tanhf((x - 0.7f) / 0.3f);
+        else if (x < -0.7f) x = -0.7f + 0.3f * tanhf((x + 0.7f) / 0.3f);
+        o[i] = (int16_t)(x * 32767.0f);
     }
 }
 
@@ -704,13 +725,7 @@ static int audio_thread(unsigned argc, void *argp)
         mutex_unlock(&g_amtx);
         int16_t *o = pcm[cur];
         if (playing) {
-            for (int i = 0; i < BLOCK * 2; i++) {
-                float x = mix[i];
-                /* soft knee above -3 dBFS so dense remixes don't hard-clip */
-                if (x > 0.7f) x = 0.7f + 0.3f * tanhf((x - 0.7f) / 0.3f);
-                else if (x < -0.7f) x = -0.7f + 0.3f * tanhf((x + 0.7f) / 0.3f);
-                o[i] = (int16_t)(x * 32767.0f);
-            }
+            mixer_to_pcm(mix, o, BLOCK * 2);
             pos += BLOCK;
         } else memset(o, 0, sizeof(int16_t) * BLOCK * 2);
         sceAudioOutOutput(port, o);     /* blocks until the previous block has been taken */
@@ -727,6 +742,10 @@ static int audio_thread(unsigned argc, void *argp)
     free(mix); free(pcm[0]); free(pcm[1]);
     return 0;
 }
+
+/* the export thread mixes too: it takes the same lock as the audio thread (playback is paused meanwhile) */
+void audio_lock(void) { if (g_amtx.id >= 0) mutex_lock(&g_amtx); }
+void audio_unlock(void) { if (g_amtx.id >= 0) mutex_unlock(&g_amtx); }
 
 int audio_start(void)
 {

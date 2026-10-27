@@ -44,6 +44,7 @@ typedef struct {
     char veg_path[512], veg_dir[512];
     volatile int *track_on;        /* proj.ntracks toggles (changed live from the UI) */
     GpuImage white;                /* 1x1 white for solid colours */
+    volatile float master;         /* master volume (linear; the tracks panel's first row) */
     int prepared;
 } Session;
 

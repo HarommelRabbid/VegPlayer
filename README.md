@@ -31,8 +31,19 @@ shaders, and the colour effects fall back to a CPU pass on the scene thread.
 2. Open the project. The **Sources** screen lists every source the timeline uses, separately for its picture and its
    sound, so you can take the picture from the `.mp4` and the sound from an `.at9`. `X` picks a file, `SQUARE` skips a
    source. Choices are saved next to the project in `<project>.veg.vegplayer`.
-3. `TRIANGLE` opens the **Tracks** screen: switch individual video/audio tracks off (also live while playing).
+3. `TRIANGLE` opens the **Tracks** screen: switch individual video/audio tracks off, and set each track's level
+   (video, 0–100 %) or volume (audio, off/−40…+12 dB) with `LEFT/RIGHT`, plus the **master volume** on the first row.
+   They start at the project's values; `SELECT` resets the selected one. All of it works live while playing too.
 4. `START` prepares (decodes what the timeline uses) and plays.
+5. `RIGHT` opens **Export audio**: the mix as it plays (track toggles, sliders, master volume) to WAV (48 kHz,
+   16-bit) or MP3 (128–320 kbps, the shine encoder), saved in `ux0:music/VegPlayer/`. It renders faster than real time.
+
+Picture sources can also be MP3 files: their cover art (ID3v2 picture, front cover preferred) is used.
+
+**Official games and apps**: browsing into `ux0:app/TITLEID` (or `gro0:app`, `ux0:patch`) opens it decrypted like
+VitaShell's *Open decrypted* (`sceAppMgrGameDataMount`), so its MP4 videos, PNG/JPEG pictures and AT9/MP3/WAV/OGG
+sounds can be picked as sources. One title at a time: a project's sources can come from one game or app (plus any
+unencrypted files). Game textures in GXT format aren't supported.
 
 Player: `X` play/pause, `LEFT/RIGHT` ±1 s, `L/R` ±5 s, `UP/DOWN` ±10 s, `SELECT` restart, `TRIANGLE` track panel,
 `SQUARE` hide the bar, `O` back. `SELECT` on the Sources screen opens **Options**. The FPS counter is in the top-left.
@@ -93,7 +104,7 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
     proprietary, so this is an approximation.
   - *Classic*: granular overlap-add with a grain size per Classic mode (A01–A19) and a narrower alignment search.
 - **Pitch Shift plug-in**: *resample* (speed and pitch change together) and *Classic* (preserve duration).
-- **Vibrato plug-in**: sine-modulated delay line.
+- **Vibrato plug-in** (Sony Vibrato): sine-modulated delay line with the project's rate and depth.
 - Event gain, audio track volume, fades, crossfades.
 - **Reverb** in an audio track's FX chain (Sony Reverb): a light per-track reverb (pre-delay, early reflections,
   damped tail) with the project's dry/reverb/early levels, decay time, pre-delay and high cut. Tracks without reverb
@@ -110,7 +121,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Take | `168d206d`: in-point @0x10, media id @0x24, name @0x2a | solid |
 | Audio stretch/pitch | `d54ad82a`: method @0x0c, attribute @0x10, semitones (double) @0x14 | semitones solid; method numbering **guessed** (0 None, 1 Classic, 2 élastique: all sample events use 2) |
 | Pitch Shift plug-in | in `b66a95ce`: semitones, cents, ratio (double) | values solid; *preserve duration* flag position **guessed** |
-| Vibrato plug-in | name match; parameter layout unknown | **guessed** (defaults: 5 Hz, 0.5 st) |
+| Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params; rate (centi-Hz) @0x1c, depth (cents) @0x20 | rate varies per instance as a rate would (9.99, 3.02, 4.63 Hz); depth **guessed** |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |

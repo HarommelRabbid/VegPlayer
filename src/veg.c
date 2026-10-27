@@ -643,14 +643,15 @@ static int parse_afx_chain(St *s, const uint8_t *b, size_t bl, VegAfx **arr, int
             a.preserve = rd32(data + 0x0c) != 0;
             a.mode = (int)rd32(data + 0x10);
         } else if (is_vib) {
-            /* layout unknown: look for a rate in Hz and a depth among the first doubles, else defaults */
+            /* Sony Vibrato (d6802ba0-…), i32 params: 1200, 1000, -, 3, -, -, rate (centi-Hz), depth (cents, signed),
+             * 1000, second depth. Rate: the value that varies between instances (9.99 / 3.02 / 4.63 Hz); depth: the
+             * -100 values read as cents. Both guessed from two projects; the rest is unknown. */
             a.type = AFX_VIBRATO;
-            a.rate_hz = 5.0; a.depth = 0.5;
-            int got_rate = 0;
-            for (size_t k = 0; k + 8 <= dl && k < 128; k += 4) {
-                double v = rdd(data + k);
-                if (!got_rate && v >= 0.1 && v <= 20) { a.rate_hz = v; got_rate = 1; k += 4; continue; }
-                if (got_rate && v > 0 && v <= 12) { a.depth = v; break; }
+            a.rate_hz = 5.0; a.depth = 1.0;
+            if (dl >= 0x28) {
+                int32_t rate = (int32_t)rd32(data + 0x1c), dep = (int32_t)rd32(data + 0x20);
+                if (rate >= 10 && rate <= 5000) a.rate_hz = rate / 100.0;
+                if (dep != 0 && dep >= -2400 && dep <= 2400) a.depth = fabs(dep) / 100.0;
             }
         } else if (is_rev && dl >= 44) {
             /* Sony Reverb, i32 params (guessed from scan.veg): dry out, reverb out, early out (centi-dB), -, mode,

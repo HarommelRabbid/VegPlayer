@@ -11,6 +11,8 @@
 #include <stdint.h>
 
 void mixer_init(void);
+void mixer_to_pcm(const float *mix, int16_t *pcm, int n);   /* master volume + soft clip to 16-bit (n samples) */
+void mixer_project_changed(void);                         /* a new project is loaded: rebuild per-track state (reverbs) */
 void mixer_reset(void);                                   /* drop all voices (after a seek or track change) */
 /* mix `frames` stereo frames starting at timeline sample `start` (OUT_RATE units) into out (interleaved float) */
 void mixer_mix(float *out, int frames, int64_t start);
@@ -25,5 +27,7 @@ void audio_play(int on);
 int audio_playing(void);
 void audio_seek(double seconds);
 double audio_time(void);          /* timeline position of what is being heard now */
+void audio_lock(void);            /* exclusive use of the mixer (export) */
+void audio_unlock(void);
 
 #endif
