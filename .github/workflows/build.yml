@@ -11,12 +11,14 @@ jobs:
       - name: Libraries
         run: vdpm libvita2d vitaShaRK SceShaccCgExt taihen freetype libpng libjpeg-turbo zlib || true
       - name: Build
-        shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          set -o pipefail
           # compiler errors also become annotations (readable through the API without the log)
-          cmake --build build -j4 2>&1 | tee build.log || { grep -E "error|undefined reference" build.log | head -20 | sed 's/^/::error::/'; exit 1; }
+          if ! { cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4; } > build.log 2>&1; then
+            grep -E "error|Error|undefined reference" build.log | head -25 | sed 's/^/::error::/'
+            tail -n 15 build.log | sed 's/^/::error::tail: /'
+            exit 1
+          fi
+          tail -n 3 build.log
       - uses: actions/upload-artifact@v4
         with:
           name: VegPlayer
