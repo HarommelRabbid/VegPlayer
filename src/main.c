@@ -197,7 +197,7 @@ static int g_bsel, g_btop;
 static int g_bmode;            /* 0 = open a project, 1 = pick a source */
 static int g_pick_media, g_pick_audio;
 
-static const char *DRIVES[] = { "ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "grw0:", "ud0:", "host0:", NULL };
+static const char *DRIVES[] = { "ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "grw0:", "ud0:", "host0:", "vs0:", "pd0:", NULL };
 
 static int wanted(const char *name)
 {
@@ -562,6 +562,7 @@ static void prepare_frame(void)
         audio_play(1);
         g_state = ST_PLAY;
     }
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
 }
 
 /* ------------------------------------------------------------------ player */
