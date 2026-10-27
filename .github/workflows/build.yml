@@ -14,8 +14,8 @@ jobs:
         run: |
           # compiler errors also become annotations (readable through the API without the log)
           if ! { cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4; } > build.log 2>&1; then
-            grep -E "error|Error|undefined reference" build.log | head -25 | sed 's/^/::error::/'
-            grep -v '^\[' build.log | grep -v '^--' | tail -n 30 | sed 's/^/::error::log: /'
+            # (GitHub keeps 10 annotations per step: only the real errors)
+            grep -E "error:|Error:|undefined reference|multiple definition|ld:|ld\.|vita-elf|NID|Failed|failed" build.log | grep -v "Error 2" | head -10 | sed 's/^/::error::/'
             exit 1
           fi
           tail -n 3 build.log
