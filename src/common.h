@@ -55,6 +55,7 @@ typedef struct {
     int cache_mb;             /* frame cache budget, MB */
     int compositing_guess;    /* apply the tracks' compositing modes (Add, Multiply, Lighten, ...) */
     int tm_follow_source;     /* scale Track Motion moves with a source of another shape (Vegas doesn't) */
+    int small_copies;         /* keep quarter-size frame copies for layers shown small (more memory) */
     char last_dir[512];
 } Config;
 extern Config g_cfg;

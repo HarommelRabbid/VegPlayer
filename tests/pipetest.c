@@ -8,7 +8,7 @@
 #include "media.h"
 #include "mixer.h"
 #include "veg.h"
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, "" };
 Session g_s;
 void log_printf(const char *fmt, ...) { (void)fmt; }
 uint64_t time_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000; }
@@ -98,7 +98,11 @@ int main(int argc, char **argv)
         for (int k = 0; k < 2048; k++) if (fabs(blk[k]) > peak) peak = fabs(blk[k]);
     }
     t1 = time_us();
-    { extern long g_slow; printf("slow frame_at: %ld\n", g_slow); } printf("mixer: %.1f s of audio in %.2f s on host (%.0fx realtime), max voices %d, peak %.2f\n", p->duration, (t1 - t0) / 1e6,
+    
+#ifdef MIXSTAT
+    { extern long g_slow; printf("slow frame_at: %ld\n", g_slow); }
+#endif
+    printf("mixer: %.1f s of audio in %.2f s on host (%.0fx realtime), max voices %d, peak %.2f\n", p->duration, (t1 - t0) / 1e6,
            p->duration / ((t1 - t0) / 1e6), maxv, peak);
     printf("  worst block: %.0f us at %.2f s (a block lasts %.0f us; average %.0f us)\n", worst, worst_at / (double)OUT_RATE,
            1024e6 / OUT_RATE, (double)(t1 - t0) / (total / 1024.0));

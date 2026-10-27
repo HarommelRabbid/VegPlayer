@@ -461,7 +461,7 @@ int prepare_start(void)
         /* cache size: never larger than the screen */
         double s = MIN(1.0, MIN((double)SCREEN_W / t->width, (double)SCREEN_H / t->height));
         vj->cw = MAX(16, (int)(t->width * s)); vj->ch = MAX(16, (int)(t->height * s));
-        need_bytes4 += (double)vj->nneed * (((vj->cw + 7) & ~7) * vj->ch + ((QUARTER(vj->cw) + 7) & ~7) * QUARTER(vj->ch)) * 4;
+        need_bytes4 += (double)vj->nneed * (((vj->cw + 7) & ~7) * vj->ch + (g_cfg.small_copies ? ((QUARTER(vj->cw) + 7) & ~7) * QUARTER(vj->ch) : 0)) * 4;
         max_w = MAX(max_w, t->width); max_h = MAX(max_h, t->height);
         if (t->max_ref_frames + 1 > max_refs) max_refs = t->max_ref_frames + 1;
         LOG("%s: %dx%d, %u frames, %.2f s, %d needed, refs %d", vm->name, t->width, t->height, t->n, vc->duration, vj->nneed, t->max_ref_frames);
@@ -498,7 +498,7 @@ int prepare_start(void)
         VideoCache *vc = &g_s.m[vj->media].vc;
         vj->cw = MAX(16, (int)(vj->cw * scale)); vj->ch = MAX(16, (int)(vj->ch * scale));
         vc->cache_w = vj->cw; vc->cache_h = vj->ch; vc->bpp = bpp;
-        size_t per = ((size_t)((vj->cw + 7) & ~7) * (size_t)vj->ch + (size_t)((QUARTER(vj->cw) + 7) & ~7) * (size_t)QUARTER(vj->ch)) * (size_t)bpp;
+        size_t per = ((size_t)((vj->cw + 7) & ~7) * (size_t)vj->ch + (g_cfg.small_copies ? (size_t)((QUARTER(vj->cw) + 7) & ~7) * (size_t)QUARTER(vj->ch) : 0)) * (size_t)bpp;
         size_t left = gpu_arena_capacity() - gpu_arena_used();
         left = left > images_reserve ? left - images_reserve : 0;
         int fit = (int)(left / (per + 256));
@@ -511,7 +511,7 @@ int prepare_start(void)
             LOG("cache: %s thinned to %d frames", g_s.proj.media[vj->media].name, keep);
         }
         vc->img = calloc((size_t)(keep ? keep : 1), sizeof(GpuImage));
-        vc->imgq = calloc((size_t)(keep ? keep : 1), sizeof(GpuImage));
+        vc->imgq = g_cfg.small_copies ? calloc((size_t)(keep ? keep : 1), sizeof(GpuImage)) : NULL;
         vc->nimg = 0;
         for (int k = 0; k < keep && vc->img; k++) {
             if (gpu_image_alloc(&vc->img[k], vj->cw, vj->ch, bpp) < 0) break;

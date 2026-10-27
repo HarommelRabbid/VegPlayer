@@ -13,7 +13,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, "" };
 
 static SceUID g_log_mutex = -1;
 
@@ -176,6 +176,7 @@ void config_load(void)
         else if (!strcmp(line, "cache_mb")) g_cfg.cache_mb = atoi(eq);
         else if (!strcmp(line, "compositing_guess")) g_cfg.compositing_guess = atoi(eq);
         else if (!strcmp(line, "tm_follow_source")) g_cfg.tm_follow_source = atoi(eq);
+        else if (!strcmp(line, "small_copies")) g_cfg.small_copies = atoi(eq);
         else if (!strcmp(line, "last_dir")) snprintf(g_cfg.last_dir, sizeof g_cfg.last_dir, "%s", eq);
     }
     fclose(f);
@@ -186,8 +187,8 @@ void config_save(void)
     mkdir_p(APP_DIR);
     FILE *f = fopen(APP_CFG, "w");
     if (!f) return;
-    fprintf(f, "force_stretch=%d\npitch_plugin_mode=%d\napply_event_level=%d\nshow_fps=%d\ncache_mb=%d\ncompositing_guess=%d\ntm_follow_source=%d\nlast_dir=%s\n",
+    fprintf(f, "force_stretch=%d\npitch_plugin_mode=%d\napply_event_level=%d\nshow_fps=%d\ncache_mb=%d\ncompositing_guess=%d\ntm_follow_source=%d\nsmall_copies=%d\nlast_dir=%s\n",
             g_cfg.force_stretch, g_cfg.pitch_plugin_mode, g_cfg.apply_event_level, g_cfg.show_fps, g_cfg.cache_mb,
-            g_cfg.compositing_guess, g_cfg.tm_follow_source, g_cfg.last_dir);
+            g_cfg.compositing_guess, g_cfg.tm_follow_source, g_cfg.small_copies, g_cfg.last_dir);
     fclose(f);
 }

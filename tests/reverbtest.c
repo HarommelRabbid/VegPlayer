@@ -9,7 +9,7 @@
 #include "media.h"
 #include "mixer.h"
 Session g_s;
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, "" };
 void log_printf(const char *fmt, ...) { (void)fmt; }
 
 static double rms(const float *x, int a, int b) { double s = 0; for (int i = a; i < b; i++) s += (double)x[2 * i] * x[2 * i]; return sqrt(s / (b - a)); }
