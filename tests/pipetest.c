@@ -8,7 +8,7 @@
 #include "media.h"
 #include "mixer.h"
 #include "veg.h"
-Config g_cfg = { -1, -1, 1, 1, 0, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, "" };
 Session g_s;
 void log_printf(const char *fmt, ...) { (void)fmt; }
 uint64_t time_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000; }

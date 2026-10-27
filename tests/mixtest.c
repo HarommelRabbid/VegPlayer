@@ -7,7 +7,7 @@
 #include "media.h"
 #include "mixer.h"
 Session g_s;
-Config g_cfg = { -1, -1, 1, 1, 0, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, "" };
 void log_printf(const char *fmt, ...) { (void)fmt; }
 
 int main(void)
@@ -42,7 +42,7 @@ int main(void)
     static VegAfx ps = { AFX_PITCH_SHIFT, "Pitch Shift", -12, 0, 0, 0, 0 };
     p->events[4].afx = &ps; p->events[4].nafx = 1;
     p->events[5].stretch_method = VEG_STRETCH_CLASSIC; p->events[5].pitch_semis = 7; p->events[5].stretch_attr = 2;
-    p->tracks[0].kind = VEG_KIND_AUDIO; p->tracks[0].first_event = 0; p->tracks[0].nevents = 6;
+    p->tracks[0].kind = VEG_KIND_AUDIO; p->tracks[0].level = 1; p->tracks[0].first_event = 0; p->tracks[0].nevents = 6;
     p->duration = 6;
     mixer_init();
     int total = OUT_RATE * 6;

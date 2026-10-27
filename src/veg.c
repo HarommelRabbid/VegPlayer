@@ -137,6 +137,11 @@ const char *veg_ext(const char *path)
 #define G_ACOMP      "69d46c27"   /* audio track settings: volume (float, linear) @0x0c */
 #define G_TRACKMOTION "cd6915d8"
 
+typedef struct { char name[64]; double v[4]; int nv; } OfxParam;
+static int ofx_params(const uint8_t *b, size_t bl, char *id, size_t idsz, OfxParam *out, int maxp);
+static const OfxParam *ofx_find(const OfxParam *ps, int n, const char *name);
+/* a2fc1a41-01f6-460e-ae5a-2be4af57b92e as stored */
+static const uint8_t OFX_WRAP[16] = { 0x41,0x1a,0xfc,0xa2,0xf6,0x01,0x0e,0x46,0xae,0x5a,0x2b,0xe4,0xaf,0x57,0xb9,0x2e };
 static const uint8_t SOLID_GEN[16] = { 0xfc,0x0d,0xdd,0xd9,0x4f,0x27,0xa7,0x45,0xb8,0x74,0x3d,0x2b,0xcf,0xa6,0x1f,0xe9 };
 static const uint8_t TEXT_GEN[16]  = { 0x9d,0x78,0xe8,0x0f,0x47,0x0c,0x2a,0x44,0xaf,0xb0,0x0d,0xaf,0x97,0x66,0x93,0x17 };
 static const uint8_t NOISE_NAME[6] = { 0xce,0x30,0xa4,0x30,0xba,0x30 };            /* "ノイズ" UTF-16LE */
@@ -254,8 +259,24 @@ static int parse_media(St *s, const uint8_t *b, size_t bl)
     } else if (mem_find(b, bl, NOISE_NAME, 6) || ci_contains(m->path, "noisetexture")) {
         m->type = VEG_MEDIA_NOISE;
     } else if (ci_contains(m->path, "solidcolor")) {
-        m->type = VEG_MEDIA_SOLID;   /* OFX solid colour: colour lives in an OFX blob we don't decode yet -> white */
+        /* OFX solid colour (Vegas 14+, Movie Studio): an OFX block like the effects' (wrapper GUID, plug-in id,
+         * preset name) with a "Color" parameter of four doubles, RGBA 0..1 */
+        m->type = VEG_MEDIA_SOLID;
         m->rgba[0] = m->rgba[1] = m->rgba[2] = m->rgba[3] = 1;
+        const uint8_t *g = mem_find(b, bl, OFX_WRAP, 16);
+        if (g && g - b >= 4) {
+            OfxParam ps[16];
+            char id[128];
+            const uint8_t *base = g - 4;   /* the effect layout's offsets count from 4 bytes before the GUID */
+            int np = ofx_params(base, bl - (size_t)(base - b), id, sizeof id, ps, 16);
+            const OfxParam *c = ofx_find(ps, np, "Color");
+            if (c && c->nv >= 3) {
+                for (int k = 0; k < 4; k++) {
+                    double v = k < c->nv ? c->v[k] : 1.0;
+                    m->rgba[k] = (float)(v < 0 ? 0 : v > 1 ? 1 : v);
+                }
+            }
+        }
     }
     if (m->type == VEG_MEDIA_GENERATOR || m->type == VEG_MEDIA_TEXT || m->type == VEG_MEDIA_NOISE) {
         /* "META:\Video Generator\{Svfx:...} (3)": keep the generator id as the name */
@@ -302,8 +323,6 @@ static double dxt_param(const uint8_t *b, size_t bl, double dflt)
     }
     return (v >= 0 && v <= 1.0000001) ? v : dflt;
 }
-
-typedef struct { char name[64]; double v[4]; int nv; } OfxParam;
 
 /* OFX effect: header 0x30; @0x28 id byte length, @0x2c preset byte length; id + preset (UTF-16);
  * then u32 block size, u32 count and entries { u32 value size, u32 name bytes, name (UTF-16), value }.
@@ -474,19 +493,22 @@ static int new_event(St *s, const uint8_t *b, size_t bl)
     e->rate = rdd(b + 40);
     if (!(e->rate > 0.001 && e->rate < 1000)) e->rate = 1.0;
     e->level = 1.0f;
-    if (bl >= 0x70) {
-        float lv = rdf(b + 0x6c);
+    /* two layouts: 184-byte chunks (newer Vegas / Movie Studio) and 160-byte ones (older Vegas) with the fields
+     * after the kind byte 8 bytes earlier (no 8-byte block at 0x60). Offsets below are for the 184-byte layout. */
+    int sh = bl >= 0xb8 ? 0 : 8;
+    if (bl >= (size_t)(0x70 - sh)) {
+        float lv = rdf(b + 0x6c - sh);
         if (lv >= 0 && lv <= 16) e->level = lv;
     }
     e->fade_in_curve = e->fade_out_curve = e->kind == VEG_KIND_VIDEO ? VEG_CURVE_SMOOTH : VEG_CURVE_LINEAR;
-    if (bl >= 0x7c) {
-        int ci = (int32_t)rd32(b + 0x74), co = (int32_t)rd32(b + 0x78);
+    if (bl >= (size_t)(0x7c - sh)) {
+        int ci = (int32_t)rd32(b + 0x74 - sh), co = (int32_t)rd32(b + 0x78 - sh);
         if (ci == 1 || ci == 2 || ci == -2 || ci == 4 || ci == -4) e->fade_in_curve = ci;
         if (co == 1 || co == 2 || co == -2 || co == 4 || co == -4) e->fade_out_curve = co;
     }
-    if (bl >= 0x98 && (e->kind == VEG_KIND_AUDIO || e->kind == VEG_KIND_VIDEO)) {
-        e->fade_in = (double)rd64(b + 0x88) / VEG_TICKS;
-        e->fade_out = (double)rd64(b + 0x90) / VEG_TICKS;
+    if (bl >= (size_t)(0x98 - sh) && (e->kind == VEG_KIND_AUDIO || e->kind == VEG_KIND_VIDEO)) {
+        e->fade_in = (double)rd64(b + 0x88 - sh) / VEG_TICKS;
+        e->fade_out = (double)rd64(b + 0x90 - sh) / VEG_TICKS;
         if (e->fade_in > e->length) e->fade_in = e->length;
         if (e->fade_out > e->length) e->fade_out = e->length;
     }

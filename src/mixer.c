@@ -42,10 +42,15 @@ typedef struct {
     int64_t len_n;           /* event length in output frames */
     const AudioCache *ac;
     int segc;
+    /* fast source access: the segment read last ([cs, cs + cn) frames, samples cp) */
+    int64_t cs, cn; const int16_t *cp;
+    double rpos;             /* resampling: source position of the next output frame */
     /* granular */
     int L, H;
     const float *win;
     double gp[2]; int64_t gk[2];
+    int64_t gki; int goff;   /* grain of the next output frame and the offset in it (no division per sample) */
+    int64_t fz_in, fz_out;   /* output frames before fz_in / from fz_out on are inside a fade */
     /* vibrato */
     int vib; double vfreq, vA, vphase;
     float *dl; int dlw;
@@ -98,74 +103,135 @@ static inline void frame_at(const AudioCache *ac, int64_t i, int *segc, float *l
     *r = p[1] * (1.0f / 32768.0f);
 }
 
+static inline void seg_remember(Voice *v)
+{
+    const PcmSeg *sg = &v->ac->seg[v->segc];
+    v->cs = sg->start; v->cn = sg->count; v->cp = sg->pcm;
+}
+
+static inline int ifloor(double x) { int i = (int)x; return (double)i > x ? i - 1 : i; }
+
+/* All reads go through a fast path for the segment read last; frame_at (search, loop wrap, gaps) only runs when a
+ * read leaves it. Source positions fit in 32 bits (2^31 frames = 12 h at 48 kHz), so no 64-bit conversions. */
 static inline void fetch_linear(Voice *v, double pos, float *l, float *r)
 {
-    double fl = floor(pos);
-    int64_t i = (int64_t)fl;
-    float t = (float)(pos - fl), l0, r0, l1, r1;
+    int i = ifloor(pos);
+    float t = (float)(pos - i);
+    int64_t o = (int64_t)i - v->cs;
+    if (o >= 0 && o < v->cn - 1) {
+        const int16_t *q = v->cp + o * 2;
+        *l = ((float)q[0] + (float)(q[2] - q[0]) * t) * (1.0f / 32768.0f);
+        *r = ((float)q[1] + (float)(q[3] - q[1]) * t) * (1.0f / 32768.0f);
+        return;
+    }
+    float l0, r0, l1, r1;
     frame_at(v->ac, i, &v->segc, &l0, &r0);
-    frame_at(v->ac, i + 1, &v->segc, &l1, &r1);
+    frame_at(v->ac, (int64_t)i + 1, &v->segc, &l1, &r1);
+    seg_remember(v);
     *l = l0 + (l1 - l0) * t;
     *r = r0 + (r1 - r0) * t;
 }
 
 static inline void fetch_cubic(Voice *v, double pos, float *l, float *r)
 {
-    double fl = floor(pos);
-    int64_t i = (int64_t)fl;
-    float t = (float)(pos - fl);
-    float a[4], b[4];
-    for (int k = 0; k < 4; k++) frame_at(v->ac, i - 1 + k, &v->segc, &a[k], &b[k]);
+    int i = ifloor(pos);
+    float t = (float)(pos - i);
     float t2 = t * t, t3 = t2 * t;
     float c0 = -0.5f * t3 + t2 - 0.5f * t, c1 = 1.5f * t3 - 2.5f * t2 + 1.0f, c2 = -1.5f * t3 + 2.0f * t2 + 0.5f * t, c3 = 0.5f * t3 - 0.5f * t2;
+    int64_t o = (int64_t)i - v->cs;
+    if (o >= 1 && o < v->cn - 2) {
+        const int16_t *q = v->cp + (o - 1) * 2;
+        *l = (q[0] * c0 + q[2] * c1 + q[4] * c2 + q[6] * c3) * (1.0f / 32768.0f);
+        *r = (q[1] * c0 + q[3] * c1 + q[5] * c2 + q[7] * c3) * (1.0f / 32768.0f);
+        return;
+    }
+    float a[4], b[4];
+    for (int k = 0; k < 4; k++) frame_at(v->ac, (int64_t)i - 1 + k, &v->segc, &a[k], &b[k]);
+    seg_remember(v);
     *l = a[0] * c0 + a[1] * c1 + a[2] * c2 + a[3] * c3;
     *r = b[0] * c0 + b[1] * c1 + b[2] * c2 + b[3] * c3;
 }
 
-static inline float mono_at(Voice *v, double pos)
+/* mono (l + r) of one source frame */
+static inline float mono1(Voice *v, int64_t i)
 {
+    int64_t o = i - v->cs;
+    if (o >= 0 && o < v->cn) { const int16_t *q = v->cp + o * 2; return ((float)q[0] + (float)q[1]) * (1.0f / 32768.0f); }
     float l, r;
-    frame_at(v->ac, (int64_t)pos, &v->segc, &l, &r);
+    frame_at(v->ac, i, &v->segc, &l, &r);
+    seg_remember(v);
     return l + r;
+}
+
+/* mono (l + r) source frames [lo, lo + n) into dst */
+static void mono_window(Voice *v, int lo, int n, float *dst)
+{
+    int k = 0;
+    while (k < n) {
+        int64_t o = (int64_t)lo + k - v->cs;
+        if (o >= 0 && o < v->cn) {   /* run of frames inside the remembered segment */
+            int run = (int)(v->cn - o < n - k ? v->cn - o : n - k);
+            const int16_t *q = v->cp + o * 2;
+            for (int j = 0; j < run; j++) dst[k + j] = ((float)q[2 * j] + (float)q[2 * j + 1]) * (1.0f / 32768.0f);
+            k += run;
+        } else {
+            dst[k] = mono1(v, (int64_t)lo + k);
+            k++;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ granular engine */
 
 static double grain_nominal(const Voice *v, int64_t k) { return v->src0 + (double)(k * v->H) * v->ksrc * v->S; }
 
-/* WSOLA: start of grain k near its nominal position, chosen so its first half continues grain k-1 best */
+#define SCR_LEN 16384
+static float g_scr[SCR_LEN];     /* search window (only the audio thread mixes) */
+
+/* WSOLA: start of grain k near its nominal position, chosen so its first half continues grain k-1 best.
+ * The search window is copied to a mono float array once; candidates are then scored with plain array reads. */
 static double grain_aligned(Voice *v, int64_t k, double prev_pos)
 {
     /* Classic gets a much narrower search than the élastique approximation: it keeps some of Classic's flutter */
     double nom = grain_nominal(v, k);
     double p = v->ksrc * v->P;
     double nat = prev_pos + v->H * p;
-    const int D = (int)(WSOLA_SEARCH * v->ksrc * (v->mode == 2 ? 1.0 : 0.3)) + 1, DEC = 16;
+    const int DEC = 16;
+    int D = (int)(WSOLA_SEARCH * v->ksrc * (v->mode == 2 ? 1.0 : 0.3)) + 1;
     int npts = v->H / DEC;
-    float y[8192 / 2 / 16 + 1];
-    if (npts > (int)(sizeof y / sizeof y[0])) npts = (int)(sizeof y / sizeof y[0]);
-    float ey = 0;
-    for (int j = 0; j < npts; j++) { y[j] = mono_at(v, nat + (double)j * DEC * p); ey += y[j] * y[j]; }
+    if (npts > 256) npts = 256;
+    if (npts < 2) return nom;
+    int offs[256];
+    for (int j = 0; j < npts; j++) offs[j] = (int)((double)j * DEC * p);
+    int span = offs[npts - 1] + 1;
+    if (span + 64 > SCR_LEN) return nom;
+    if (2 * D + 16 + span > SCR_LEN) D = (SCR_LEN - 16 - span) / 2;
+    /* reference: how grain k-1 continues */
+    float y[256], ey = 0;
+    int nb = ifloor(nat);
+    for (int j = 0; j < npts; j++) { y[j] = mono1(v, (int64_t)nb + offs[j]); ey += y[j] * y[j]; }
     if (ey < 1e-6f) return nom;          /* silence: nothing to align */
-    double best = nom;
-    float bestc = -1e30f;
-    /* coarse search every 8 source frames, then refine around the winner */
-    for (int pass = 0; pass < 2; pass++) {
-        double centre = best;
-        int lo = pass ? -7 : -D, hi = pass ? 7 : D, step = pass ? 1 : 8;
-        for (int d = lo; d <= hi; d += step) {
-            double st = (pass ? centre : nom) + d;
+    int base = ifloor(nom) - D - 8;
+    mono_window(v, base, 2 * D + 16 + span, g_scr);
+    /* coarse to fine: every 16 frames scoring every other point, then every 4 within +-15, then every frame within
+     * +-3 (about a third of the work of a step-8 search, same final precision) */
+    int bestd = 0;
+    static const int STEP[3] = { 16, 4, 1 }, HALF[3] = { 0, 15, 3 }, PSTEP[3] = { 2, 1, 1 };
+    for (int pass = 0; pass < 3; pass++) {
+        int centre = bestd;
+        int lo = pass ? centre - HALF[pass] : -D, hi = pass ? centre + HALF[pass] : D;
+        if (lo < -D - 7) lo = -D - 7;
+        if (hi > D + 7) hi = D + 7;
+        float bestc = -1e30f;
+        for (int d = lo; d <= hi; d += STEP[pass]) {
+            const float *x = g_scr + (d + D + 8);
             float c = 0, ex = 0;
-            for (int j = 0; j < npts; j++) {
-                float x = mono_at(v, st + (double)j * DEC * p);
-                c += x * y[j];
-                ex += x * x;
-            }
+            for (int j = 0; j < npts; j += PSTEP[pass]) { float xv = x[offs[j]]; c += xv * y[j]; ex += xv * xv; }
             float score = ex > 1e-9f ? c / sqrtf(ex) : -1e30f;
-            if (score > bestc) { bestc = score; best = st; }
+            if (score > bestc) { bestc = score; bestd = d; }
         }
     }
-    return best;
+    return nom + bestd;
 }
 
 static void grain_prepare(Voice *v, int64_t k)
@@ -179,24 +245,6 @@ static void grain_prepare(Voice *v, int64_t k)
         v->gk[0] = k - 1; v->gp[0] = grain_nominal(v, k - 1);
         v->gk[1] = k; v->gp[1] = grain_nominal(v, k);
     }
-}
-
-static inline void granular_sample(Voice *v, int64_t n, float *l, float *r)
-{
-    int64_t k = n >= 0 ? n / v->H : -((-n + v->H - 1) / v->H);
-    grain_prepare(v, k);
-    float al = 0, ar = 0;
-    double p = v->ksrc * v->P;
-    for (int g = 0; g < 2; g++) {
-        int64_t i = n - v->gk[g] * v->H;
-        if (i < 0 || i >= v->L) continue;
-        float w = v->win ? v->win[i] : 0.5f;
-        float sl, sr;
-        fetch_linear(v, v->gp[g] + (double)i * p, &sl, &sr);
-        al += w * sl;
-        ar += w * sr;
-    }
-    *l = al; *r = ar;
 }
 
 /* ------------------------------------------------------------------ voices */
@@ -254,6 +302,17 @@ static void voice_setup(Voice *v, int ei, double t0)
     v->level = (g_cfg.apply_event_level ? e->level : 1.0f) * tr->level;   /* event gain x track volume */
     v->fi = e->fade_in; v->fo = e->fade_out; v->xi = e->xfade_in; v->xo = e->xfade_out;
     v->segc = 0;
+    seg_remember(v);
+    v->rpos = v->src0 + (double)v->n * v->ksrc * v->S;
+    if (v->mode) {
+        v->gki = v->n >= 0 ? v->n / v->H : -((-v->n + v->H - 1) / v->H);   /* once per voice */
+        v->goff = (int)(v->n - v->gki * v->H);
+    }
+    {   /* fade regions in output frames: gains are only computed in there */
+        double fin = v->fi > v->xi ? v->fi : v->xi, fout = v->fo > v->xo ? v->fo : v->xo;
+        v->fz_in = fin > 1e-6 ? (int64_t)ceil(fin * OUT_RATE) : INT64_MIN;
+        v->fz_out = fout > 1e-6 ? (int64_t)floor((v->len - fout) * OUT_RATE) : INT64_MAX;
+    }
     if (v->vib && v->dl) { memset(v->dl, 0, sizeof(float) * DL_LEN * 2); v->dlw = 0; }
 }
 
@@ -275,12 +334,25 @@ static inline float ramp(double x, double len) { return len > 1e-6 && x < len ? 
 static void voice_render(Voice *v, float *out, int from, int to)
 {
     double inv = 1.0 / OUT_RATE;
-    double p = v->ksrc * v->S;
+    double p = v->ksrc * v->S;          /* resampling: source frames per output frame */
+    double gstep = v->ksrc * v->P;      /* granular: source frames per output frame inside a grain */
     for (int j = from; j < to; j++, v->n++) {
-        int64_t n = v->n;
         float l, r;
-        if (v->mode == 0) fetch_cubic(v, v->src0 + (double)n * p, &l, &r);
-        else granular_sample(v, n, &l, &r);
+        if (v->mode == 0) {
+            fetch_cubic(v, v->rpos, &l, &r);
+            v->rpos += p;
+        } else {
+            if (v->goff >= v->H) { v->goff -= v->H; v->gki++; }
+            if (v->gk[1] != v->gki) grain_prepare(v, v->gki);
+            /* output frame = grain k at offset goff + grain k-1 at offset goff + H (50 % overlap) */
+            int i1 = v->goff, i0 = i1 + v->H;
+            float w1 = v->win ? v->win[i1] : 0.5f, w0 = v->win ? v->win[i0] : 0.5f, sl, sr;
+            fetch_linear(v, v->gp[1] + i1 * gstep, &sl, &sr);
+            l = w1 * sl; r = w1 * sr;
+            fetch_linear(v, v->gp[0] + i0 * gstep, &sl, &sr);
+            l += w0 * sl; r += w0 * sr;
+            v->goff++;
+        }
         if (v->vib && v->dl) {
             v->dl[v->dlw * 2] = l; v->dl[v->dlw * 2 + 1] = r;
             double d = (v->vA * (1.0 + sin(v->vphase)) + 0.001) * OUT_RATE;
@@ -288,14 +360,17 @@ static void voice_render(Voice *v, float *out, int from, int to)
             if (v->vphase > 2.0 * M_PI) v->vphase -= 2.0 * M_PI;
             double rp = v->dlw - d;
             while (rp < 0) rp += DL_LEN;
-            int i0 = (int)rp, i1 = (i0 + 1) % DL_LEN;
+            int i0 = (int)rp, i1 = i0 + 1 == DL_LEN ? 0 : i0 + 1;
             float t = (float)(rp - i0);
             l = v->dl[i0 * 2] + (v->dl[i1 * 2] - v->dl[i0 * 2]) * t;
             r = v->dl[i0 * 2 + 1] + (v->dl[i1 * 2 + 1] - v->dl[i0 * 2 + 1]) * t;
-            v->dlw = (v->dlw + 1) % DL_LEN;
+            v->dlw = v->dlw + 1 == DL_LEN ? 0 : v->dlw + 1;
         }
-        double tau = n * inv, rem = v->len - tau;
-        float g = v->level * ramp(tau, v->fi) * ramp(rem, v->fo) * ramp(tau, v->xi) * ramp(rem, v->xo);
+        float g = v->level;
+        if (v->n < v->fz_in || v->n >= v->fz_out) {
+            double tau = (double)v->n * inv, rem = v->len - tau;
+            g *= ramp(tau, v->fi) * ramp(rem, v->fo) * ramp(tau, v->xi) * ramp(rem, v->xo);
+        }
         out[j * 2] += l * g;
         out[j * 2 + 1] += r * g;
     }
