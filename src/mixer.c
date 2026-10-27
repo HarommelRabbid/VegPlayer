@@ -376,10 +376,150 @@ static void voice_render(Voice *v, float *out, int from, int to)
     }
 }
 
+/* ------------------------------------------------------------------ track reverb (Sony Reverb in a track's FX chain)
+ * A small Freeverb-style reverb per track that has one: the track's voices mix into a bus, which goes through a
+ * pre-delay, 4 early-reflection taps and a late tail (4 damped combs + 2 all-passes per channel). Tracks without
+ * reverb cost nothing, and a reverb track stops processing once its tail has died away. */
+
+#define RV_MAX 16
+#define RV_BUS 4096
+#define RV_COMBS 4
+static const int RV_COMB_LEN[RV_COMBS] = { 1215, 1390, 1548, 1695 };   /* Freeverb's, at 48 kHz */
+static const int RV_AP_LEN[2] = { 605, 480 };
+static const float RV_ER_MS[4] = { 4.3f, 7.1f, 11.7f, 17.9f }, RV_ER_G[4] = { 0.8f, 0.6f, 0.45f, 0.3f };
+
+typedef struct {
+    int track;
+    float dry, wet, early, damp, fb[RV_COMBS];
+    float *mem;                         /* one allocation for all the lines below */
+    float *pre; int pre_len, pre_w, pre_d, er_d[4];
+    float *comb[2][RV_COMBS]; int cpos[2][RV_COMBS]; float cst[2][RV_COMBS]; int clen[2][RV_COMBS];
+    float *ap[2][2]; int apos[2][2]; int alen[2][2];
+    int64_t idle, tail;                 /* frames since input stopped / frames the tail lasts */
+    float bus[RV_BUS * 2];
+} Reverb;
+
+static Reverb *g_rv[RV_MAX];
+static int g_nrv;
+static signed char *g_track_rv;         /* per track: reverb index or -1 */
+
+static float db2lin(double db) { return db <= -96 ? 0.0f : (float)pow(10.0, db / 20.0); }
+
+static void rv_clear(Reverb *r)
+{
+    size_t n = (size_t)r->pre_len * 2;
+    for (int c = 0; c < 2; c++) {
+        for (int k = 0; k < RV_COMBS; k++) n += (size_t)r->clen[c][k];
+        for (int k = 0; k < 2; k++) n += (size_t)r->alen[c][k];
+    }
+    memset(r->mem, 0, n * sizeof(float));
+    memset(r->cst, 0, sizeof r->cst);
+    r->idle = r->tail;   /* silent until something comes in */
+}
+
+static void reverbs_free(void)
+{
+    for (int i = 0; i < g_nrv; i++) { free(g_rv[i]->mem); free(g_rv[i]); g_rv[i] = NULL; }
+    g_nrv = 0;
+    free(g_track_rv); g_track_rv = NULL;
+}
+
+/* set up a reverb for every track whose FX chain has one (not on the audio thread: allocates) */
+static void reverbs_init(void)
+{
+    reverbs_free();
+    VegProject *p = &g_s.proj;
+    if (!p->ntracks) return;
+    g_track_rv = malloc((size_t)p->ntracks);
+    if (!g_track_rv) return;
+    for (int t = 0; t < p->ntracks; t++) {
+        g_track_rv[t] = -1;
+        const VegAfx *a = NULL;
+        for (int k = 0; k < p->tracks[t].nafx; k++) if (p->tracks[t].afx[k].type == AFX_REVERB) { a = &p->tracks[t].afx[k]; break; }
+        if (!a || g_nrv >= RV_MAX || p->tracks[t].kind != VEG_KIND_AUDIO) continue;
+        Reverb *r = calloc(1, sizeof *r);
+        if (!r) continue;
+        r->track = t;
+        r->dry = db2lin(a->dry_db); r->wet = db2lin(a->wet_db); r->early = db2lin(a->early_db);
+        double decay = a->decay_s > 0.05 ? a->decay_s : 2.0;
+        double fc = a->hicut_hz > 100 ? a->hicut_hz : 9000;
+        r->damp = (float)exp(-2.0 * M_PI * fc / OUT_RATE);
+        r->pre_d = (int)(a->predelay_ms * OUT_RATE / 1000.0);
+        for (int k = 0; k < 4; k++) r->er_d[k] = (int)(RV_ER_MS[k] * OUT_RATE / 1000.0);
+        r->pre_len = r->pre_d + r->er_d[3] + 2;
+        size_t n = (size_t)r->pre_len * 2;
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < RV_COMBS; k++) { r->clen[c][k] = RV_COMB_LEN[k] + c * 25; n += (size_t)r->clen[c][k]; }
+            for (int k = 0; k < 2; k++) { r->alen[c][k] = RV_AP_LEN[k] + c * 25; n += (size_t)r->alen[c][k]; }
+        }
+        r->mem = malloc(n * sizeof(float));
+        if (!r->mem) { free(r); continue; }
+        float *q = r->mem;
+        r->pre = q; q += (size_t)r->pre_len * 2;
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < RV_COMBS; k++) { r->comb[c][k] = q; q += r->clen[c][k]; }
+            for (int k = 0; k < 2; k++) { r->ap[c][k] = q; q += r->alen[c][k]; }
+        }
+        /* RT60: each comb loses 60 dB over the decay time */
+        for (int k = 0; k < RV_COMBS; k++) r->fb[k] = (float)pow(10.0, -3.0 * RV_COMB_LEN[k] / (decay * OUT_RATE));
+        r->tail = (int64_t)((decay + a->predelay_ms / 1000.0 + 0.1) * OUT_RATE);
+        rv_clear(r);
+        g_track_rv[t] = (signed char)g_nrv;
+        g_rv[g_nrv++] = r;
+    }
+}
+
+/* process r->bus[0..frames) and add the result to out */
+static void rv_process(Reverb *r, float *out, int frames)
+{
+    const float IN_GAIN = 0.05f;   /* input into the comb bank (4 combs in parallel, high feedback): tail ~8 dB under the source at 0 dB */
+    float d = r->damp, d1 = 1.0f - d;
+    for (int j = 0; j < frames; j++) {
+        float il = r->bus[j * 2], ir = r->bus[j * 2 + 1];
+        /* pre-delay line (stereo) */
+        r->pre[r->pre_w * 2] = il; r->pre[r->pre_w * 2 + 1] = ir;
+        int rp = r->pre_w - r->pre_d; if (rp < 0) rp += r->pre_len;
+        float pl = r->pre[rp * 2], pr = r->pre[rp * 2 + 1];
+        float el = 0, er = 0;
+        for (int k = 0; k < 4; k++) {
+            int ep = rp - r->er_d[k]; if (ep < 0) ep += r->pre_len;
+            if (k & 1) er += r->pre[ep * 2 + 1] * RV_ER_G[k]; else el += r->pre[ep * 2] * RV_ER_G[k];
+        }
+        if (++r->pre_w == r->pre_len) r->pre_w = 0;
+        float in = (pl + pr) * IN_GAIN, y[2];
+        for (int c = 0; c < 2; c++) {
+            float acc = 0;
+            for (int k = 0; k < RV_COMBS; k++) {
+                float *buf = r->comb[c][k];
+                int pos = r->cpos[c][k];
+                float o = buf[pos];
+                r->cst[c][k] = o * d1 + r->cst[c][k] * d;           /* damping (high cut) in the loop */
+                buf[pos] = in + r->cst[c][k] * r->fb[k];
+                if (++pos == r->clen[c][k]) pos = 0;
+                r->cpos[c][k] = pos;
+                acc += o;
+            }
+            for (int k = 0; k < 2; k++) {                          /* all-passes: diffuse the echoes */
+                float *buf = r->ap[c][k];
+                int pos = r->apos[c][k];
+                float b = buf[pos];
+                buf[pos] = acc + b * 0.5f;
+                acc = b - acc;
+                if (++pos == r->alen[c][k]) pos = 0;
+                r->apos[c][k] = pos;
+            }
+            y[c] = acc;
+        }
+        out[j * 2] += il * r->dry + y[0] * r->wet + el * r->early;
+        out[j * 2 + 1] += ir * r->dry + y[1] * r->wet + er * r->early;
+    }
+}
+
 /* ------------------------------------------------------------------ mixing */
 
 void mixer_init(void)
 {
+    reverbs_init();
     if (!g_dl_pool) g_dl_pool = calloc((size_t)MAX_VOICES * DL_LEN * 2, sizeof(float));
     for (int i = 0; i < MAX_VOICES; i++) g_v[i].dl = g_dl_pool ? g_dl_pool + (size_t)i * DL_LEN * 2 : NULL;
     mixer_reset();
@@ -388,6 +528,7 @@ void mixer_init(void)
 void mixer_reset(void)
 {
     for (int i = 0; i < MAX_VOICES; i++) g_v[i].used = 0;
+    for (int i = 0; i < g_nrv; i++) rv_clear(g_rv[i]);   /* a seek starts the tails afresh */
     g_expect = -1;
 }
 
@@ -419,9 +560,21 @@ static void restart_at(double t0)
     }
 }
 
+static void mix_block(float *out, int frames, int64_t start);
+
 void mixer_mix(float *out, int frames, int64_t start)
 {
+    for (int done = 0; done < frames;) {   /* reverb buses hold RV_BUS frames */
+        int n = frames - done < RV_BUS ? frames - done : RV_BUS;
+        mix_block(out + (size_t)done * 2, n, start + done);
+        done += n;
+    }
+}
+
+static void mix_block(float *out, int frames, int64_t start)
+{
     memset(out, 0, sizeof(float) * (size_t)frames * 2);
+    for (int i = 0; i < g_nrv; i++) memset(g_rv[i]->bus, 0, sizeof(float) * (size_t)frames * 2);
     VegProject *p = &g_s.proj;
     if (!p->nevents || !g_s.m) return;
     double t0 = (double)start / OUT_RATE, t1 = (double)(start + frames) / OUT_RATE;
@@ -446,8 +599,18 @@ void mixer_mix(float *out, int frames, int64_t start)
         int from = (int)(es > start ? es - start : 0);
         int64_t stop = es + v->len_n - start;
         int to = stop < frames ? (int)stop : frames;
-        if (from < to) voice_render(v, out, from, to);
+        int ri = g_track_rv ? g_track_rv[v->track] : -1;
+        if (from < to) {
+            voice_render(v, ri >= 0 ? g_rv[ri]->bus : out, from, to);
+            if (ri >= 0) g_rv[ri]->idle = 0;
+        }
         if (stop <= frames) v->used = 0;
+    }
+    for (int i = 0; i < g_nrv; i++) {
+        Reverb *r = g_rv[i];
+        if (r->idle >= r->tail || !g_s.track_on[r->track]) continue;   /* nothing playing and the tail has died away */
+        rv_process(r, out, frames);
+        r->idle += frames;
     }
 }
 

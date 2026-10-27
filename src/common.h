@@ -53,7 +53,7 @@ typedef struct {
     int apply_event_level;    /* use the event gain / opacity value */
     int show_fps;
     int cache_mb;             /* frame cache budget, MB */
-    int compositing_guess;    /* apply guessed track compositing codes to generator tracks */
+    int compositing_guess;    /* apply the tracks' compositing modes (Add, Multiply, Lighten, ...) */
     int tm_follow_source;     /* scale Track Motion moves with a source of another shape (Vegas doesn't) */
     char last_dir[512];
 } Config;

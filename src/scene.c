@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include <psp2/kernel/threadmgr.h>
+#include <vita2d.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -83,6 +84,25 @@ static void vfx_matrix(const VegVfx *v, float m[12])
         cm_mul(m, ml, t);
         break;
     }
+    case VFX_MATRIX:
+    case VFX_COLORCORR:
+        memcpy(m, v->mtx, sizeof(float) * 12);
+        break;
+    case VFX_LAB: {
+        /* LAB Adjust, approximated in YCbCr (BT.601): lightness scale / inversion on Y, a/b offsets on Cr/Cb */
+        static const float TO[3][3] = { { 0.299f, 0.587f, 0.114f }, { -0.168736f, -0.331264f, 0.5f }, { 0.5f, -0.418688f, -0.081312f } };
+        static const float FROM[3][3] = { { 1, 0, 1.402f }, { 1, -0.344136f, -0.714136f }, { 1, 1.772f, 0 } };
+        float to[12], from[12], mid[12], t[12];
+        cm_from_rows(to, TO, zero);
+        cm_from_rows(from, FROM, zero);
+        float ly = (float)v->lum, kc = v->desat ? 0.0f : 1.0f;
+        float D[3][3] = { { v->invert ? -ly : ly, 0, 0 }, { 0, kc, 0 }, { 0, 0, kc } };
+        float o[3] = { v->invert ? 1.0f : 0.0f, (float)(v->b * 0.5), (float)(v->a * 0.5) };   /* a/b scale guessed */
+        cm_from_rows(mid, D, o);
+        cm_mul(t, mid, to);
+        cm_mul(m, from, t);
+        break;
+    }
     case VFX_BRICON: {
         float k = (float)(1.0 + v->contrast), b = (float)v->bright;
         float r[3][3] = { { k, 0, 0 }, { 0, k, 0 }, { 0, 0, k } }, o[3] = { 0.5f - 0.5f * k + b, 0.5f - 0.5f * k + b, 0.5f - 0.5f * k + b };
@@ -93,19 +113,126 @@ static void vfx_matrix(const VegVfx *v, float m[12])
     }
 }
 
-static void chain_matrix(const VegEvent *e, const VegTrack *t, float m[12])
+/* ------------------------------------------------------------------ gradient maps (built when playback starts) */
+
+#define MAX_LUTS 32
+typedef struct { const VegVfx *ref; vita2d_texture *tex; uint8_t rgb[256][3]; } Lut;
+static Lut g_lut[MAX_LUTS];
+static int g_nlut;
+
+static void lut_fill(const VegVfx *v, uint8_t out[256][3])
 {
-    cm_identity(m);
+    for (int i = 0; i < 256; i++) {
+        float x = i / 255.0f, c[3];
+        int k = 0;
+        while (k + 1 < v->nstops && v->stop_pos[k + 1] < x) k++;
+        if (v->nstops == 1 || x <= v->stop_pos[0]) { for (int j = 0; j < 3; j++) c[j] = v->stop_rgb[0][j]; }
+        else if (k + 1 >= v->nstops) { for (int j = 0; j < 3; j++) c[j] = v->stop_rgb[v->nstops - 1][j]; }
+        else {
+            float span = v->stop_pos[k + 1] - v->stop_pos[k], u = span > 1e-6f ? (x - v->stop_pos[k]) / span : 1.0f;
+            for (int j = 0; j < 3; j++) c[j] = v->stop_rgb[k][j] + (v->stop_rgb[k + 1][j] - v->stop_rgb[k][j]) * u;
+        }
+        for (int j = 0; j < 3; j++) out[i][j] = (uint8_t)(c[j] * 255.0f + 0.5f);
+    }
+}
+
+static int same_gradient(const VegVfx *a, const VegVfx *b)
+{
+    if (a->nstops != b->nstops) return 0;
+    for (int i = 0; i < a->nstops; i++) {
+        if (fabsf(a->stop_pos[i] - b->stop_pos[i]) > 1e-4f) return 0;
+        for (int j = 0; j < 3; j++) if (fabsf(a->stop_rgb[i][j] - b->stop_rgb[i][j]) > 1e-4f) return 0;
+    }
+    return 1;
+}
+
+static void luts_free(void)
+{
+    if (!g_nlut) return;
+    vita2d_wait_rendering_done();
+    for (int i = 0; i < g_nlut; i++) if (g_lut[i].tex) vita2d_free_texture(g_lut[i].tex);
+    g_nlut = 0;
+}
+
+static void lut_assign(VegVfx *v)
+{
+    if (v->type != VFX_GRADIENT) return;
+    for (int i = 0; i < g_nlut; i++) if (same_gradient(g_lut[i].ref, v)) { v->lut = i; return; }
+    if (g_nlut >= MAX_LUTS) { v->lut = -1; return; }
+    Lut *L = &g_lut[g_nlut];
+    L->ref = v;
+    lut_fill(v, L->rgb);
+    L->tex = vita2d_create_empty_texture_format(256, 1, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
+    if (L->tex) {
+        uint32_t *px = vita2d_texture_get_datap(L->tex);
+        for (int i = 0; i < 256; i++) px[i] = L->rgb[i][0] | (uint32_t)L->rgb[i][1] << 8 | (uint32_t)L->rgb[i][2] << 16 | 0xFF000000u;
+        vita2d_texture_set_filters(L->tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    }
+    v->lut = g_nlut++;
+}
+
+static void luts_build(void)
+{
+    luts_free();
+    VegProject *p = &g_s.proj;
+    for (int i = 0; i < p->nevents; i++) for (int k = 0; k < p->events[i].nvfx; k++) lut_assign(&p->events[i].vfx[k]);
+    for (int t = 0; t < p->ntracks; t++) for (int k = 0; k < p->tracks[t].nvfx; k++) lut_assign(&p->tracks[t].vfx[k]);
+    if (g_nlut) LOG("scene: %d gradient map%s", g_nlut, g_nlut > 1 ? "s" : "");
+}
+
+/* ------------------------------------------------------------------ effect chain of a layer */
+
+/* The chain (event effects, then track effects) becomes one GPU pass: colour effects fold into the matrix m;
+ * a Gradient Map splits the chain (m before it, m2 after it); a blur is applied when sampling (it commutes with
+ * the colour matrix). One special effect per layer: the first one wins. */
+typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; } Chain;
+
+static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
+{
+    cm_identity(c->m); cm_identity(c->m2);
+    c->pass = PASS_MATRIX; c->special = NULL;
     for (int pass = 0; pass < 2; pass++) {
         const VegVfx *fx = pass ? t->vfx : e->vfx;
         int n = pass ? t->nvfx : e->nvfx;
         for (int i = 0; i < n; i++) {
-            if (fx[i].type == VFX_UNKNOWN) continue;
+            const VegVfx *v = &fx[i];
+            if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
+            if (v->type == VFX_GRADIENT || v->type == VFX_LINEARBLUR || v->type == VFX_RADIALBLUR || v->type == VFX_GAUSSBLUR) {
+                if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
+                    c->special = v;
+                    c->pass = v->type == VFX_GRADIENT ? PASS_LUT : PASS_BLUR;
+                }
+                continue;
+            }
             float f[12], r[12];
-            vfx_matrix(&fx[i], f);
-            cm_mul(r, f, m);
-            memcpy(m, r, sizeof r);
+            vfx_matrix(v, f);
+            float *dst = c->pass == PASS_LUT ? c->m2 : c->m;
+            cm_mul(r, f, dst);
+            memcpy(dst, r, sizeof r);
         }
+    }
+}
+
+/* blur taps for the shader: step at the outermost tap (texcoords), radial centre/strength, 9 weights */
+static void blur_params(const VegVfx *v, const GpuImage *img, GpuLayer *L)
+{
+    float asp = img->h > 0 ? (float)img->w / img->h : 1.0f;
+    memset(L->dir, 0, sizeof L->dir); memset(L->rad, 0, sizeof L->rad);
+    int gauss = v->type == VFX_GAUSSBLUR;
+    for (int k = 0; k < 17; k++) {   /* Gaussian: binomial weights C(16, k) / 2^16; the others: a box */
+        double c = 1;
+        for (int j = 0; j < k; j++) c = c * (16 - j) / (j + 1);
+        L->w[k] = gauss ? (float)(c / 65536.0) : 1.0f / 17.0f;
+    }
+    L->w[17] = L->w[18] = L->w[19] = 0;
+    if (v->type == VFX_LINEARBLUR) {
+        float a = (float)(v->angle * M_PI / 180.0), len = (float)v->amount * 0.5f;   /* Amount: blur length / picture width */
+        L->dir[0] = cosf(a) * len; L->dir[1] = -sinf(a) * len * asp;
+    } else if (v->type == VFX_GAUSSBLUR) {
+        if (v->a >= v->b) L->dir[0] = (float)v->a; else L->dir[1] = (float)v->b;   /* the longer axis */
+    } else {
+        L->dir[2] = (float)v->cx; L->dir[3] = (float)v->cy;
+        L->rad[0] = (float)v->amount;
     }
 }
 
@@ -118,6 +245,14 @@ static void pan_at(const VegEvent *e, double tau, VegPanKey *k)
         const VegPanKey *a = &e->pan[i], *b = &e->pan[i + 1];
         if (tau <= b->t) {
             double u = b->t > a->t ? (tau - a->t) / (b->t - a->t) : 1.0;
+            switch (a->curve) {   /* the keyframe's interpolation type shapes the way to the next one */
+            case VEG_KEY_FAST:   u = veg_fade_shape(VEG_CURVE_FAST, u); break;
+            case VEG_KEY_SLOW:   u = veg_fade_shape(VEG_CURVE_SLOW, u); break;
+            case VEG_KEY_SMOOTH: u = veg_fade_shape(VEG_CURVE_SMOOTH, u); break;
+            case VEG_KEY_SHARP:  u = veg_fade_shape(VEG_CURVE_SHARP, u); break;
+            case VEG_KEY_HOLD:   u = 0; break;
+            default: break;
+            }
             k->t = tau;
             k->w = a->w + (b->w - a->w) * u; k->h = a->h + (b->h - a->h) * u;
             k->cx = a->cx + (b->cx - a->cx) * u; k->cy = a->cy + (b->cy - a->cy) * u;
@@ -205,13 +340,17 @@ static const GpuImage *frame_for(const VideoCache *vc, double src)
 }
 
 /* CPU effect pass into a scratch image (only without the GPU shader) */
-static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], GpuImage *dst)
+static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint8_t (*lut)[3], float lamt,
+                              const float m2[12], GpuImage *dst)
 {
     if (src->w > g_fb_w || src->h > g_fb_h) return src;
     GpuImage out = *dst;
     if (gpu_image_wrap(&out, dst->data, src->w, src->h, 4) < 0) return src;
-    int M[12];
-    for (int i = 0; i < 12; i++) M[i] = (int)(m[i] * (i % 4 == 3 ? 255.0f * 256.0f : 256.0f));
+    int M[12], M2[12], la = (int)(lamt * 256.0f);
+    for (int i = 0; i < 12; i++) {
+        M[i] = (int)(m[i] * (i % 4 == 3 ? 255.0f * 256.0f : 256.0f));
+        M2[i] = (int)(m2[i] * (i % 4 == 3 ? 255.0f * 256.0f : 256.0f));
+    }
     for (int y = 0; y < src->h; y++) {
         const uint8_t *row = (const uint8_t *)src->data + (size_t)y * src->stride * src->bpp;
         uint32_t *o = (uint32_t *)out.data + (size_t)y * out.stride;
@@ -228,6 +367,14 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], GpuImage *
             int G = (M[4] * r + M[5] * g + M[6] * b + M[7]) >> 8;
             int B = (M[8] * r + M[9] * g + M[10] * b + M[11]) >> 8;
             R = CLAMP(R, 0, 255); G = CLAMP(G, 0, 255); B = CLAMP(B, 0, 255);
+            if (lut) {   /* Gradient Map: brightness -> colour, mixed by amount, then the effects after it */
+                int l = (77 * R + 150 * G + 29 * B) >> 8;
+                R += ((lut[l][0] - R) * la) >> 8; G += ((lut[l][1] - G) * la) >> 8; B += ((lut[l][2] - B) * la) >> 8;
+                int R2 = (M2[0] * R + M2[1] * G + M2[2] * B + M2[3]) >> 8;
+                int G2 = (M2[4] * R + M2[5] * G + M2[6] * B + M2[7]) >> 8;
+                int B2 = (M2[8] * R + M2[9] * G + M2[10] * B + M2[11]) >> 8;
+                R = CLAMP(R2, 0, 255); G = CLAMP(G2, 0, 255); B = CLAMP(B2, 0, 255);
+            }
             o[x] = (uint32_t)R | (uint32_t)G << 8 | (uint32_t)B << 16 | (uint32_t)a << 24;
         }
     }
@@ -268,10 +415,21 @@ static void build(Scene *sc, int buf, double T)
                 pw = m->vc.src_w; ph = m->vc.src_h;
             }
             if (!img || pw <= 0 || ph <= 0) continue;   /* text / noise generators and missing sources */
+            if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
             place(p, e, tr, tau, pw, ph, L->x, L->y);
-            chain_matrix(e, tr, L->m);
-            L->fx = !cm_is_identity(L->m);
+            Chain ch;
+            chain_build(e, tr, &ch);
+            memcpy(L->m, ch.m, sizeof L->m);
+            memcpy(L->m2, ch.m2, sizeof L->m2);
+            L->pass = ch.pass;
+            L->lut = NULL;
+            if (ch.pass == PASS_LUT) {
+                const Lut *lu = &g_lut[ch.special->lut];
+                L->lut = lu->tex ? &lu->tex->gxm_tex : NULL;
+                L->lutp[0] = (float)ch.special->amount; L->lutp[1] = 255.0f / 256.0f; L->lutp[2] = 0.5f / 256.0f; L->lutp[3] = 0;
+            } else if (ch.pass == PASS_BLUR) blur_params(ch.special, img, L);
+            L->fx = !cm_is_identity(L->m) || ch.pass != PASS_MATRIX;
             float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
             /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
              * the fade-out is left out where the next event overlaps, since that one dissolves in on top */
@@ -283,19 +441,48 @@ static void build(Scene *sc, int buf, double T)
             if (a <= 0.002f) continue;
             L->tint[0] = tint[0]; L->tint[1] = tint[1]; L->tint[2] = tint[2]; L->tint[3] = a > 1 ? 1 : a;
             L->blend = BLEND_NORMAL;
-            if (vm->type != VEG_MEDIA_FILE && tr->has_comp && g_cfg.compositing_guess) {
-                if (tr->comp_b == -1) continue;   /* plug-in compositing (masks etc.): hidden, like vegtool */
-                if (tr->comp_a == 1) L->blend = BLEND_ADD;
-                else if (tr->comp_a == 2) L->blend = BLEND_SUBTRACT;
-            }
             L->tex = &img->tex;
-            if (L->fx && !gpu_shaders_ok()) {
+            /* colour work the GPU can't do here goes through the CPU scratch images: everything without the shader
+             * compiler, a gradient map without its shader. Blurs without their shader are skipped. */
+            int cpu = L->fx && (!gpu_shaders_ok() || (L->pass == PASS_LUT && (!gpu_pass_ok(PASS_LUT) || !L->lut)));
+            if (cpu) {
                 if (g_fb_ok && fb_used < FB_SLOTS) {
-                    L->tex = &cpu_fx(img, L->m, &g_fb[buf][fb_used++])->tex;
+                    const uint8_t (*lt)[3] = L->pass == PASS_LUT ? (const uint8_t (*)[3])g_lut[ch.special->lut].rgb : NULL;
+                    L->tex = &cpu_fx(img, L->m, lt, (float)(ch.special && L->pass == PASS_LUT ? ch.special->amount : 0), L->m2,
+                                     &g_fb[buf][fb_used++])->tex;
                     sc->cpu_fx++;
                 }
-                L->fx = 0;
                 cm_identity(L->m);
+                L->pass = PASS_MATRIX;
+                L->fx = 0;
+            }
+            if (L->pass == PASS_BLUR && !gpu_pass_ok(PASS_BLUR)) L->pass = PASS_MATRIX;
+            /* track compositing mode -> blend */
+            if (g_cfg.compositing_guess) {
+                float al = L->tint[3];
+                switch (tr->comp_mode) {
+                case VEG_COMP_ADD:      L->blend = BLEND_ADD; break;
+                case VEG_COMP_SUBTRACT: L->blend = BLEND_SUBTRACT; break;
+                case VEG_COMP_CUT:      L->blend = BLEND_CUT; break;
+                case VEG_COMP_MULTIPLY: L->blend = BLEND_MULTIPLY; break;
+                case VEG_COMP_SCREEN:   L->blend = BLEND_SCREEN; break;
+                case VEG_COMP_LIGHTEN:  L->blend = BLEND_LIGHTEN; break;
+                case VEG_COMP_DARKEN:   L->blend = BLEND_DARKEN; break;
+                default: break;   /* Overlay, Hard Light, Dodge, Burn, Difference: need the picture below (normal) */
+                }
+                if (!gpu_shaders_ok() && L->blend != BLEND_ADD) L->blend = BLEND_NORMAL;   /* vita2d path: add only */
+                if (L->blend == BLEND_MULTIPLY || L->blend == BLEND_SCREEN || L->blend == BLEND_LIGHTEN) {
+                    for (int c = 0; c < 3; c++) L->tint[c] *= al;   /* premultiplied: the opacity mixes towards neutral */
+                } else if (L->blend == BLEND_DARKEN) {
+                    /* neutral for MIN is white: colour = a * c + (1 - a), folded into the last matrix */
+                    float *fm = L->pass == PASS_LUT ? L->m2 : L->m;
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) fm[r * 4 + c] *= al * L->tint[r];
+                        fm[r * 4 + 3] = fm[r * 4 + 3] * al * L->tint[r] + (1.0f - al);
+                    }
+                    L->tint[0] = L->tint[1] = L->tint[2] = 1.0f;
+                    L->fx = 1;
+                }
             }
             sc->n++;
         }
@@ -328,6 +515,7 @@ int scene_start(void)
     if (g_sema < 0) g_sema = sceKernelCreateSema("vp_scene_sema", 0, 0, 1, NULL);
     g_disp = g_ready = -1;
     memset(g_sc, 0, sizeof g_sc);
+    luts_build();   /* gradient map textures (main thread: vita2d allocations) */
     /* scratch images for the CPU effect fallback, sized for the largest cache frame */
     g_fb_ok = 0;
     if (!gpu_shaders_ok()) {

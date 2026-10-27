@@ -136,6 +136,7 @@ const char *veg_ext(const char *path)
 #define G_COMP       "69d46c29"
 #define G_ACOMP      "69d46c27"   /* audio track settings: volume (float, linear) @0x0c */
 #define G_TRACKMOTION "cd6915d8"
+#define G_TRACKFX    "f79298f4"   /* audio track FX chain (Track Noise Gate/EQ/Compressor + inserted plug-ins) */
 
 typedef struct { char name[64]; double v[4]; int nv; } OfxParam;
 static int ofx_params(const uint8_t *b, size_t bl, char *id, size_t idsz, OfxParam *out, int maxp);
@@ -151,7 +152,10 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_BW_GUID     "e87674d5-e8f2-11d1-9aa9-00a0c99b12c5"   /* Sony Black and White (DXT) */
 #define FX_INVERT_GUID "c3062be7-e69d-11d1-9aa9-00a0c99b12c5"   /* Sony Invert (DXT) */
 #define FX_OFX_GUID    "a2fc1a41-01f6-460e-ae5a-2be4af57b92e"   /* OFX host wrapper: the effect is named by an Svfx id */
+#define FX_CHANBLEND_GUID "0bc15b73-83b9-11d4-9f67-00485481bd31" /* Sony Channel Blend (DXT) */
+#define FX_GRADMAP_GUID   "300f2f5f-d7c7-48be-b796-90fc740b654e" /* Sony Gradient Map (DXT) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
+#define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
 /* ------------------------------------------------------------------ chunk iteration */
 
@@ -220,7 +224,12 @@ static int parse_media(St *s, const uint8_t *b, size_t bl)
     VegProject *p = s->p;
     if (bl < 0x64) return 0;
     uint32_t id; size_t path_at;
-    if (!memcmp(b + 0x30, MEDIA_ID_MARK, 8)) { id = rd32(b + 0x3c); path_at = 0x60; }
+    if (!memcmp(b + 0x30, MEDIA_ID_MARK, 8)) {
+        id = rd32(b + 0x3c);
+        /* the first word is the path's offset: 0x60 in most files, 0x80 in some (scan.veg) */
+        uint32_t po = rd32(b);
+        path_at = po >= 0x60 && po < 0x200 && po < bl ? po : 0x60;
+    }
     else {   /* older layout: search like vegtool did */
         const uint8_t *m = mem_find(b, bl, MEDIA_ID_MARK, 8);
         if (!m || (size_t)(m - b) + 16 > bl) return 0;
@@ -302,7 +311,7 @@ static int walk_media(St *s, size_t off, size_t end)
 static void vfx_defaults(VegVfx *v)
 {
     memset(v, 0, sizeof *v);
-    v->amount = 1; v->sat = 1; v->lum = 1;
+    v->amount = 1; v->sat = 1; v->lum = 1; v->lut = -1;
 }
 
 /* Legacy (DXT) effect: header 0x38, preset name (UTF-16, byte length @0x34), then parameter data.
@@ -363,6 +372,51 @@ static double ofx_get(const OfxParam *ps, int n, const char *name, double dflt)
     return p && p->nv ? p->v[0] : dflt;
 }
 
+/* DXT effects: after the preset name comes a static parameter block, then the keyframes. The first keyframe's copy
+ * of the block holds the values Vegas actually uses (the static block can be stale): it starts with u32 28 placed
+ * right after the static block, whose length is repeated 0x18 bytes later, followed by the copy itself. */
+static const uint8_t *dxt_params(const uint8_t *b, size_t bl, size_t *len)
+{
+    if (bl < 0x38) return NULL;
+    uint32_t n = rd32(b + 0x34);
+    if (n >= 400 || 0x38 + n > bl) return NULL;
+    size_t q = 0x38 + n;
+    for (size_t k = q + 8; k + 0x1c <= bl; k += 4) {
+        if (rd32(b + k) != 0x1c) continue;
+        uint32_t S = rd32(b + k + 0x18);
+        if (S == k - q && k + 0x1c + S <= bl) { *len = S; return b + k + 0x1c; }
+    }
+    *len = bl - q;
+    return b + q;
+}
+
+static void lab_or_blur_ofx(VegVfx *v, const char *id, const OfxParam *ps, int np)
+{
+    if (ci_contains(id, ":labadjust")) {
+        v->type = VFX_LAB;
+        v->lum = ofx_get(ps, np, "Lightness", 1);
+        v->a = ofx_get(ps, np, "Channela", 0);
+        v->b = ofx_get(ps, np, "Channelb", 0);
+        v->invert = ofx_get(ps, np, "InvertLuminance", 0) != 0;
+        v->desat = ofx_get(ps, np, "Desaturate", 0) != 0;
+    } else if (ci_contains(id, ":linearblur")) {
+        v->type = VFX_LINEARBLUR;
+        v->angle = ofx_get(ps, np, "Angle", 0);
+        v->amount = ofx_get(ps, np, "Amount", 0.05);
+    } else if (ci_contains(id, ":radialblur")) {
+        v->type = VFX_RADIALBLUR;
+        v->amount = ofx_get(ps, np, "Amount", 0.1);
+        const OfxParam *c = ofx_find(ps, np, "Center");
+        v->cx = c && c->nv >= 2 ? c->v[0] : 0.5;
+        v->cy = c && c->nv >= 2 ? 1.0 - c->v[1] : 0.5;   /* OFX y points up */
+    } else if (ci_contains(id, ":gaussianblur")) {
+        v->type = VFX_GAUSSBLUR;
+        v->a = ofx_get(ps, np, "HorizontalRange", 0);
+        v->b = ofx_get(ps, np, "VerticalRange", 0);
+        if (v->a <= 0 && v->b <= 0) v->type = VFX_NOOP;
+    }
+}
+
 static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
 {
     vfx_defaults(v);
@@ -392,6 +446,22 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
             v->type = VFX_BRICON;
             v->bright = ofx_get(ps, np, "Brightness", 0);
             v->contrast = ofx_get(ps, np, "Contrast", 0);
+        } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur")) {
+            lab_or_blur_ofx(v, id, ps, np);
+        } else if (ci_contains(id, ":colorcorrector") && !ci_contains(id, "secondary")) {
+            /* saturation around luma, then gain and offset; the colour wheels and gamma are not applied */
+            double sat = ofx_get(ps, np, "Saturation", 1), gain = ofx_get(ps, np, "Gain", 1), off = ofx_get(ps, np, "Offset", 0);
+            v->type = fabs(sat - 1) < 1e-6 && fabs(gain - 1) < 1e-6 && fabs(off) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
+            const double L[3] = { 0.299, 0.587, 0.114 };
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) v->mtx[i * 4 + j] = (float)(gain * ((1 - sat) * L[j] + (i == j ? sat : 0)));
+                v->mtx[i * 4 + 3] = (float)off;
+            }
+        } else if (ci_contains(id, ":colorbalance")) {
+            double r = ofx_get(ps, np, "Red", 0), g = ofx_get(ps, np, "Green", 0), bb = ofx_get(ps, np, "Blue", 0);
+            v->type = fabs(r) + fabs(g) + fabs(bb) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
+            for (int i = 0; i < 12; i++) v->mtx[i] = i % 5 == 0 ? 1.0f : 0.0f;
+            v->mtx[3] = (float)(r * 0.5); v->mtx[7] = (float)(g * 0.5); v->mtx[11] = (float)(bb * 0.5);   /* scale guessed */
         } else {
             v->type = VFX_UNKNOWN;
         }
@@ -406,11 +476,52 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
         } else if (!strcmp(plug, FX_BW_GUID)) {
             v->type = VFX_GRAYSCALE;
             v->amount = dxt_param(b, bl, 1.0);
+        } else if (!strcmp(plug, FX_CHANBLEND_GUID)) {
+            /* 2 x 20 doubles; the first block: for each input channel (R,G,B,A) its weight in output R,G,B,A + one
+             * more value. "Red Only" = red copied to R, G and B. The second block stays identity (not applied). */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            if (pp && pl >= 20 * 8) {
+                v->type = VFX_MATRIX;
+                for (int o = 0; o < 3; o++) {
+                    for (int in = 0; in < 3; in++) {
+                        double w = rdd(pp + (size_t)(in * 5 + o) * 8);
+                        v->mtx[o * 4 + in] = (float)(w > -16 && w < 16 ? w : 0);
+                    }
+                    v->mtx[o * 4 + 3] = 0;
+                }
+            } else v->type = VFX_UNKNOWN;
+        } else if (!strcmp(plug, FX_GRADMAP_GUID)) {
+            /* double amount, u32 -, u32 stop count, then 32-byte stops: floats B,G,R,A, double position, double - */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            uint32_t ns = pp && pl >= 0x10 ? rd32(pp + 0x0c) : 0;
+            if (ns >= 1 && ns <= VFX_MAX_STOPS && 0x10 + (size_t)ns * 0x20 <= pl) {
+                v->type = VFX_GRADIENT;
+                double amt = rdd(pp);
+                v->amount = amt >= 0 && amt <= 1 ? amt : 1.0;
+                v->nstops = (int)ns;
+                for (uint32_t i = 0; i < ns; i++) {
+                    const uint8_t *st = pp + 0x10 + i * 0x20;
+                    double pos = rdd(st + 16);
+                    v->stop_pos[i] = (float)(pos >= 0 && pos <= 1 ? pos : (double)i / (ns > 1 ? ns - 1 : 1));
+                    for (int c = 0; c < 3; c++) {
+                        float x = rdf(st + 8 - c * 4);   /* stored B, G, R */
+                        v->stop_rgb[i][c] = x < 0 ? 0 : x > 1 ? 1 : x;
+                    }
+                }
+                for (int i = 1; i < v->nstops; i++)   /* keep stops sorted by position */
+                    for (int j = i; j > 0 && v->stop_pos[j] < v->stop_pos[j - 1]; j--) {
+                        float tp = v->stop_pos[j]; v->stop_pos[j] = v->stop_pos[j - 1]; v->stop_pos[j - 1] = tp;
+                        for (int c = 0; c < 3; c++) { float t = v->stop_rgb[j][c]; v->stop_rgb[j][c] = v->stop_rgb[j - 1][c]; v->stop_rgb[j - 1][c] = t; }
+                    }
+            } else v->type = VFX_UNKNOWN;
         } else v->type = VFX_UNKNOWN;
         snprintf(v->name, sizeof v->name, "%s%s%.8s", preset, *preset ? " " : "", plug);
     }
     if (v->amount < 0) v->amount = 0;
     if (v->amount > 1) v->amount = 1;
+    if (v->type == VFX_NOOP) return;
     if (v->type == VFX_UNKNOWN) { s->p->n_unknown_vfx++; note_unknown(s, v->name); }
 }
 
@@ -442,6 +553,14 @@ static int parse_afx_chain(St *s, const uint8_t *b, size_t bl, VegAfx **arr, int
         /* "ピッチ シフト" = Pitch Shift, "ビブラート" = Vibrato (Japanese UI) */
         int is_pitch = !strcmp(clsid, AFX_PITCH_GUID) || ci_contains(a.name, "pitch shift") || strstr(a.name, "\xE3\x83\x94\xE3\x83\x83\xE3\x83\x81");
         int is_vib = ci_contains(a.name, "vibrato") || strstr(a.name, "\xE3\x83\x93\xE3\x83\x96\xE3\x83\xA9\xE3\x83\xBC\xE3\x83\x88");
+        /* "リバーブ" = Reverb */
+        int is_rev = !strcmp(clsid, AFX_REVERB_GUID) || ci_contains(a.name, "reverb") || strstr(a.name, "\xE3\x83\xAA\xE3\x83\x90\xE3\x83\xBC\xE3\x83\x96");
+        /* every audio track carries these in their neutral state; Smooth/Enhance is subtle enough to skip */
+        /* (by CLSID: the names are localised, e.g. "トラック EQ", "EQ piste") */
+        int is_noop = !strcmp(clsid, "869419dd-501f-11d3-8cdc-00c04f6b8e4c") ||   /* Track Noise Gate */
+                      !strcmp(clsid, "8cb69a0a-10e8-11d2-9b89-00104b8d13c2") ||   /* Track EQ */
+                      !strcmp(clsid, "23c9f225-40ec-11d2-9d36-00c04f8edc1e") ||   /* Track Compressor */
+                      !strcmp(clsid, "9e3e4540-8339-11d0-aebc-00a0c9053912");     /* Smooth/Enhance */
         if (is_pitch && dl >= 0x20) {
             /* params: i32 semitones, i32 cents, i32 accuracy, i32 preserve duration, i32 classic mode, i32 -, double ratio */
             int32_t semis = (int32_t)rd32(data), cents = (int32_t)rd32(data + 4);
@@ -464,6 +583,26 @@ static int parse_afx_chain(St *s, const uint8_t *b, size_t bl, VegAfx **arr, int
                 if (!got_rate && v >= 0.1 && v <= 20) { a.rate_hz = v; got_rate = 1; k += 4; continue; }
                 if (got_rate && v > 0 && v <= 12) { a.depth = v; break; }
             }
+        } else if (is_rev && dl >= 44) {
+            /* Sony Reverb, i32 params (guessed from scan.veg): dry out, reverb out, early out (centi-dB), -, mode,
+             * decay (0.1 s), pre-delay (ms), -, low cut (Hz), high cut on, high cut (Hz) */
+            a.type = AFX_REVERB;
+            a.dry_db = (int32_t)rd32(data) / 100.0;
+            a.wet_db = (int32_t)rd32(data + 4) / 100.0;
+            a.early_db = (int32_t)rd32(data + 8) / 100.0;
+            a.decay_s = (int32_t)rd32(data + 20) / 10.0;
+            a.predelay_ms = (int32_t)rd32(data + 24);
+            a.hicut_hz = rd32(data + 36) ? (int32_t)rd32(data + 40) : 0;
+            if (!(a.decay_s > 0.05 && a.decay_s < 30)) a.decay_s = 2.0;
+            if (!(a.predelay_ms >= 0 && a.predelay_ms <= 500)) a.predelay_ms = 20;
+            if (a.dry_db < -100 || a.dry_db > 12) a.dry_db = 0;
+            if (a.wet_db < -100 || a.wet_db > 12) a.wet_db = -6;
+            if (a.early_db < -100 || a.early_db > 12) a.early_db = -6;
+        } else if (is_rev) {
+            a.type = AFX_REVERB;
+            a.dry_db = 0; a.wet_db = -6; a.early_db = -6; a.decay_s = 2.0; a.predelay_ms = 20; a.hicut_hz = 12000;
+        } else if (is_noop) {
+            a.type = AFX_NOOP;
         } else {
             a.type = AFX_UNKNOWN;
             s->p->n_unknown_afx++;
@@ -544,6 +683,8 @@ static int event_chunk(St *s, const Chunk *c)
                 k[n].w = rdd(pl + 20); k[n].h = rdd(pl + 28);
                 k[n].cx = rdd(pl + 36); k[n].cy = rdd(pl + 44);
                 k[n].rot = rdd(pl + 52);
+                uint32_t cv = rd32(pl + 16);   /* interpolation to the next keyframe */
+                k[n].curve = cv <= VEG_KEY_HOLD ? (int)cv : VEG_KEY_LINEAR;
                 if (isfinite(k[n].w) && isfinite(k[n].h) && isfinite(k[n].cx) && isfinite(k[n].cy) && isfinite(k[n].rot)) n++;
             }
             q += 4;
@@ -602,6 +743,7 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
             t->kind = ty == 3 ? VEG_KIND_VIDEO : ty == 2 ? VEG_KIND_AUDIO : VEG_KIND_OTHER;
         } else if (gpre(&c, G_COMP) && bl >= 0x84 && !in_event) {
             t->has_comp = 1; t->comp_a = rd32(b + 0x60); t->comp_b = (int32_t)rd32(b + 0x64);
+            if (t->comp_b >= VEG_COMP_CUSTOM && t->comp_b <= VEG_COMP_DIFFSQUARED) t->comp_mode = t->comp_b;
             float lv = rdf(b + 0x68);   /* track Level (opacity) */
             if (lv >= 0 && lv <= 1) t->level = lv;
         } else if (gpre(&c, G_ACOMP) && bl >= 0x10 && !in_event) {
@@ -617,7 +759,7 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
             if (!np) return -1;
             t->vfx = np;
             t->vfx[t->nvfx++] = v;
-        } else if (!in_event && s->cur < 0 && gpre(&c, G_AFX_CHAIN)) {
+        } else if (!in_event && s->cur < 0 && (gpre(&c, G_AFX_CHAIN) || gpre(&c, G_TRACKFX))) {
             if (parse_afx_chain(s, b, bl, &t->afx, &t->nafx) < 0) return -1;
         } else {
             int r = event_chunk(s, &c);   /* also covers old files whose events aren't wrapped in event lists */
@@ -646,6 +788,7 @@ static int find_tracks(St *s, size_t off, size_t end, int *tcap)
             memset(t, 0, sizeof *t);
             t->kind = VEG_KIND_OTHER;
             t->level = 1.0f;
+            t->comp_mode = VEG_COMP_SRCALPHA;
             s->track = p->ntracks++;
             s->cur = -1;
             if (walk_track(s, c.body, c.body + c.blen, 0) < 0) return -1;
@@ -655,6 +798,14 @@ static int find_tracks(St *s, size_t off, size_t end, int *tcap)
 }
 
 /* ------------------------------------------------------------------ public */
+
+const char *veg_comp_name(int mode)
+{
+    static const char *N[] = { "3D Source Alpha", "Add", "Subtract", "Cut", "Source Alpha", "Multiply", "Overlay", "Screen",
+                               "Hard Light", "Dodge", "Burn", "Darken", "Lighten", "Difference", "Difference Squared" };
+    if (mode == VEG_COMP_CUSTOM) return "Custom (plug-in)";
+    return mode >= 0 && mode <= VEG_COMP_DIFFSQUARED ? N[mode] : "?";
+}
 
 float veg_fade_shape(int curve, double u)
 {

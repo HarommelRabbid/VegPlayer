@@ -62,10 +62,16 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
 
 ## What is played
 
-- **Video effects** (event and track level, in chain order): Invert, Black and White (grayscale), HSL Adjust (hue,
-  saturation, luminance), Sepia and Brightness/Contrast. Each is an affine colour transform, so the whole chain is
-  folded into one 3×4 matrix and applied by one GPU pass per layer. Unknown effects are listed on the Sources screen.
-- **Pan/Crop** keyframes (linear between keys, mirroring, rotation; like Vegas, the window is rescaled to the
+- **Video effects** (event and track level, in chain order), all on the GPU (shaders compiled once with vitaShaRK):
+  - colour effects folded into one matrix per layer: Invert, Black and White, HSL Adjust, Sepia, Brightness/Contrast,
+    Channel Blend (e.g. Red/Green/Blue Only), LAB Adjust (lightness, a/b, Invert Luminosity, desaturate; done in
+    YCbCr), Color Corrector (saturation, gain, offset) and Color Balance;
+  - Gradient Map (brightness through a gradient texture, mixed by amount);
+  - Linear Blur, Gaussian Blur and Radial Blur (17-tap blur pass). One Gradient Map or blur per layer.
+  Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; blurs are skipped.
+- **Track compositing modes**: Add, Subtract, Cut, Multiply, Screen, Lighten, Darken. Overlay, Hard Light, Dodge, Burn
+  and Difference need the picture underneath in the shader, so they draw normally for now.
+- **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; like Vegas, the window is rescaled to the
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
   (first keyframe; when the source has another shape, its moves are scaled with the rescaled layout so moved
   tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
@@ -79,6 +85,9 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
 - **Pitch Shift plug-in**: *resample* (speed and pitch change together) and *Classic* (preserve duration).
 - **Vibrato plug-in**: sine-modulated delay line.
 - Event gain, audio track volume, fades, crossfades.
+- **Reverb** in an audio track's FX chain (Sony Reverb): a light per-track reverb (pre-delay, early reflections,
+  damped tail) with the project's dry/reverb/early levels, decay time, pre-delay and high cut. Tracks without reverb
+  cost nothing; a reverb stops processing once its tail has died away.
 
 ## What is read from the .veg (and what is guessed)
 
@@ -94,6 +103,13 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Vibrato plug-in | name match; parameter layout unknown | **guessed** (defaults: 5 Hz, 0.5 st) |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
+| Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |
+| Pan/Crop keyframe type | keyframe @16: 0 Linear, 1 Fast, 2 Slow, 3 Smooth, 4 Sharp, 5 Hold | Smooth (3) seen in the Porta Mix project |
+| Media path | media chunk: the first word is the path's offset (0x60, or 0x80 in some files) | solid |
+| DXT effect values | the first keyframe's copy of the parameter block (the static block can be stale) | solid for Channel Blend, Gradient Map |
+| Channel Blend | 2 x 20 doubles; block 1: per input channel its weight in R,G,B,A (+1) | presets match (Red Only = red copied to R,G,B) |
+| Gradient Map | amount, stop count, 32-byte stops (B,G,R,A floats, position double) | Sunset decodes to black-orange-yellow-white |
+| Audio track FX | `f79298f4`: same records as the event plug-in chain; Sony Reverb i32 params | levels/decay/pre-delay/high cut **guessed** from one project |
 | Audio track volume | `69d46c27` (audio track settings): float @0x0c, linear gain | solid (values land on round dB steps) |
 | Video track Level | `69d46c29` (compositing): float @0x68 | solid (Pinkiety: 0 %, 32.8 %, 35 %) |
 | Fade curves | event @0x74 (in) / @0x78 (out): 1 Linear, 2 Fast, −2 Slow, 4 Smooth, −4 Sharp | codes match Vegas's defaults (audio 2/−2, video 4); which word is in/out **guessed** |

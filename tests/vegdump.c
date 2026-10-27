@@ -4,8 +4,8 @@
 #include <string.h>
 #include "veg.h"
 
-static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon" };
-static const char *AFXN[] = { "unknown", "pitchshift", "vibrato" };
+static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon", "chanblend", "lab", "colorcorr", "gradient", "linearblur", "radialblur", "noop", "gaussblur" };
+static const char *AFXN[] = { "unknown", "pitchshift", "vibrato", "reverb", "noop" };
 
 int main(int argc, char **argv)
 {
@@ -23,13 +23,15 @@ int main(int argc, char **argv)
             if (m->used_audio) printf(" arange %.2f-%.2f", m->use_lo[1], m->use_hi[1]);
             printf("\n");
         }
-        int vfxc[6] = { 0 }, afxc[3] = { 0 }, nostr = 0, meth[4] = { 0 }, pitched = 0, panned = 0, nomedia = 0, xf = 0;
+        int vfxc[16] = { 0 }, afxc[8] = { 0 }, nostr = 0, meth[4] = { 0 }, pitched = 0, panned = 0, nomedia = 0, xf = 0;
         double minpitch = 0, maxpitch = 0;
         for (int t = 0; t < p.ntracks; t++) {
             VegTrack *tr = &p.tracks[t];
             printf("  track %2d %s events=%4d%s%s", t, tr->kind == VEG_KIND_VIDEO ? "video" : tr->kind == VEG_KIND_AUDIO ? "audio" : "other",
                    tr->nevents, tr->has_motion ? " motion" : "", tr->has_comp ? " comp" : "");
             if (tr->has_comp) printf("(%u,%d)", tr->comp_a, tr->comp_b);
+            if (tr->comp_mode != VEG_COMP_SRCALPHA) printf(" [%s]", veg_comp_name(tr->comp_mode));
+            for (int k = 0; k < tr->nafx; k++) if (tr->afx[k].type != AFX_NOOP) printf(" [afx %s '%s' dry=%.1f wet=%.1f early=%.1f decay=%.1f pre=%.0f hicut=%.0f]", AFXN[tr->afx[k].type], tr->afx[k].name, tr->afx[k].dry_db, tr->afx[k].wet_db, tr->afx[k].early_db, tr->afx[k].decay_s, tr->afx[k].predelay_ms, tr->afx[k].hicut_hz);
             if (tr->level != 1.0f) {
                 if (tr->kind == VEG_KIND_AUDIO) printf(" volume=%.2f dB", tr->level > 0 ? 20 * log10(tr->level) : -INFINITY);
                 else printf(" level=%.1f%%", tr->level * 100);
@@ -55,8 +57,11 @@ int main(int argc, char **argv)
             if (e->media < 0) nomedia++;
             if (e->xfade_in > 0) xf++;
         }
-        printf("  vfx: invert=%d gray=%d hsl=%d sepia=%d bricon=%d unknown=%d | afx: pitch=%d vibrato=%d unknown=%d\n",
-               vfxc[1], vfxc[2], vfxc[3], vfxc[4], vfxc[5], vfxc[0], afxc[1], afxc[2], afxc[0]);
+        printf("  vfx:");
+        for (int k = 1; k < 14; k++) if (vfxc[k]) printf(" %s=%d", VFXN[k], vfxc[k]);
+        printf(" unknown=%d | afx:", vfxc[0]);
+        for (int k = 1; k < 5; k++) if (afxc[k]) printf(" %s=%d", AFXN[k], afxc[k]);
+        printf(" unknown=%d\n", afxc[0]);
         printf("  audio stretch: none-chunk=%d method0=%d method1=%d method2=%d pitched=%d (%.0f..%.0f)  pan/crop=%d  nomedia=%d crossfades=%d\n",
                nostr, meth[0], meth[1], meth[2], pitched, minpitch, maxpitch, panned, nomedia, xf);
         if (p.unknown_fx[0]) printf("  unknown fx: %s\n", p.unknown_fx);

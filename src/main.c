@@ -482,7 +482,7 @@ static void options_frame(void)
     snprintf(rows[1], 160, "Pitch Shift plug-in mode:  %s", PSM[g_cfg.pitch_plugin_mode + 1]);
     snprintf(rows[2], 160, "Event gain / opacity:  %s", g_cfg.apply_event_level ? "applied" : "ignored");
     snprintf(rows[3], 160, "Show FPS and stats:  %s", g_cfg.show_fps ? "on" : "off");
-    snprintf(rows[4], 160, "Generator compositing guesses (add/subtract):  %s", g_cfg.compositing_guess ? "on" : "off");
+    snprintf(rows[4], 160, "Track compositing modes (Add, Multiply, Lighten...):  %s", g_cfg.compositing_guess ? "applied" : "ignored");
     if (g_cfg.cache_mb) snprintf(rows[5], 160, "Frame cache budget:  %d MB", g_cfg.cache_mb);
     else snprintf(rows[5], 160, "Frame cache budget:  automatic (176 MB)");
     snprintf(rows[6], 160, "Track Motion with other-shaped sources:  %s", g_cfg.tm_follow_source ? "follows the source (aligned)" : "as in Vegas");

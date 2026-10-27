@@ -22,6 +22,14 @@ SceUID sceKernelCreateSema(const char *n, SceUInt a, int i, int m, SceKernelSema
 int sceKernelWaitSema(SceUID s, int n, SceUInt *t) { return 0; }
 int sceKernelSignalSema(SceUID s, int n) { return 0; }
 int gpu_shaders_ok(void) { return 1; }
+int gpu_pass_ok(int pass) { return 1; }
+#include <vita2d.h>
+static vita2d_texture g_fake_tex[64]; static uint32_t g_fake_px[64][256]; static int g_nfake;
+vita2d_texture *vita2d_create_empty_texture_format(unsigned int w, unsigned int h, SceGxmTextureFormat f) { return g_nfake < 64 ? &g_fake_tex[g_nfake++] : NULL; }
+void *vita2d_texture_get_datap(const vita2d_texture *t) { return g_fake_px[t - g_fake_tex]; }
+void vita2d_texture_set_filters(vita2d_texture *t, SceGxmTextureFilter a, SceGxmTextureFilter b) {}
+void vita2d_wait_rendering_done(void) {}
+void vita2d_free_texture(vita2d_texture *t) {}
 int gpu_image_alloc(GpuImage *img, int w, int h, int bpp) { return -1; }
 int gpu_image_wrap(GpuImage *img, void *d, int w, int h, int bpp) { img->data = d; img->w = w; img->h = h; img->bpp = bpp; img->stride = (w + 7) & ~7; return 0; }
 double audio_time(void) { return 0; }
@@ -51,18 +59,24 @@ int main(int argc, char **argv)
         for (int64_t k = 0; k < ac->total; k++) ac->seg[0].pcm[2 * k] = ac->seg[0].pcm[2 * k + 1] = (int16_t)(8000 * sin(k * 0.05) + 3000 * sin(k * 0.011));
     }
     g_vx = 0; g_vy = 2; g_vw = 960; g_vh = 540;
+    luts_build();
     /* video: build a scene every 1/30 s */
     static Scene sc;
-    int maxl = 0, bad = 0, frames = 0;
+    int maxl = 0, bad = 0, frames = 0, npass[PASS_COUNT] = { 0 }, nblend[BLEND_COUNT] = { 0 };
     uint64_t t0 = time_us();
     for (double T = 0; T < p->duration; T += 1.0 / 30, frames++) {
         build(&sc, 0, T);
         if (sc.n > maxl) maxl = sc.n;
         for (int i = 0; i < sc.n; i++) for (int k = 0; k < 4; k++)
             if (!isfinite(sc.layer[i].x[k]) || !isfinite(sc.layer[i].y[k]) || fabsf(sc.layer[i].x[k]) > 1e6f) bad++;
+        for (int i = 0; i < sc.n; i++) { npass[sc.layer[i].pass]++; nblend[sc.layer[i].blend]++; }
     }
     uint64_t t1 = time_us();
     printf("scenes: %d built, max layers %d, bad coords %d, %.1f us/scene on host\n", frames, maxl, bad, (double)(t1 - t0) / frames);
+    printf("  layer passes: matrix %d, gradient map %d, blur %d | blends:", npass[0], npass[1], npass[2]);
+    static const char *BN[BLEND_COUNT] = { "normal", "add", "subtract", "multiply", "screen", "lighten", "darken", "cut" };
+    for (int b = 0; b < BLEND_COUNT; b++) if (nblend[b]) printf(" %s %d", BN[b], nblend[b]);
+    printf("\n");
     /* a peek at one busy moment */
     build(&sc, 0, p->duration * 0.5);
     for (int i = 0; i < sc.n && i < 4; i++) printf("  layer %d: (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) a=%.2f fx=%d m0=%.2f\n", i,
