@@ -15,8 +15,8 @@ ExportJob g_export;
 static int g_thid = -1;
 
 #ifndef EXPORT_DIR
-#define EXPORT_DIR "ux0:music/VegPlayer"
-#endif   /* the Music app lists MP3 and WAV files from ux0:music */
+#define EXPORT_DIR "ux0:data/vegplayer/exports"
+#endif
 
 const char *export_dir(void) { return EXPORT_DIR; }
 
