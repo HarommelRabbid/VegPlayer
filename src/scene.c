@@ -422,26 +422,28 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
 
 /* ------------------------------------------------------------------ building */
 
-/* the Glow effect's light for layer S (drawn already): the same picture through the same colour matrix, its parts
- * above the threshold spread over a small disc, added on top in the glow colour. Guessed mapping: glow percent sets
- * both the threshold (1 - percent) and the radius (percent x 12 % of the frame height); intensity scales the light. */
-static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, GpuLayer *L)
+/* the Glow effect's light for layer S (drawn already): the same picture through the same colour matrix, its bright
+ * parts spread over a disc and screened on top in the glow colour x intensity. Matched by eye to Vegas (a dmf project):
+ * a wide, soft bloom from everything moderately bright. Guessed mapping: threshold 1 - 2 x glow percent, radius
+ * glow percent x 16 % of the frame height. q: the frame's quarter-size copy (smoother), else the layer's own texture. */
+static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, const GpuImage *q, GpuLayer *L)
 {
     if (S->pass == PASS_BLUR || S->blend != BLEND_NORMAL || S->tint[3] <= 0.002f) return 0;
     *L = *S;
+    if (q) L->tex = &q->tex;
     float ax = S->x[1] - S->x[0], ay = S->y[1] - S->y[0], bx = S->x[2] - S->x[0], by = S->y[2] - S->y[0];
     float la = hypotf(ax, ay), lb = hypotf(bx, by);
     if (la < 2 || lb < 2) return 0;
-    float r = (float)g->amount * 0.12f * frame_h;
+    float r = (float)g->amount * 0.16f * frame_h;
     float rx = r / la, ry = r / lb;
     if (rx > 0.5f) rx = 0.5f;
     if (ry > 0.5f) ry = 0.5f;
-    float thr = 1.0f - (float)g->amount;
-    thr = thr < 0.05f ? 0.05f : thr > 0.95f ? 0.95f : thr;
+    float thr = 1.0f - 2.0f * (float)g->amount;
+    thr = thr < 0.05f ? 0.05f : thr > 0.9f ? 0.9f : thr;
     L->soft[0] = rx; L->soft[1] = ry; L->soft[2] = thr; L->soft[3] = 1.0f / (1.0f - thr);
     L->pass = PASS_GLOW;
-    L->blend = BLEND_ADD;
-    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a;
+    L->blend = BLEND_SCREEN;   /* bright parts get hazy instead of clipping to white (as in Vegas) */
+    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a * S->tint[3];   /* Screen takes premultiplied colour */
     L->tint[3] = S->tint[3];
     L->fx = 1;
     static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
@@ -533,7 +535,8 @@ static void build(Scene *sc, int buf, double T)
             if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
             place(p, e, tr, tau, pw, ph, NULL, L->x, L->y);
-            if (vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
+            const GpuImage *full = img;   /* (the Glow samples this frame's quarter-size copy) */
+            if (vm->type == VEG_MEDIA_FILE && m->vc.imgq && g_cfg.small_copies) {
                 /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
                 float sw = hypotf(L->x[1] - L->x[0], L->y[1] - L->y[0]), sh = hypotf(L->x[2] - L->x[0], L->y[2] - L->y[0]);
                 int slot = (int)(img - m->vc.img);
@@ -630,8 +633,13 @@ static void build(Scene *sc, int buf, double T)
             }
             sc->n++;
             /* Glow: its light goes on top of the layer, added */
+            const GpuImage *gq = NULL;   /* the frame's quarter-size copy: already averaged, so the wide glow comes out smooth */
+            if (ch.glow && vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
+                int slot = (int)(full - m->vc.img);
+                if (slot >= 0 && slot < m->vc.nimg && m->vc.imgq[slot].data) gq = &m->vc.imgq[slot];
+            }
             if (ch.glow && g_cfg.glow && gpu_pass_ok(PASS_GLOW) && sc->n < MAX_LAYERS &&
-                glow_layer(&sc->layer[sc->n - 1], ch.glow, g_vw * p->height / p->width, &sc->layer[sc->n])) {
+                glow_layer(&sc->layer[sc->n - 1], ch.glow, g_vw * p->height / p->width, gq, &sc->layer[sc->n])) {
                 sc->n++;
                 sc->nglow++;
             }

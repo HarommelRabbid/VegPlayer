@@ -195,27 +195,38 @@ static const char FRAG_SHADOW_SRC[] =
     "    return float4(uTint.rgb, uTint.a * 0.25f * a * r.x * r.y);\n"
     "}\n";
 
-/* PASS_GLOW: 9 taps (centre, 4 at the radius, 4 diagonal at half of it); each tap's colour goes through the layer's
- * matrix, then the part above the threshold is kept (taps outside the picture count as dark) */
+/* PASS_GLOW: 13 taps (centre, 6 at half the radius, 6 at the radius, rotated 30 degrees), roughly Gaussian weights.
+ * Each tap goes through the layer's matrix; how much it glows rises from the threshold (brightness) to full, keeping
+ * its colour; the picture's edge fades out over half the radius (no steps in the halo). Drawn with Screen. */
 static const char FRAG_GLOW_SRC[] =
     "float3 br(float2 q, sampler2D tex, float4 R, float4 G, float4 B, float4 s)\n"
     "{\n"
     "    float4 c = tex2D(tex, q);\n"
     "    float4 p = float4(c.rgb, 1.0f);\n"
     "    float3 x = saturate(float3(dot(R, p), dot(G, p), dot(B, p)));\n"
-    "    float2 in2 = step(float2(0.0f, 0.0f), q) * step(q, float2(1.0f, 1.0f));\n"
-    "    return saturate((x - s.z) * s.w) * (c.a * in2.x * in2.y);\n"
+    "    float l = dot(x, float3(0.299f, 0.587f, 0.114f));\n"
+    "    float2 e = s.xy * 0.5f;\n"
+    "    float2 in2 = saturate((q + e) / (2.0f * e)) - saturate((q - 1.0f + e) / (2.0f * e));\n"
+    "    return x * (saturate((l - s.z) * s.w) * c.a * in2.x * in2.y);\n"
     "}\n"
     "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex,\n"
     "            uniform float4 uMatR, uniform float4 uMatG, uniform float4 uMatB, uniform float4 uTint, uniform float4 uSoft) : COLOR\n"
     "{\n"
     "    float2 t = vTexcoord, r = uSoft.xy, h = uSoft.xy * 0.5f;\n"
-    "    float3 g = br(t, tex, uMatR, uMatG, uMatB, uSoft) * 0.2f;\n"
-    "    float3 a = br(t + float2(r.x, 0.0f), tex, uMatR, uMatG, uMatB, uSoft) + br(t - float2(r.x, 0.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "             + br(t + float2(0.0f, r.y), tex, uMatR, uMatG, uMatB, uSoft) + br(t - float2(0.0f, r.y), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "             + br(t + h, tex, uMatR, uMatG, uMatB, uSoft) + br(t - h, tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "             + br(t + float2(h.x, -h.y), tex, uMatR, uMatG, uMatB, uSoft) + br(t + float2(-h.x, h.y), tex, uMatR, uMatG, uMatB, uSoft);\n"
-    "    g += a * 0.1f;\n"
+    "    float3 c0 = br(t, tex, uMatR, uMatG, uMatB, uSoft);\n"
+    "    float3 c1 = br(t + h * float2(1.0f, 0.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + h * float2(-1.0f, 0.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + h * float2(0.5f, 0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + h * float2(-0.5f, 0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + h * float2(0.5f, -0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + h * float2(-0.5f, -0.866f), tex, uMatR, uMatG, uMatB, uSoft);\n"
+    "    float3 c2 = br(t + r * float2(0.866f, 0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + r * float2(-0.866f, 0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + r * float2(0.866f, -0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + r * float2(-0.866f, -0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + r * float2(0.0f, 1.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
+    "              + br(t + r * float2(0.0f, -1.0f), tex, uMatR, uMatG, uMatB, uSoft);\n"
+    "    float3 g = c0 * 0.16f + c1 * 0.09f + c2 * 0.05f;\n"
     "    return float4(g * uTint.rgb, uTint.a);\n"
     "}\n";
 
@@ -236,7 +247,7 @@ static FProg g_fp[PASS_COUNT] = {
     { .name = "lut", .src = FRAG_LUT_SRC },
     { .name = "blur", .src = FRAG_BLUR_SRC },
     { .name = "shadow", .src = FRAG_SHADOW_SRC },
-    { .name = "glow", .src = FRAG_GLOW_SRC },
+    { .name = "glow2", .src = FRAG_GLOW_SRC },   /* (renamed when the shader changed: the cached .gxp is per name) */
 };
 static SceGxmProgram *g_vprog_gxp;
 static SceGxmShaderPatcherId g_vid;
