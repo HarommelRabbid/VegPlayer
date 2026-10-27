@@ -44,6 +44,63 @@ static stext_font *g_font;   /* sharptext: glyphs rendered at the size they're d
 static int is_cjk(unsigned int c) { return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFF00 && c <= 0xFFEF) || (c >= 0x3000 && c <= 0x30FF); }
 
 static void text(int x, int y, unsigned col, float scale, const char *s) { stext_draw_text(g_font, x, y, col, scale, s); }
+
+/* ------------------------------------------------------------------ button symbols
+ * btext() draws hint strings where {X} {O} {S} {T} {L} {R} {START} {SELECT} {UP} {DOWN} {LEFT} {RIGHT} become the
+ * console's own button glyphs from sa0:data/font/pvf/psexchar.pvf (a PVF font of PlayStation symbols; character
+ * map: github.com/nobodywasishere/vita_Symbols). Without that font the words are drawn instead. */
+static stext_font *g_sym;
+#define SYM_SCALE 1.15f   /* symbol size relative to the text around it */
+#define SYM_DY    1       /* nudge down (pixels at scale 1) to sit on the text's baseline */
+typedef struct { const char *tok; const char *glyph; const char *word; unsigned col; } Sym;
+static const Sym SYMS[] = {
+    /* filled-disc face buttons, in the PlayStation colours */
+    { "{X}", "&", "X", RGBA8(124, 178, 232, 255) },
+    { "{O}", "%", "O", RGBA8(255, 102, 102, 255) },
+    { "{S}", "'", "SQUARE", RGBA8(255, 105, 248, 255) },
+    { "{T}", "$", "TRIANGLE", RGBA8(64, 226, 160, 255) },
+    { "{L}", "0", "L", 0 }, { "{R}", "1", "R", 0 },
+    { "{SELECT}", "4", "SELECT", 0 }, { "{START}", "5", "START", 0 },
+    { "{UP}", ",", "UP", 0 }, { "{DOWN}", "-", "DOWN", 0 }, { "{LEFT}", ".", "LEFT", 0 }, { "{RIGHT}", "/", "RIGHT", 0 },
+};
+
+static const Sym *sym_at(const char *p)
+{
+    if (*p != '{') return NULL;
+    for (size_t i = 0; i < sizeof SYMS / sizeof SYMS[0]; i++)
+        if (!strncmp(p, SYMS[i].tok, strlen(SYMS[i].tok))) return &SYMS[i];
+    return NULL;
+}
+
+/* draws (draw = 1) or measures a hint string; returns its width */
+static int btext_run(int draw, int x, int y, unsigned col, float scale, const char *s)
+{
+    char run[256];
+    int pen = x;
+    while (*s) {
+        const Sym *k = sym_at(s);
+        if (k) {
+            if (g_sym) {
+                float ss = scale * SYM_SCALE;
+                unsigned c = k->col ? k->col : col;
+                pen += draw ? stext_draw_text(g_sym, pen, y + (int)lroundf(SYM_DY * scale), c, ss, k->glyph)
+                            : stext_text_width(g_sym, ss, k->glyph);
+            } else {
+                pen += draw ? stext_draw_text(g_font, pen, y, col, scale, k->word) : stext_text_width(g_font, scale, k->word);
+            }
+            s += strlen(k->tok);
+            continue;
+        }
+        size_t n = 0;
+        while (s[n] && n + 1 < sizeof run && !(s[n] == '{' && sym_at(s + n))) { run[n] = s[n]; n++; }
+        run[n] = 0;
+        pen += draw ? stext_draw_text(g_font, pen, y, col, scale, run) : stext_text_width(g_font, scale, run);
+        s += n;
+    }
+    return pen - x;
+}
+static void btext(int x, int y, unsigned col, float scale, const char *s) { btext_run(1, x, y, col, scale, s); }
+static int btext_width(float scale, const char *s) { return btext_run(0, 0, 0, 0, scale, s); }
 static void textf(int x, int y, unsigned col, float scale, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
 static void textf(int x, int y, unsigned col, float scale, const char *fmt, ...)
 {
@@ -75,7 +132,7 @@ static void header(const char *title, const char *hint)
     text(16, 28, COL_ACCENT, 1.0f, APP_NAME);
     text(130, 28, COL_TEXT, 1.0f, title);
     vita2d_draw_rectangle(0, SCREEN_H - 30, SCREEN_W, 30, COL_PANEL);
-    text(16, SCREEN_H - 9, COL_DIM, 0.8f, hint);
+    btext(16, SCREEN_H - 9, COL_DIM, 0.8f, hint);
 }
 
 /* ------------------------------------------------------------------ input */
@@ -225,8 +282,8 @@ static void browse_frame(void)
     char t[600];
     if (g_bmode == 0) snprintf(t, sizeof t, "Open a Vegas project (.veg)");
     else snprintf(t, sizeof t, "Pick the %s for: %s", g_pick_audio ? "SOUND" : "PICTURE", g_s.proj.media[g_pick_media].name);
-    header(t, g_bmode == 0 ? "X open   O up   L/R page   START quit"
-                           : "X choose   O up   TRIANGLE cancel   L/R page");
+    header(t, g_bmode == 0 ? "{X} open   {O} up   {L}{R} page   {START} quit"
+                           : "{X} choose   {O} up   {T} cancel   {L}{R} page");
     char cw[600];
     fit(cw, sizeof cw, g_cwd[0] ? g_cwd : "(drives)", 920, 0.8f);
     text(20, top + 6, COL_DIM, 0.8f, cw);
@@ -289,7 +346,7 @@ static void project_frame(void)
     build_rows();
     char t[300];
     snprintf(t, sizeof t, "%s", veg_basename(g_s.veg_path));
-    header(t, "X choose file   SQUARE skip   TRIANGLE tracks   SELECT options   START play   O close");
+    header(t, "{X} choose file   {S} skip   {T} tracks   {SELECT} options   {START} play   {O} close");
     textf(20, 66, COL_DIM, 0.85f, "%dx%d  %.3f fps  %d Hz  %d:%05.2f   %d tracks  %d events  %d sources", p->width, p->height, p->fps,
           p->sample_rate, (int)(p->duration / 60), fmod(p->duration, 60), p->ntracks, p->nevents, p->nmedia);
     textf(20, 88, gpu_shaders_ok() ? COL_OK : COL_WARN, 0.8f, "Effects: %s", gpu_status());
@@ -315,13 +372,13 @@ static void project_frame(void)
         if (vm->type == VEG_MEDIA_SOLID) snprintf(status, sizeof status, "solid colour (built in)");
         else if (vm->type != VEG_MEDIA_FILE) { snprintf(status, sizeof status, "generator - not supported yet (skipped)"); col = COL_DIM; }
         else if (st == MS_SKIP) { snprintf(status, sizeof status, "skipped"); col = COL_DIM; }
-        else if (!file[0]) { snprintf(status, sizeof status, "MISSING - press X to choose"); col = COL_ERR; }
+        else if (!file[0]) { snprintf(status, sizeof status, "MISSING - press {X} to choose"); col = COL_ERR; }
         else {
             snprintf(status, sizeof status, "%s%s", st == MS_AUTO ? "(found) " : "", msg[0] ? msg : veg_basename(file));
             if (msg[0] && strstr(msg, ":")) col = strncmp(msg, "audio:", 6) && strncmp(msg, "video:", 6) && strncmp(msg, "picture:", 8) ? COL_OK : COL_ERR;
         }
-        fit(nm, sizeof nm, status, 470, 0.8f);
-        text(460, y + 21, col, 0.8f, nm);
+        if (!file[0] && st != MS_SKIP && vm->type == VEG_MEDIA_FILE) btext(460, y + 21, col, 0.8f, status);   /* has a button symbol */
+        else { fit(nm, sizeof nm, status, 470, 0.8f); text(460, y + 21, col, 0.8f, nm); }
         vita2d_draw_rectangle(460, y + 26, (float)(460 * (row->audio ? m->aprog : m->vprog)), 2, COL_ACCENT);
     }
     if (p->unknown_fx[0]) {
@@ -404,7 +461,7 @@ static void tracks_input(void)
 
 static void tracks_frame(void)
 {
-    header("Tracks (first = front)", "X toggle   SQUARE all video   TRIANGLE all audio   O back");
+    header("Tracks (first = front)", "{X} toggle   {S} all video   {T} all audio   {O} back");
     tracks_draw_list(10, 56, SCREEN_W - 20, 17, 1);
     tracks_input();
     if (g_pressed & SCE_CTRL_CIRCLE) g_state = g_tracks_back;
@@ -417,7 +474,7 @@ static const int CACHE_OPTS[] = { 0, 64, 96, 128, 176, 224 };
 
 static void options_frame(void)
 {
-    header("Options", "LEFT/RIGHT change   O back");
+    header("Options", "{LEFT}{RIGHT} change   {O} back");
     char rows[6][160];
     static const char *STR[] = { "as in the project", "None (resample)", "Classic", "elastique (WSOLA approx.)" };
     static const char *PSM[] = { "as in the project", "resample (speed + pitch)", "Classic (preserve duration)" };
@@ -463,7 +520,7 @@ static void options_frame(void)
 
 static void prepare_frame(void)
 {
-    header("Preparing", "O cancel");
+    header("Preparing", "{O} cancel");
     text(40, 90, COL_TEXT, 1.0f, g_prep.line);
     vita2d_draw_rectangle(40, 110, SCREEN_W - 80, 18, COL_PANEL);
     vita2d_draw_rectangle(40, 110, (SCREEN_W - 80) * g_prep.progress, 18, COL_ACCENT);
@@ -548,7 +605,10 @@ static void play_frame(void)
         vita2d_draw_rectangle(20, SCREEN_H - 50, (SCREEN_W - 40) * fminf(prog, 1), 6, COL_ACCENT);
         textf(20, SCREEN_H - 16, COL_TEXT, 0.85f, "%s  %d:%05.2f / %d:%05.2f", audio_playing() ? "PLAYING" : "PAUSED", (int)(t / 60), fmod(t, 60),
               (int)(p->duration / 60), fmod(p->duration, 60));
-        text(380, SCREEN_H - 16, COL_DIM, 0.75f, "X play/pause  <- -> 1s  L/R 5s  ^v 10s  TRIANGLE tracks  SQUARE osd  O back");
+        {
+            static const char *h = "{X} play/pause  {LEFT}{RIGHT} 1s  {L}{R} 5s  {UP}{DOWN} 10s  {T} tracks  {S} osd  {O} back";
+            btext(SCREEN_W - 16 - btext_width(0.75f, h), SCREEN_H - 16, COL_DIM, 0.75f, h);
+        }
     }
     if (g_cfg.show_fps) {
         vita2d_draw_rectangle(0, 0, 330, 24, RGBA8(0, 0, 0, 150));
@@ -557,7 +617,7 @@ static void play_frame(void)
     }
     if (g_panel) {
         vita2d_draw_rectangle(480, 40, 470, 400, RGBA8(10, 12, 18, 225));
-        text(496, 64, COL_ACCENT, 0.9f, "Tracks - X toggle, SQUARE video, TRIANGLE audio");
+        btext(496, 64, COL_ACCENT, 0.9f, "Tracks:  {X} toggle  {S} video  {T} audio");
         tracks_draw_list(484, 76, 462, 13, 1);
         tracks_input();
         if (g_pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_START)) g_panel = 0;
@@ -611,6 +671,8 @@ int main(void)
     g_font = stext_load_system_pvf(2, pvf);
     if (!g_font) { LOG("PVF fonts unavailable, using PGF"); g_font = stext_load_system_pgf(2, pgf); }
     if (!g_font) g_font = stext_load_default_pgf();
+    g_sym = stext_load_custom_pvf("sa0:data/font/pvf/psexchar.pvf");
+    if (!g_sym) LOG("psexchar.pvf not found: button names drawn as words");
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
 
     /* shaders first: the first run compiles them (needs ur0:data/libshacccg.suprx), later runs load the .gxp */
@@ -655,6 +717,7 @@ quit:
     audio_stop();
     session_close();
     gpu_fini();
+    if (g_sym) stext_free(g_sym);
     if (g_font) stext_free(g_font);
     vita2d_fini();
     sceKernelExitProcess(0);

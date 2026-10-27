@@ -13,7 +13,8 @@
  *         list 1af0e4e4  -> 1af0e4e6 video effect (legacy DXT or OFX)
  *         list d54ad82a  -> d54ad82a audio time stretch / pitch
  *         list b66a95ce  -> b66a95ce audio DirectX plug-in chain
- *     list 69d46c28 -> 69d46c29  video track compositing
+ *     list 69d46c28 -> 69d46c29  video track compositing (Level @0x68)
+ *     list 69d46c26 -> 69d46c27  audio track settings (volume @0x0c)
  *     list d24df987 -> cd6915d8  track motion
  *   list b28f2d5b -> b28f2d5d   media pool entries (id @0x3c, UTF-16 path @0x60)
  *   b28f2d5a                    project settings (sample rate @0x0c, fps @0x10, frame size)
@@ -133,6 +134,7 @@ const char *veg_ext(const char *path)
 #define G_STRETCH    "d54ad82a"
 #define G_AFX_CHAIN  "b66a95ce"
 #define G_COMP       "69d46c29"
+#define G_ACOMP      "69d46c27"   /* audio track settings: volume (float, linear) @0x0c */
 #define G_TRACKMOTION "cd6915d8"
 
 static const uint8_t SOLID_GEN[16] = { 0xfc,0x0d,0xdd,0xd9,0x4f,0x27,0xa7,0x45,0xb8,0x74,0x3d,0x2b,0xcf,0xa6,0x1f,0xe9 };
@@ -580,6 +582,9 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
             t->has_comp = 1; t->comp_a = rd32(b + 0x60); t->comp_b = (int32_t)rd32(b + 0x64);
             float lv = rdf(b + 0x68);   /* track Level (opacity) */
             if (lv >= 0 && lv <= 1) t->level = lv;
+        } else if (gpre(&c, G_ACOMP) && bl >= 0x10 && !in_event) {
+            float vol = rdf(b + 0x0c);   /* linear gain: Vegas's -inf..+12 dB slider = 0..3.98 */
+            if (vol >= 0 && vol <= 4.5f) t->level = vol;
         } else if (gpre(&c, G_TRACKMOTION) && bl >= 136 && !in_event) {
             t->has_motion = 1;
             t->tm_x = rdd(b + 88); t->tm_y = rdd(b + 96); t->tm_w = rdd(b + 120); t->tm_h = rdd(b + 128);

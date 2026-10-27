@@ -77,7 +77,7 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   - *Classic*: granular overlap-add with a grain size per Classic mode (A01–A19) and a narrower alignment search.
 - **Pitch Shift plug-in**: *resample* (speed and pitch change together) and *Classic* (preserve duration).
 - **Vibrato plug-in**: sine-modulated delay line.
-- Event gain, fades, crossfades.
+- Event gain, audio track volume, fades, crossfades.
 
 ## What is read from the .veg (and what is guessed)
 
@@ -93,6 +93,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Vibrato plug-in | name match; parameter layout unknown | **guessed** (defaults: 5 Hz, 0.5 st) |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
+| Audio track volume | `69d46c27` (audio track settings): float @0x0c, linear gain | solid (values land on round dB steps) |
 | Video track Level | `69d46c29` (compositing): float @0x68 | solid (Pinkiety: 0 %, 32.8 %, 35 %) |
 | Fade curves | event @0x74 (in) / @0x78 (out): 1 Linear, 2 Fast, −2 Slow, 4 Smooth, −4 Sharp | codes match Vegas's defaults (audio 2/−2, video 4); which word is in/out **guessed** |
 
@@ -105,6 +106,9 @@ glyph once at its base size and scales the quads (point-sampled, pen truncated t
 below 1.0 and soft above it. sharptext makes the glyph image for the size it is drawn at and draws it 1:1 on whole
 pixels: PVF fonts (vector) are rasterised at that exact size; PGF fonts (bitmaps) are resampled once per size (area
 average when shrinking, Catmull-Rom when enlarging). Same arguments as vita2d, so it can be reused in other projects.
+
+Button hints use the console's own button glyphs from `sa0:data/font/pvf/psexchar.pvf` (character map:
+[vita_Symbols](https://github.com/nobodywasishere/vita_Symbols)); without that font the button names are written out.
 
 ## How it stays fast
 

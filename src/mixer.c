@@ -251,7 +251,7 @@ static void voice_setup(Voice *v, int ei, double t0)
     v->len = e->length;
     v->len_n = (int64_t)llround(e->length * OUT_RATE);
     v->n = (int64_t)llround((t0 - e->start) * OUT_RATE);
-    v->level = g_cfg.apply_event_level ? e->level : 1.0f;
+    v->level = (g_cfg.apply_event_level ? e->level : 1.0f) * tr->level;   /* event gain x track volume */
     v->fi = e->fade_in; v->fo = e->fade_out; v->xi = e->xfade_in; v->xo = e->xfade_out;
     v->segc = 0;
     if (v->vib && v->dl) { memset(v->dl, 0, sizeof(float) * DL_LEN * 2); v->dlw = 0; }
@@ -391,6 +391,7 @@ static int64_t g_written;                   /* timeline sample after the last su
 static uint64_t g_written_at;               /* time_us() when that block was handed over */
 static volatile int64_t g_seek_to = -1;     /* written under g_amtx */
 static volatile float g_seek_show = -1;     /* what audio_time() reports until the seek is processed (32-bit: atomic) */
+static volatile float g_resume_hold = -1;   /* after unpausing: don't report earlier than the paused position */
 
 static void clock_publish(int64_t written, uint64_t at)
 {
@@ -445,8 +446,11 @@ static int audio_thread(unsigned argc, void *argp)
             pos += BLOCK;
         } else memset(o, 0, sizeof(int16_t) * BLOCK * 2);
         sceAudioOutOutput(port, o);     /* blocks until the previous block has been taken */
-        /* right after a seek the old block is still queued: count the new position from here */
-        clock_publish(seeked ? pos + (playing ? 0 : 2 * BLOCK) : pos, time_us());
+        /* audio_time() reports written - 2 blocks (the blocks still queued in the port). While paused nothing of
+         * the timeline is queued, so publish pos + 2 blocks to keep the clock exactly at pos: otherwise every
+         * silent block after a pause/seek would show the clock 2 blocks early, and seeking to audio_time() (the
+         * track panel does) would step back again each time */
+        clock_publish(playing ? pos : pos + 2 * BLOCK, time_us());
         if (seeked) g_seek_show = -1;
         cur ^= 1;
     }
@@ -483,6 +487,11 @@ void audio_play(int on)
         audio_seek(t);
         return;
     }
+    if (on && !g_audio_play) {
+        /* the first new block is heard after the silent one still queued: hold the clock until it catches up,
+         * so resuming never steps the picture back */
+        g_resume_hold = (float)audio_time();
+    }
     g_audio_play = on;
 }
 int audio_playing(void) { return g_audio_play; }
@@ -493,6 +502,7 @@ void audio_seek(double s)
     mutex_lock(&g_amtx);
     g_seek_to = (int64_t)(s * OUT_RATE);
     g_seek_show = (float)s;   /* so audio_time() jumps right away */
+    g_resume_hold = -1;
     mutex_unlock(&g_amtx);
 }
 
@@ -509,6 +519,11 @@ double audio_time(void)
         double dt = (double)(time_us() - at) / 1e6;
         if (dt > (double)BLOCK / OUT_RATE) dt = (double)BLOCK / OUT_RATE;
         base += dt;
+        float hold = g_resume_hold;
+        if (hold >= 0) {
+            if (base < hold) return hold;
+            g_resume_hold = -1;
+        }
     }
     return base < 0 ? 0 : base;
 }

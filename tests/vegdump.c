@@ -1,3 +1,4 @@
+#include <math.h>
 /* Host-side check of the .veg reader:  cc -O2 -I../src vegdump.c ../src/veg.c -lm -o vegdump */
 #include <stdio.h>
 #include <string.h>
@@ -29,7 +30,10 @@ int main(int argc, char **argv)
             printf("  track %2d %s events=%4d%s%s", t, tr->kind == VEG_KIND_VIDEO ? "video" : tr->kind == VEG_KIND_AUDIO ? "audio" : "other",
                    tr->nevents, tr->has_motion ? " motion" : "", tr->has_comp ? " comp" : "");
             if (tr->has_comp) printf("(%u,%d)", tr->comp_a, tr->comp_b);
-            if (tr->level != 1.0f) printf(" level=%.1f%%", tr->level * 100);
+            if (tr->level != 1.0f) {
+                if (tr->kind == VEG_KIND_AUDIO) printf(" volume=%.2f dB", tr->level > 0 ? 20 * log10(tr->level) : -INFINITY);
+                else printf(" level=%.1f%%", tr->level * 100);
+            }
             if (tr->has_motion) printf(" tm=(%.3f,%.3f,%.3f,%.3f)", tr->tm_x, tr->tm_y, tr->tm_w, tr->tm_h);
             printf("\n");
         }

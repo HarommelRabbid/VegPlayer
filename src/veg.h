@@ -88,7 +88,7 @@ typedef struct {
     int first_event, nevents;   /* events of this track are events[first_event .. first_event+nevents) sorted by start */
     int has_motion; double tm_x, tm_y, tm_w, tm_h;  /* Track Motion (first keyframe) */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing mode (codes partly guessed) */
-    float level;           /* video track opacity / composite level (1 = 100%) */
+    float level;           /* video track: opacity (Level); audio track: volume, linear gain (1 = 0 dB) */
     VegVfx *vfx; int nvfx;  /* track-level video FX */
     VegAfx *afx; int nafx;  /* track-level audio FX */
 } VegTrack;
