@@ -119,10 +119,15 @@ typedef struct {
     double blur;           /* softness, in the same units as the position */
 } VegTmFx;
 
+/* a Track Motion keyframe: t in seconds of the project timeline; x, y position; w, h size (Track Motion units);
+ * rot in radians (counter-clockwise); curve VEG_KEY_* (the way to the next keyframe) */
+typedef struct { double t, x, y, w, h, rot; int curve; } VegTmKey;
+
 typedef struct {
     int kind;              /* VEG_KIND_AUDIO / VEG_KIND_VIDEO (from the track header; OTHER if unknown) */
     int first_event, nevents;   /* events of this track are events[first_event .. first_event+nevents) sorted by start */
     int has_motion; double tm_x, tm_y, tm_w, tm_h;  /* Track Motion (first keyframe) */
+    VegTmKey *tmk; int ntmk;   /* Track Motion position keyframes (time-sorted; ntmk >= 1 when has_motion) */
     VegTmFx shadow, glow;  /* Track Motion 2D Shadow / 2D Glow (first keyframe; .on = enabled) */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing chunk words @0x60 / @0x64 */
     int comp_mode;         /* VEG_COMP_* (Source Alpha when absent) */

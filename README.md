@@ -85,7 +85,7 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   and Difference need the picture underneath in the shader, so they draw normally for now.
 - **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; like Vegas, the window is rescaled to the
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
-  (first keyframe; when the source has another shape, its moves are scaled with the rescaled layout so moved
+  (keyframes with position, size and 2D rotation, interpolated with the same curve types; when the source has another shape, its moves are scaled with the rescaled layout so moved
   tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
 - **VEGAS 20 effect names** (`com.vegascreativesoftware:*`): Channel Blend (OFX: per-channel weights and offsets,
   Normalize), Invert (`BlendAmount`), and the other OFX effects under their new prefix.
@@ -133,6 +133,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Audio track volume | `69d46c27` (audio track settings): float @0x0c, linear gain | solid (values land on round dB steps) |
 | Video track Level | `69d46c29` (compositing): float @0x68 | solid (Pinkiety: 0 %, 32.8 %, 35 %) |
 | Track Motion shadow/glow | `cd6915d8`: u32 @0x04 = enabled parts (1 position, 8 2D Shadow, 16 2D Glow); from @0x24 three keyframe lists (count, then keyframes with a size field at s): x/y @s+0x30/0x38, w/h @s+0x50/0x58, colour B,G,R,A floats @s+0xb0, blur @s+0xc0 | flags and colours solid (CTR Custom vs the Veg Custom it came from, scan.veg); how blur and glow intensity map to pixels **guessed** |
+| Track Motion keyframes | position list in `cd6915d8`: per keyframe interpolation type @s+4 (as Pan/Crop), time @s+8 (u64, 100 ns, project timeline), rotation as a quaternion (w @s+0x90, z @s+0xa8: angle = 2 atan2(z, w)) | from Northern Pacer (16 keyframes rocking between -18.8 and +16 degrees on the beat) |
 | Fade curves | event @0x74 (in) / @0x78 (out): 1 Linear, 2 Fast, −2 Slow, 4 Smooth, −4 Sharp | codes match Vegas's defaults (audio 2/−2, video 4); which word is in/out **guessed** |
 
 Options can override the guessed parts (stretch method, Pitch Shift mode, event level) if a project sounds wrong.

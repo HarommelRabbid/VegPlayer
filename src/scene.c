@@ -291,6 +291,31 @@ static void pan_at(const VegEvent *e, double tau, VegPanKey *k)
     *k = e->pan[e->npan - 1];
 }
 
+/* Track Motion at project time T: between keyframes, shaped by the earlier keyframe's interpolation type (as Pan/Crop) */
+static void tm_at(const VegTrack *t, double T, double *x, double *y, double *w, double *h, double *rot)
+{
+    if (!t->tmk || t->ntmk < 1) { *x = t->tm_x; *y = t->tm_y; *w = t->tm_w; *h = t->tm_h; *rot = 0; return; }
+    const VegTmKey *k = t->tmk;
+    int n = t->ntmk;
+    if (n == 1 || T <= k[0].t) { *x = k[0].x; *y = k[0].y; *w = k[0].w; *h = k[0].h; *rot = k[0].rot; return; }
+    int i = 0;
+    while (i + 1 < n && T > k[i + 1].t) i++;
+    if (i + 1 >= n) { *x = k[n - 1].x; *y = k[n - 1].y; *w = k[n - 1].w; *h = k[n - 1].h; *rot = k[n - 1].rot; return; }
+    const VegTmKey *a = &k[i], *b = &k[i + 1];
+    double u = b->t > a->t ? (T - a->t) / (b->t - a->t) : 1.0;
+    switch (a->curve) {
+    case VEG_KEY_FAST:   u = veg_fade_shape(VEG_CURVE_FAST, u); break;
+    case VEG_KEY_SLOW:   u = veg_fade_shape(VEG_CURVE_SLOW, u); break;
+    case VEG_KEY_SMOOTH: u = veg_fade_shape(VEG_CURVE_SMOOTH, u); break;
+    case VEG_KEY_SHARP:  u = veg_fade_shape(VEG_CURVE_SHARP, u); break;
+    case VEG_KEY_HOLD:   u = 0; break;
+    default: break;
+    }
+    *x = a->x + (b->x - a->x) * u; *y = a->y + (b->y - a->y) * u;
+    *w = a->w + (b->w - a->w) * u; *h = a->h + (b->h - a->h) * u;
+    *rot = a->rot + (b->rot - a->rot) * u;
+}
+
 /* corners of the source picture in project-frame pixels (W x H). Vegas's model:
  * - the Pan/Crop window (centre, size, rotation, negative size = mirror) is stored in the pixels of the media the
  *   project was made with (the frame size recorded in the Pan/Crop chunk);
@@ -345,15 +370,17 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         for (int i = 0; i < 4; i++) { qx[i] = cx + (qx[i] - W / 2) * fx->w; qy[i] = cy + (qy[i] - H / 2) * fx->h; }
     }
     if (t->has_motion) {
-        double asp = W / H;
-        double tw = t->tm_w != 0 ? t->tm_w : asp, th = t->tm_h != 0 ? t->tm_h : 1.0;
+        double asp = W / H, mx, my, mw, mh, rot;
+        tm_at(t, e->start + tau, &mx, &my, &mw, &mh, &rot);   /* keyframes are on the project timeline */
+        double tw = mw != 0 ? mw : asp, th = mh != 0 ? mh : 1.0;
         double sx = fabs(tw) / asp, sy = fabs(th);
-        double cx = W / 2 + t->tm_x * H / 2 * lx, cy = H / 2 - t->tm_y * H / 2 * ly;
+        double cx = W / 2 + mx * H / 2 * lx, cy = H / 2 - my * H / 2 * ly;
+        double c = cos(rot), s = sin(rot);   /* counter-clockwise on screen (y points down) */
         for (int i = 0; i < 4; i++) {
             double dx = (qx[i] - W / 2) * sx, dy = (qy[i] - H / 2) * sy;
             if (tw < 0) dx = -dx;
             if (th < 0) dy = -dy;
-            qx[i] = cx + dx; qy[i] = cy + dy;
+            qx[i] = cx + dx * c + dy * s; qy[i] = cy - dx * s + dy * c;
         }
     }
     double s = g_vw / W;

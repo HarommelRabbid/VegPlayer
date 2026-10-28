@@ -827,7 +827,9 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
 /* Track Motion chunk (cd6915d8): u32 @0x04 = enabled parts (1 position, 8 2D Shadow, 16 2D Glow), then three
  * keyframe lists from @0x24 (position, shadow, glow), each: u32 count, then per keyframe a u32 size (counting
  * itself) and the data. In a keyframe at s (its size field): x @s+0x30, y @+0x38, w @+0x50, h @+0x58 (doubles);
- * shadow/glow colour @+0xb0 (4 floats, B G R A) and blur @+0xc0 (double). Only the first keyframe is used. */
+ * shadow/glow colour @+0xb0 (4 floats, B G R A) and blur @+0xc0 (double). Position keyframes also: interpolation
+ * type @s+4 (VEG_KEY_*, as Pan/Crop), time @s+8 (u64, 100 ns, project timeline), rotation as a quaternion
+ * (w @s+0x90, x, y, z @s+0xa8; only z turns a 2D track: angle = 2 atan2(z, w)). Shadow/glow: first keyframe only. */
 static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
 {
     uint32_t flags = rd32(b + 4);
@@ -837,10 +839,33 @@ static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
         uint32_t n = rd32(b + p);
         p += 4;
         size_t s = p;   /* first keyframe */
+        if (blk == 0 && n > 0 && n < 100000) {
+            free(t->tmk);
+            t->tmk = calloc(n, sizeof(VegTmKey));
+            t->ntmk = 0;
+        }
         for (uint32_t k = 0; k < n; k++) {
             uint32_t sz = rd32(b + p);
             if (sz < 8 || sz > bl - p) return;
+            if (blk == 0 && t->tmk && sz >= 0xb0) {
+                VegTmKey key;
+                const uint8_t *q = b + p;
+                key.curve = (int)rd32(q + 4);
+                key.t = (double)rd64(q + 8) * 1e-7;
+                key.x = rdd(q + 0x30); key.y = rdd(q + 0x38); key.w = rdd(q + 0x50); key.h = rdd(q + 0x58);
+                double qw = rdd(q + 0x90), qz = rdd(q + 0xa8);
+                key.rot = isfinite(qw) && isfinite(qz) && (qw != 0 || qz != 0) ? 2.0 * atan2(qz, qw) : 0;
+                if (key.curve < 0 || key.curve > VEG_KEY_HOLD) key.curve = VEG_KEY_LINEAR;
+                if (isfinite(key.t) && isfinite(key.x) && isfinite(key.y) && isfinite(key.w) && isfinite(key.h) &&
+                    fabs(key.x) < 1000 && fabs(key.y) < 1000 && fabs(key.w) < 1000 && fabs(key.h) < 1000)
+                    t->tmk[t->ntmk++] = key;
+            }
             p += sz;
+        }
+        if (blk == 0 && t->tmk) {   /* time order (insertion sort: few keyframes) */
+            for (int i = 1; i < t->ntmk; i++)
+                for (int j = i; j > 0 && t->tmk[j].t < t->tmk[j - 1].t; j--) { VegTmKey x = t->tmk[j]; t->tmk[j] = t->tmk[j - 1]; t->tmk[j - 1] = x; }
+            if (!t->ntmk) { free(t->tmk); t->tmk = NULL; }
         }
         if (blk == 0 || n == 0 || s + 0xc8 > bl || rd32(b + s) < 0xc8) continue;
         VegTmFx *f = blk == 1 ? &t->shadow : &t->glow;
@@ -1012,7 +1037,7 @@ int veg_load_file(const char *path, VegProject *p, char *err, size_t errlen)
 void veg_free(VegProject *p)
 {
     for (int i = 0; i < p->nevents; i++) { free(p->events[i].pan); free(p->events[i].vfx); free(p->events[i].afx); }
-    for (int t = 0; t < p->ntracks; t++) { free(p->tracks[t].vfx); free(p->tracks[t].afx); }
+    for (int t = 0; t < p->ntracks; t++) { free(p->tracks[t].vfx); free(p->tracks[t].afx); free(p->tracks[t].tmk); }
     free(p->events); free(p->tracks); free(p->media);
     memset(p, 0, sizeof *p);
 }
