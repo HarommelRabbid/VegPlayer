@@ -53,7 +53,7 @@ VExport g_vexp;
 #define VIDEO_DIR "ux0:data/vegplayer/vexports"   /* where the finished file is moved */
 #define REC_DIR "ux0:video"                       /* where the recorder itself saves */
 #define NYUV 3                     /* frames handed to the recorder rotate through this many buffers */
-#define NAUD 4
+#define NAUD 32                    /* mixed sound blocks ready ahead of the recorder (~0.7 s) */
 #define AUD_FRAMES 1024
 
 typedef struct { SceUID uid; void *p; size_t size; } Block;
@@ -76,13 +76,15 @@ static struct {
     /* pipeline: the main thread renders frame k+1 while vp_mp4v hands frame k to the recorder and vp_mp4a mixes and
      * hands over the sound (the recorder serialises its own calls; mixing and rendering overlap with them) */
     SceUID sem_free, sem_full;     /* free / filled YUV slots */
+    SceUID sem_afree, sem_afull;   /* free / mixed sound blocks */
+    int64_t mixed;                 /* sound blocks mixed so far (mix thread) */
     int th_v, th_a;
     volatile int queued;           /* frames rendered and queued */
     volatile int vdone;            /* frames the recorder took */
     volatile int quit;             /* stop the threads */
     volatile int err;              /* first recorder error (< 0) */
     volatile int err_video;
-    volatile uint64_t t_vadd, t_audio;
+    volatile uint64_t t_vadd, t_audio, t_mix;
 } X;
 
 static int mem_alloc(Block *b, const char *name, size_t size, unsigned type, size_t gran)
@@ -208,48 +210,71 @@ static int add_sample(int video, void *buf, int size)
     return r;
 }
 
-static int add_audio_block(void)
+/* The recorder can't take video and sound from two threads at once in practice: it locks itself for each call and
+ * its muxer interleaves by time, so a video-only burst fills its video buffer (0x801083AA). So one feeder thread
+ * hands over everything in time order - a frame, then the sound up to that frame's end - while the main thread
+ * renders the next frames and a mix thread mixes the sound ahead. */
+static int mix_thread(unsigned argc, void *argp)
 {
-    int16_t *pcm = X.aud[X.ablocks % NAUD];
-    mixer_mix(X.mix, AUD_FRAMES, X.ablocks * AUD_FRAMES);
-    mixer_to_pcm(X.mix, pcm, AUD_FRAMES * 2);
-    int r = add_sample(0, pcm, SCE_MP4REC_AUDIO_BUFFER_SIZE);
-    if (r < 0) return r;
-    X.ablocks++;
+    (void)argc; (void)argp;
+    while (!X.quit && X.mixed < X.ablocks_total) {
+        SceUInt to = 100000;
+        if (sceKernelWaitSema(X.sem_afree, 1, &to) < 0) continue;
+        if (X.quit) break;
+        uint64_t t = time_us();
+        int16_t *pcm = X.aud[X.mixed % NAUD];
+        mixer_mix(X.mix, AUD_FRAMES, X.mixed * AUD_FRAMES);
+        mixer_to_pcm(X.mix, pcm, AUD_FRAMES * 2);
+        X.mixed++;
+        X.t_mix += time_us() - t;
+        sceKernelSignalSema(X.sem_afull, 1);
+    }
     return 0;
 }
 
-static int video_thread(unsigned argc, void *argp)
+/* hand over the next mixed sound block (waits for the mixer) */
+static int feed_audio_block(void)
+{
+    for (;;) {
+        if (X.quit) return 1;
+        SceUInt to = 100000;
+        if (sceKernelWaitSema(X.sem_afull, 1, &to) >= 0) break;
+    }
+    uint64_t t = time_us();
+    int r = add_sample(0, X.aud[X.ablocks % NAUD], SCE_MP4REC_AUDIO_BUFFER_SIZE);
+    X.t_audio += time_us() - t;
+    if (r < 0) return r;
+    X.ablocks++;
+    sceKernelSignalSema(X.sem_afree, 1);
+    return 0;
+}
+
+static int feeder_thread(unsigned argc, void *argp)
 {
     (void)argc; (void)argp;
     while (!X.quit) {
+        int k = X.vdone;
+        if (k >= g_vexp.nframes) {   /* the rest of the sound */
+            while (!X.quit && X.ablocks < X.ablocks_total) {
+                int r = feed_audio_block();
+                if (r < 0) { if (!X.err) X.err = r; return 0; }
+            }
+            break;
+        }
         SceUInt to = 100000;
         if (sceKernelWaitSema(X.sem_full, 1, &to) < 0) continue;
         if (X.quit) break;
-        int k = X.vdone;
         uint64_t t = time_us();
         int r = add_sample(1, X.yuv[k % NYUV], X.w * X.h * 3 / 2);
         X.t_vadd += time_us() - t;
         if (r < 0) { if (!X.err) { X.err = r; X.err_video = 1; } break; }
         X.vdone = k + 1;
         sceKernelSignalSema(X.sem_free, 1);
-    }
-    return 0;
-}
-
-/* sound up to the end of the frames queued so far (all of it once every frame is queued) */
-static int audio_thread(unsigned argc, void *argp)
-{
-    (void)argc; (void)argp;
-    while (!X.quit && X.ablocks < X.ablocks_total) {
-        int q = X.queued;
-        int64_t target = q >= g_vexp.nframes ? X.ablocks_total : ((int64_t)q * 1001 * OUT_RATE / 30000 + AUD_FRAMES - 1) / AUD_FRAMES;
-        if (target > X.ablocks_total) target = X.ablocks_total;
-        if (X.ablocks >= target) { sleep_us(1000); continue; }
-        uint64_t t = time_us();
-        int r = add_audio_block();
-        X.t_audio += time_us() - t;
-        if (r < 0) { if (!X.err) X.err = r; break; }
+        int64_t until = (int64_t)(k + 1) * 1001 * OUT_RATE;   /* x 30000 */
+        while (!X.quit && X.ablocks < X.ablocks_total && X.ablocks * AUD_FRAMES * 30000 < until) {
+            r = feed_audio_block();
+            if (r < 0) { if (!X.err) X.err = r; return 0; }
+        }
     }
     return 0;
 }
@@ -257,9 +282,10 @@ static int audio_thread(unsigned argc, void *argp)
 static void threads_stop(void)
 {
     X.quit = 1;
-    if (X.sem_full > 0) sceKernelSignalSema(X.sem_full, 1);
     if (X.th_v > 0) { thread_join(X.th_v); X.th_v = 0; }
     if (X.th_a > 0) { thread_join(X.th_a); X.th_a = 0; }
+    if (X.sem_afree > 0) { sceKernelDeleteSema(X.sem_afree); X.sem_afree = 0; }
+    if (X.sem_afull > 0) { sceKernelDeleteSema(X.sem_afull); X.sem_afull = 0; }
     if (X.sem_full > 0) { sceKernelDeleteSema(X.sem_full); X.sem_full = 0; }
     if (X.sem_free > 0) { sceKernelDeleteSema(X.sem_free); X.sem_free = 0; }
 }
@@ -460,11 +486,15 @@ int vexport_start(int mode)
     stats_reset();
     X.sem_free = sceKernelCreateSema("vp_mp4_free", 0, NYUV, NYUV, NULL);
     X.sem_full = sceKernelCreateSema("vp_mp4_full", 0, 0, NYUV, NULL);
-    /* big stacks: the recorder's encoders run on the calling thread, and the AAC encoder overflowed 64 KB (crash
-     * at a function entry in SceAacenc) */
-    X.th_v = thread_start("vp_mp4v", video_thread, NULL, 0x10000100, 256 * 1024, 0x40000);
-    X.th_a = thread_start("vp_mp4a", audio_thread, NULL, 0x10000100, 1024 * 1024, 0x20000);
-    if (X.sem_free < 0 || X.sem_full < 0 || X.th_v < 0 || X.th_a < 0) { finish(1); return fail("Couldn't start the export threads", 0); }
+    X.sem_afree = sceKernelCreateSema("vp_mp4_afree", 0, NAUD, NAUD, NULL);
+    X.sem_afull = sceKernelCreateSema("vp_mp4_afull", 0, 0, NAUD, NULL);
+    /* big stacks: the recorder's encoders run on the calling thread (the AAC encoder overflowed 64 KB) */
+    X.th_v = thread_start("vp_mp4feed", feeder_thread, NULL, 0x10000100, 1024 * 1024, 0x40000);
+    X.th_a = thread_start("vp_mp4mix", mix_thread, NULL, 0x10000100 + 2, 256 * 1024, 0x20000);
+    if (X.sem_free < 0 || X.sem_full < 0 || X.sem_afree < 0 || X.sem_afull < 0 || X.th_v < 0 || X.th_a < 0) {
+        finish(1);
+        return fail("Couldn't start the export threads", 0);
+    }
     g_vexp.running = 1;
     LOG("vexport: %d frames, %lld audio blocks, project %dx%d -> %dx%d", g_vexp.nframes, (long long)X.ablocks_total, pr->width, pr->height, X.w, X.h);
     return 0;
@@ -513,12 +543,12 @@ static void stats_log(void)
     if (!g_t_n) return;
     uint64_t wall = time_us() - g_t0;
     LOG("vexport: per frame: %.1f ms overall; render %.1f ms, colour conversion %.1f ms (%s), waiting for a free slot %.1f ms; "
-        "recorder thread: add video %.1f ms; sound thread: %.1f ms (%d frames)",
+        "feeder: add video %.1f ms, add sound %.1f ms; mixing %.1f ms (%d frames)",
         wall / 1000.0 / g_t_n, g_t_render / 1000.0 / g_t_n, g_t_csc / 1000.0 / g_t_n,
         X.csc_mode == 0 ? "hardware" : X.csc_mode == 1 ? "hardware, copied" : "CPU", g_t_wait / 1000.0 / g_t_n,
-        X.t_vadd / 1000.0 / g_t_n, X.t_audio / 1000.0 / g_t_n, g_t_n);
+        X.t_vadd / 1000.0 / g_t_n, X.t_audio / 1000.0 / g_t_n, X.t_mix / 1000.0 / g_t_n, g_t_n);
     g_t_render = g_t_csc = g_t_wait = 0;
-    X.t_vadd = X.t_audio = 0;
+    X.t_vadd = X.t_audio = X.t_mix = 0;
     g_t_n = 0;
     g_t0 = time_us();
 }
