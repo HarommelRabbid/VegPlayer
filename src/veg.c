@@ -893,7 +893,7 @@ static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
             if (blk == 0 && t->tmk && sz >= 0xb0) {
                 VegTmKey key;
                 const uint8_t *q = b + p;
-                key.curve = veg_key_type(rd32(q + 4));
+                key.curve = veg_tm_key_type(rd32(q + 4));
                 key.t = (double)rd64(q + 8) * 1e-7;
                 key.x = rdd(q + 0x30); key.y = rdd(q + 0x38); key.w = rdd(q + 0x50); key.h = rdd(q + 0x58);
                 double qw = rdd(q + 0x90), qz = rdd(q + 0xa8);
@@ -964,6 +964,14 @@ int veg_key_type(uint32_t stored)
 {
     static const int MAP[] = { VEG_KEY_LINEAR, VEG_KEY_HOLD, VEG_KEY_SLOW, VEG_KEY_FAST, VEG_KEY_SMOOTH, VEG_KEY_SHARP };
     return stored < 6 ? MAP[stored] : VEG_KEY_LINEAR;
+}
+
+/* Track Motion keyframes number their types differently from Pan/Crop: the Northern Pacer veg stores 0 and 2 on
+ * keyframes that VEGAS shows as Linear. Until the other codes are known, all play as Linear. */
+int veg_tm_key_type(uint32_t stored)
+{
+    (void)stored;
+    return VEG_KEY_LINEAR;
 }
 
 float veg_fade_shape(int curve, double u)
