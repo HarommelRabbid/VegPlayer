@@ -66,7 +66,7 @@ Log: `ux0:data/vegplayer/log.txt`.
 has no header or stub for it, so both come from DolceSDK (`third_party/sce`); the stub format is VitaSDK's, so it
 links unchanged. The decoder's work memory, frame and output buffers live in one physically contiguous block. The
 `fact` chunk's encoder delay is skipped; DRM-encrypted OMA files are refused. Not yet tested on hardware: if a file
-fails, the log has the SCE error code.
+fails, the log has the SCE error code. Verified on a Vita: ATRAC3plus output is interleaved 16-bit and bit-exact with FFmpeg.
 
 Text and noise generators are skipped (as asked). Solid-colour generators are drawn.
 

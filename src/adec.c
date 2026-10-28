@@ -627,8 +627,8 @@ static int dec_at9(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
  * physically contiguous block (the codec hardware reads them directly, like the video decoder's buffers).
  * The output layout isn't documented: a frame is 2048 (ATRAC3plus) or 1024 (ATRAC3) samples per channel, and the
  * layout (interleaved 16-bit, 16-bit per channel one after the other, or 32-bit float) is picked from the first
- * frames that carry sound: the one whose neighbouring samples correlate like real audio. The choice, the return codes
- * and the first seconds (as decoded) go to the log and to ux0:data/vegplayer/at3_debug.wav. */
+ * frames that carry sound: the one whose neighbouring samples correlate like real audio (on a Vita: interleaved
+ * 16-bit, bit-exact with FFmpeg's decoder). The choice and the return codes go to the log. */
 enum { AT3_I16 = 0, AT3_PLANAR16, AT3_F32, AT3_LAYOUTS };
 
 /* sample k of channel c in the raw output, as a float -1..1 */
@@ -689,11 +689,6 @@ static int dec_at3(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
     int qr = sceAudiocodecQueryPcmSize(&ctrl, type, &ps), qm = sceAudiocodecQueryMaxPcmSize(&ctrl, type, &pmax);
     LOG("adec: %s init ok; pcm size %u (0x%08X), max %u (0x%08X)", nm, (unsigned)ps, qr, (unsigned)pmax, qm);
     int16_t *pcm = malloc(sizeof(int16_t) * (size_t)spf * (size_t)a->ch);
-    /* the first seconds as decoded (16-bit stereo), for checking on a PC */
-    FILE *dbg = NULL;
-    static int dumped;
-    if (!dumped) { dumped = 1; mkdir_p(APP_DIR); dbg = fopen(APP_DIR "/at3_debug.wav", "wb"); if (dbg) { uint8_t z[44] = { 0 }; fwrite(z, 1, 44, dbg); } }
-    int64_t dbg_frames = 0;
     int64_t frames = a->data_len / a->block, skip = a->skip, out = 0;
     int errors = 0, ok = 0, layout = -1;
     for (int64_t k = 0; pcm && k < frames && !sink_done(s) && !*cancel && out < a->total; k++) {
@@ -723,24 +718,11 @@ static int dec_at3(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
                 float v = at3_get(raw, ly, spf, a->ch, q, c) * 32767.0f;
                 pcm[q * a->ch + c] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
             }
-        if (dbg && dbg_frames < (int64_t)a->rate * 6) {
-            for (int q = 0; q < spf; q++) { int16_t st[2] = { pcm[q * a->ch], pcm[q * a->ch + (a->ch > 1)] }; fwrite(st, 2, 2, dbg); }
-            dbg_frames += spf;
-        }
         int n = spf, off = 0;
         if (skip > 0) { int d = skip < n ? (int)skip : n; off = d; n -= d; skip -= d; }
         if (out + n > a->total) n = (int)(a->total - out);
         if (n > 0) { sink_put(s, pcm + off * a->ch, n, a->ch); out += n; }
         if (prog) *prog = (float)s->pos / (float)(s->end ? s->end : 1);
-    }
-    if (dbg) {   /* WAV header for what was written */
-        uint8_t h[44]; uint32_t data = (uint32_t)dbg_frames * 4;
-        memcpy(h, "RIFF", 4); h[4] = (uint8_t)(36 + data); h[5] = (uint8_t)((36 + data) >> 8); h[6] = (uint8_t)((36 + data) >> 16); h[7] = (uint8_t)((36 + data) >> 24);
-        memcpy(h + 8, "WAVEfmt ", 8); h[16] = 16; h[17] = h[18] = h[19] = 0; h[20] = 1; h[21] = 0; h[22] = 2; h[23] = 0;
-        uint32_t sr = (uint32_t)a->rate, br = sr * 4;
-        for (int b = 0; b < 4; b++) { h[24 + b] = (uint8_t)(sr >> (8 * b)); h[28 + b] = (uint8_t)(br >> (8 * b)); h[40 + b] = (uint8_t)(data >> (8 * b)); }
-        h[32] = 4; h[33] = 0; h[34] = 16; h[35] = 0; memcpy(h + 36, "data", 4);
-        fseek(dbg, 0, SEEK_SET); fwrite(h, 1, 44, dbg); fclose(dbg);
     }
     free(pcm);
     sceKernelFreeMemBlock(blk);
