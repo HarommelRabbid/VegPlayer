@@ -25,12 +25,19 @@
 
 #include "../third_party/sce/mp4rec.h"
 
-/* exported by the library but not in vita-headers: the library-wide set-up and tear-down. Without it,
- * sceMp4RecCreateRecorder calls through a null pointer (crash dump: PC 0 from SceLibMp4Recorder + 0x193, after it
- * printed "Mp4Rec: Require TRC R3146 test"). The arguments aren't known; zeros are passed explicitly. */
-int sceMp4RecRecorderInit(int a, int b, int c, int d);
-int sceMp4RecRecorderEnd(int a, int b, int c, int d);
-static int g_lib_inited;
+/* What the recorder needs, found by disassembling vs0:sys/external/libSceMp4Rec.suprx (FW 3.6x):
+ *  - it imports memset/memcpy/mspace_create/mspace_malloc/... from SceLibc (vs0:sys/external/libc.suprx). SCE-SDK
+ *    games always have that loaded; VitaSDK programs don't, so the imports stay unresolved and the first call into
+ *    them (mspace_create of the recorder's heap in sceMp4RecCreateRecorder) jumps to address 0. So libc.suprx is
+ *    loaded before the recorder.
+ *  - the recorder heap (SceMp4RecRecorder.base) must be at least 4 MB (else 0x80108304, invalid buffer size).
+ *  - sceMp4RecAddVideoSample wants exactly width * height * 3 / 2 bytes (a 2-plane YUV 4:2:0 frame, pitch = width).
+ *  - recordings must be 5 s .. 30 min long.
+ *  - the frame struct's last two words are the picture's plane pointers (Y, then the interleaved chroma). */
+#define REC_HEAP (4u << 20)
+#define REC_MIN_S 5.0
+#define REC_MAX_S (30.0 * 60.0)
+static SceUID g_libc = -1;
 #include "common.h"
 #include "media.h"
 #include "mixer.h"
@@ -93,53 +100,6 @@ static void mem_free(Block *b)
     memset(b, 0, sizeof *b);
 }
 
-/* ------------------------------------------------------------------ recorder module dump (for reverse engineering)
- * sceMp4RecCreateRecorder crashes calling a null pointer; to see why, the loaded recorder module (and the modules it
- * pulled in) are written to ux0:data/vegplayer/mp4rec/ once, with a text file of their load addresses. */
-#define DUMP_DIR APP_DIR "/mp4rec"
-
-static int dump_modules(void)
-{
-    SceUID ids[256];
-    SceSize n = 256;
-    int r = sceKernelGetModuleList(0xFF, ids, &n);
-    LOG("vexport: module list: 0x%08X, %u modules", (unsigned)r, (unsigned)n);
-    if (r < 0) return -1;
-    mkdir_p(DUMP_DIR);
-    FILE *idx = fopen(DUMP_DIR "/modules.txt", "w");
-    int dumped = 0;
-    for (SceSize i = 0; i < n; i++) {
-        SceKernelModuleInfo mi;
-        memset(&mi, 0, sizeof mi);
-        mi.size = sizeof mi;
-        if (sceKernelGetModuleInfo(ids[i], &mi) < 0) continue;
-        mi.module_name[sizeof mi.module_name - 1] = 0;
-        if (idx) {
-            fprintf(idx, "%s  %s  start %p stop %p\n", mi.module_name, mi.path, mi.start_entry, mi.stop_entry);
-            for (int k = 0; k < 4; k++)
-                if (mi.segments[k].memsz)
-                    fprintf(idx, "    seg%d vaddr %p memsz 0x%X perms 0x%X\n", k, mi.segments[k].vaddr, (unsigned)mi.segments[k].memsz,
-                            (unsigned)mi.segments[k].perms);
-        }
-        if (!strstr(mi.module_name, "Mp4") && !strstr(mi.module_name, "VideoExport") && !strstr(mi.module_name, "Aacenc") &&
-            !strstr(mi.module_name, "Videoenc") && !strstr(mi.module_name, "Avcenc") && !strstr(mi.module_name, "Codecengine"))
-            continue;
-        for (int k = 0; k < 4; k++) {
-            if (!mi.segments[k].memsz || !mi.segments[k].vaddr) continue;
-            char path[300];
-            snprintf(path, sizeof path, DUMP_DIR "/%s_seg%d_%08X.bin", mi.module_name, k, (unsigned)(uintptr_t)mi.segments[k].vaddr);
-            FILE *f = fopen(path, "wb");
-            if (!f) continue;
-            fwrite(mi.segments[k].vaddr, 1, mi.segments[k].memsz, f);
-            fclose(f);
-            dumped++;
-            LOG("vexport: dumped %s", path);
-        }
-    }
-    if (idx) fclose(idx);
-    return dumped;
-}
-
 /* ------------------------------------------------------------------ finding the saved file */
 
 static void list_videos(const char *dir, char ***out, int *n, int depth)
@@ -169,8 +129,9 @@ static void free_list(char **l, int n)
 
 /* ------------------------------------------------------------------ colour conversion */
 
-/* RGBA (bytes R, G, B, A) -> NV12 (Y plane, then interleaved U/V at half size), BT.601 limited range */
-static void rgba_to_nv12(const uint8_t *src, int stride_px, int w, int h, uint8_t *dst)
+/* RGBA (bytes R, G, B, A) -> the recorder's 2-plane 4:2:0 (Y plane, then interleaved V/U at half size, "YVU420P2"),
+ * BT.601 limited range */
+static void rgba_to_yvu420(const uint8_t *src, int stride_px, int w, int h, uint8_t *dst)
 {
     uint8_t *Y = dst, *UV = dst + w * h;
     for (int y = 0; y < h; y += 2) {
@@ -186,8 +147,8 @@ static void rgba_to_nv12(const uint8_t *src, int stride_px, int w, int h, uint8_
                 R += r; G += g; B += b;
             }
             R = (R + 2) >> 2; G = (G + 2) >> 2; B = (B + 2) >> 2;
-            uv[x] = (uint8_t)(((-38 * R - 74 * G + 112 * B + 128) >> 8) + 128);
-            uv[x + 1] = (uint8_t)(((112 * R - 94 * G - 18 * B + 128) >> 8) + 128);
+            uv[x] = (uint8_t)(((112 * R - 94 * G - 18 * B + 128) >> 8) + 128);
+            uv[x + 1] = (uint8_t)(((-38 * R - 74 * G + 112 * B + 128) >> 8) + 128);
         }
     }
 }
@@ -200,7 +161,9 @@ static int convert(uint8_t *dst)
     SceMp4RecFrame d, s;
     memset(&d, 0, sizeof d); memset(&s, 0, sizeof s);
     d.size = sizeof d; d.pixelformat = SCE_MP4REC_PIXELFORMAT_YUV420_PACKED; d.stride = w; d.width = w; d.height = h; d.buffer = dst;
+    d.reserved = (uint32_t)(uintptr_t)(dst + (size_t)w * h);   /* second plane: the interleaved chroma */
     s.size = sizeof s; s.pixelformat = SCE_MP4REC_PIXELFORMAT_A8B8G8R8; s.stride = stride; s.width = w; s.height = h; s.buffer = src;
+    s.unk[1] = 1;   /* RGBA option: conversion coefficients ITU-R BT.601 (byte 0 is a constant alpha, unused) */
     if (X.csc_mode == 0) {
         int r = sceMp4RecCsc(&d, &s);
         if (r >= 0) return 0;
@@ -215,7 +178,7 @@ static int convert(uint8_t *dst)
         LOG("vexport: sceMp4RecCsc from a contiguous copy: 0x%08X - converting on the CPU", (unsigned)r);
         X.csc_mode = 2;
     }
-    rgba_to_nv12(src, stride, w, h, dst);
+    rgba_to_yvu420(src, stride, w, h, dst);
     return 0;
 }
 
@@ -324,14 +287,21 @@ int vexport_start(int mode)
     g_vexp.t0 = time_us();
     X.w = VEXPORT_MODES[mode].w; X.h = VEXPORT_MODES[mode].h;
 
+    if (g_libc < 0) {
+        /* the recorder links against SceLibc: it must be there before the recorder is loaded (imports resolve at
+         * load time). If the recorder got loaded without it (an earlier version), reload it. */
+        g_libc = sceKernelLoadStartModule("vs0:sys/external/libc.suprx", 0, NULL, 0, NULL, NULL);
+        LOG("vexport: load SceLibc: 0x%08X", (unsigned)g_libc);
+        if (g_libc < 0) return fail("Couldn't load the system's C library (needed by the recorder)", g_libc);
+        if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) == 0) {
+            int u = sceSysmoduleUnloadModule(SCE_SYSMODULE_MP4_RECORDER);
+            LOG("vexport: unload SceMp4Rec (loaded without SceLibc): 0x%08X", (unsigned)u);
+        }
+    }
     if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) != 0) {
         int r = sceSysmoduleLoadModule(SCE_SYSMODULE_MP4_RECORDER);
         LOG("vexport: load SceMp4Rec module: 0x%08X", (unsigned)r);
         if (r < 0) return fail("Couldn't load the system's MP4 recorder", r);
-    }
-    if (!file_exists(DUMP_DIR "/modules.txt")) {
-        int d = dump_modules();
-        if (d > 0) return fail("Saved the recorder's code to " DUMP_DIR " for analysis - please send that folder and log.txt", 0);
     }
     SceKernelFreeMemorySizeInfo fm;
     memset(&fm, 0, sizeof fm);
@@ -340,15 +310,9 @@ int vexport_start(int mode)
         LOG("vexport: free memory: main %d KB, CDRAM %d KB, contiguous %d KB", fm.size_user >> 10, fm.size_cdram >> 10, fm.size_phycont >> 10);
 
     /* the recorder object's own memory: its size isn't documented, so grow it until the recorder accepts it */
-    if (!g_lib_inited) {
-        LOG("vexport: calling sceMp4RecRecorderInit");
-        int ri = sceMp4RecRecorderInit(0, 0, 0, 0);
-        LOG("vexport: sceMp4RecRecorderInit: 0x%08X", (unsigned)ri);
-        if (ri >= 0) g_lib_inited = 1;
-    }
-    static const unsigned BASE_KB[] = { 256, 1024, 4096 };
+    static const unsigned BASE_KB[] = { REC_HEAP >> 10, 8192 };
     int r = -1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (mem_alloc(&X.base, "vp_mp4rec_base", BASE_KB[i] << 10, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 4096) < 0) break;
         memset(X.base.p, 0, X.base.size);
         X.rec.size = sizeof X.rec;
@@ -375,7 +339,7 @@ int vexport_start(int mode)
     SceMp4RecInitParam ip;
     memset(&ip, 0, sizeof ip);
     ip.size = sizeof ip;
-    ip.mode = (uint32_t)mode;
+    ip.mode = (uint32_t)mode | 0x10000;   /* option: ITU-R BT.601 colours (what the conversion below produces) */
     ip.encoder_mem = X.enc.p; ip.encoder_size = enc_size;
     ip.av_mem = X.av.p; ip.av_size = av_size;
     ip.affinity = 0x40000;            /* core 2: the scene builder's core, idle while exporting */
@@ -409,6 +373,8 @@ int vexport_start(int mode)
 
     list_videos(REC_DIR, &X.before, &X.nbefore, 0);
     double dur = g_s.proj.duration;
+    if (dur > REC_MAX_S) { LOG("vexport: the recorder stops at 30 minutes: exporting the first 30"); dur = REC_MAX_S; }
+    if (dur < REC_MIN_S) dur = REC_MIN_S;   /* the recorder's minimum: the rest is silent black */
     g_vexp.nframes = (int)ceil(dur * 30000.0 / 1001.0 - 1e-6);
     if (g_vexp.nframes < 1) g_vexp.nframes = 1;
     X.ablocks_total = (int64_t)ceil(dur * OUT_RATE / AUD_FRAMES - 1e-6);
