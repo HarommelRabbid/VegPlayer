@@ -779,7 +779,7 @@ static int event_chunk(St *s, const Chunk *c)
                 k[n].cx = rdd(pl + 36); k[n].cy = rdd(pl + 44);
                 k[n].rot = rdd(pl + 52);
                 uint32_t cv = rd32(pl + 16);   /* interpolation to the next keyframe */
-                k[n].curve = cv <= VEG_KEY_HOLD ? (int)cv : VEG_KEY_LINEAR;
+                k[n].curve = veg_key_type(cv);
                 if (isfinite(k[n].w) && isfinite(k[n].h) && isfinite(k[n].cx) && isfinite(k[n].cy) && isfinite(k[n].rot)) n++;
             }
             q += 4;
@@ -893,12 +893,11 @@ static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
             if (blk == 0 && t->tmk && sz >= 0xb0) {
                 VegTmKey key;
                 const uint8_t *q = b + p;
-                key.curve = (int)rd32(q + 4);
+                key.curve = veg_key_type(rd32(q + 4));
                 key.t = (double)rd64(q + 8) * 1e-7;
                 key.x = rdd(q + 0x30); key.y = rdd(q + 0x38); key.w = rdd(q + 0x50); key.h = rdd(q + 0x58);
                 double qw = rdd(q + 0x90), qz = rdd(q + 0xa8);
                 key.rot = isfinite(qw) && isfinite(qz) && (qw != 0 || qz != 0) ? 2.0 * atan2(qz, qw) : 0;
-                if (key.curve < 0 || key.curve > VEG_KEY_HOLD) key.curve = VEG_KEY_LINEAR;
                 if (isfinite(key.t) && isfinite(key.x) && isfinite(key.y) && isfinite(key.w) && isfinite(key.h) &&
                     fabs(key.x) < 1000 && fabs(key.y) < 1000 && fabs(key.w) < 1000 && fabs(key.h) < 1000)
                     t->tmk[t->ntmk++] = key;
@@ -959,6 +958,12 @@ const char *veg_comp_name(int mode)
                                "Hard Light", "Dodge", "Burn", "Darken", "Lighten", "Difference", "Difference Squared" };
     if (mode == VEG_COMP_CUSTOM) return "Custom (plug-in)";
     return mode >= 0 && mode <= VEG_COMP_DIFFSQUARED ? N[mode] : "?";
+}
+
+int veg_key_type(uint32_t stored)
+{
+    static const int MAP[] = { VEG_KEY_SMOOTH, VEG_KEY_LINEAR, VEG_KEY_SLOW, VEG_KEY_FAST, VEG_KEY_SHARP, VEG_KEY_HOLD };
+    return stored < 6 ? MAP[stored] : VEG_KEY_LINEAR;
 }
 
 float veg_fade_shape(int curve, double u)
