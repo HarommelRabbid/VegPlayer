@@ -409,25 +409,12 @@ static void prepare_mount_titles(void)
     }
 }
 
-/* is media i shown by an event with a Glow effect (event or track chain)? Its glow samples quarter-size copies */
-static int media_has_glow(const VegProject *p, int i)
-{
-    for (int e = 0; e < p->nevents; e++) {
-        const VegEvent *ev = &p->events[e];
-        if (ev->kind != VEG_KIND_VIDEO || ev->media != i) continue;
-        for (int k = 0; k < ev->nvfx; k++) if (ev->vfx[k].type == VFX_GLOW) return 1;
-        const VegTrack *t = &p->tracks[ev->track];
-        for (int k = 0; k < t->nvfx; k++) if (t->vfx[k].type == VFX_GLOW) return 1;
-    }
-    return 0;
-}
-
 int prepare_start(void)
 {
     VegProject *p = &g_s.proj;
     prepare_mount_titles();
     session_free_caches();
-    for (int i = 0; i < p->nmedia; i++) g_s.m[i].vc.want_q = g_cfg.small_copies || (g_cfg.glow && media_has_glow(p, i));
+    for (int i = 0; i < p->nmedia; i++) g_s.m[i].vc.want_q = g_cfg.small_copies;
     memset(&g_prep, 0, sizeof g_prep);
     g_prep.running = 1;
     snprintf(g_prep.line, sizeof g_prep.line, "Reading sources...");

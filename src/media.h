@@ -17,7 +17,7 @@ typedef struct {
     GpuImage *img; int nimg;
     GpuImage *imgq;         /* per slot: a quarter-size copy (or NULL): small layers sample it, faster and no shimmer */
     int cache_w, cache_h, bpp;
-    int want_q;             /* make the quarter-size copies (the option, or the source is used with Glow) */
+    int want_q;             /* make the quarter-size copies (the small-layer option) */
 } VideoCache;
 
 typedef struct { int64_t start; int64_t count; int16_t *pcm; } PcmSeg;   /* stereo interleaved, positions in source frames */

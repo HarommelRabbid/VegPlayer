@@ -5,7 +5,7 @@
 #include <string.h>
 #include "veg.h"
 
-static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon", "chanblend", "lab", "colorcorr", "gradient", "linearblur", "radialblur", "noop", "gaussblur", "glow" };
+static const char *VFXN[] = { "unknown", "invert", "grayscale", "hsl", "sepia", "bricon", "chanblend", "lab", "colorcorr", "gradient", "linearblur", "radialblur", "noop", "gaussblur" };
 static const char *AFXN[] = { "unknown", "pitchshift", "vibrato", "reverb", "noop" };
 
 int main(int argc, char **argv)

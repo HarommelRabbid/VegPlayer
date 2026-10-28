@@ -195,41 +195,6 @@ static const char FRAG_SHADOW_SRC[] =
     "    return float4(uTint.rgb, uTint.a * 0.25f * a * r.x * r.y);\n"
     "}\n";
 
-/* PASS_GLOW: 13 taps (centre, 6 at half the radius, 6 at the radius, rotated 30 degrees), roughly Gaussian weights.
- * Each tap goes through the layer's matrix; how much it glows rises from the threshold (brightness) to full, keeping
- * its colour; the picture's edge fades out over half the radius (no steps in the halo). Drawn with Screen. */
-static const char FRAG_GLOW_SRC[] =
-    "float3 br(float2 q, sampler2D tex, float4 R, float4 G, float4 B, float4 s)\n"
-    "{\n"
-    "    float4 c = tex2D(tex, q);\n"
-    "    float4 p = float4(c.rgb, 1.0f);\n"
-    "    float3 x = saturate(float3(dot(R, p), dot(G, p), dot(B, p)));\n"
-    "    float l = dot(x, float3(0.299f, 0.587f, 0.114f));\n"
-    "    float2 e = s.xy * 0.5f;\n"
-    "    float2 in2 = saturate((q + e) / (2.0f * e)) - saturate((q - 1.0f + e) / (2.0f * e));\n"
-    "    return x * (saturate((l - s.z) * s.w) * c.a * in2.x * in2.y);\n"
-    "}\n"
-    "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex,\n"
-    "            uniform float4 uMatR, uniform float4 uMatG, uniform float4 uMatB, uniform float4 uTint, uniform float4 uSoft) : COLOR\n"
-    "{\n"
-    "    float2 t = vTexcoord, r = uSoft.xy, h = uSoft.xy * 0.5f;\n"
-    "    float3 c0 = br(t, tex, uMatR, uMatG, uMatB, uSoft);\n"
-    "    float3 c1 = br(t + h * float2(1.0f, 0.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + h * float2(-1.0f, 0.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + h * float2(0.5f, 0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + h * float2(-0.5f, 0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + h * float2(0.5f, -0.866f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + h * float2(-0.5f, -0.866f), tex, uMatR, uMatG, uMatB, uSoft);\n"
-    "    float3 c2 = br(t + r * float2(0.866f, 0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + r * float2(-0.866f, 0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + r * float2(0.866f, -0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + r * float2(-0.866f, -0.5f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + r * float2(0.0f, 1.0f), tex, uMatR, uMatG, uMatB, uSoft)\n"
-    "              + br(t + r * float2(0.0f, -1.0f), tex, uMatR, uMatG, uMatB, uSoft);\n"
-    "    float3 g = c0 * 0.16f + c1 * 0.09f + c2 * 0.05f;\n"
-    "    return float4(g * uTint.rgb, uTint.a);\n"
-    "}\n";
-
 #define SHADER_VERSION 4   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
@@ -247,7 +212,6 @@ static FProg g_fp[PASS_COUNT] = {
     { .name = "lut", .src = FRAG_LUT_SRC },
     { .name = "blur", .src = FRAG_BLUR_SRC },
     { .name = "shadow", .src = FRAG_SHADOW_SRC },
-    { .name = "glow2", .src = FRAG_GLOW_SRC },   /* (renamed when the shader changed: the cached .gxp is per name) */
 };
 static SceGxmProgram *g_vprog_gxp;
 static SceGxmShaderPatcherId g_vid;
@@ -360,8 +324,7 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
     f->tex_unit = unit_of(f->gxp, "tex");
     f->lut_unit = unit_of(f->gxp, "lut");
     int shadow = f == &g_fp[PASS_SHADOW];
-    int glow = f == &g_fp[PASS_GLOW];
-    if ((!shadow && (!f->mat[0] || !f->mat[1] || !f->mat[2])) || ((shadow || glow) && !f->soft) || !f->tint || f->tex_unit < 0) return -1;
+    if ((!shadow && (!f->mat[0] || !f->mat[1] || !f->mat[2])) || (shadow && !f->soft) || !f->tint || f->tex_unit < 0) return -1;
     static const struct { int src, dst, func; } BL[BLEND_COUNT] = {
         { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* normal */
         { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_ADD },                   /* add */
@@ -421,9 +384,8 @@ int gpu_init(void)
     for (int i = 1; i < PASS_COUNT; i++)
         if (setup_fprog(&g_fp[i], sp) < 0) LOG("gpu: %s shader unavailable (that effect falls back)", g_fp[i].name);
     g_shaders_ok = 1;
-    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s, shadow %s, glow %s)",
-             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no", g_fp[PASS_SHADOW].ok ? "yes" : "no",
-             g_fp[PASS_GLOW].ok ? "yes" : "no");
+    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s, shadow/glow %s)",
+             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no", g_fp[PASS_SHADOW].ok ? "yes" : "no");
     LOG("gpu: %s", g_status);
     return 0;
 }
@@ -493,7 +455,7 @@ void gpu_draw_layer(const GpuLayer *L)
         if (f->dir) sceGxmSetUniformDataF(fbuf, f->dir, 0, 4, L->dir);
         if (f->rad) sceGxmSetUniformDataF(fbuf, f->rad, 0, 4, L->rad);
         for (int k = 0; k < 5; k++) if (f->w[k]) sceGxmSetUniformDataF(fbuf, f->w[k], 0, 4, L->w + 4 * k);
-    } else if (pass == PASS_SHADOW || pass == PASS_GLOW) {
+    } else if (pass == PASS_SHADOW) {
         sceGxmSetUniformDataF(fbuf, f->soft, 0, 4, L->soft);
     }
     sceGxmSetFragmentTexture(ctx, (unsigned)f->tex_unit, L->tex);

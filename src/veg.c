@@ -156,7 +156,6 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_CHANBLEND_GUID "0bc15b73-83b9-11d4-9f67-00485481bd31" /* Sony Channel Blend (DXT) */
 #define FX_GRADMAP_GUID   "300f2f5f-d7c7-48be-b796-90fc740b654e" /* Sony Gradient Map (DXT) */
 #define FX_LINBLUR_GUID   "8dbe8301-d9a5-4fd5-8901-1d8bf4d3a6c0" /* Sony Linear Blur (DXT, Vegas 8) */
-#define FX_GLOW_GUID      "809d57ab-4be6-41b7-854c-37555e183e25" /* Glow (DXT; still used by VEGAS 20) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
 #define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
@@ -532,23 +531,6 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
                     v->mtx[o * 4 + 3] = 0;
                 }
             } else v->type = VFX_UNKNOWN;
-        } else if (!strcmp(plug, FX_GLOW_GUID)) {
-            /* five 8-byte slots: float (0; suppression?), float glow percent, float intensity, u32 colour (Windows
-             * COLORREF 0x00BBGGRR), float (1); names after Vegas's Glow dialog, order guessed from one project */
-            size_t pl;
-            const uint8_t *pp = dxt_params(b, bl, &pl);
-            v->type = VFX_GLOW;
-            v->amount = 0.2; v->a = 1; v->b = 0;
-            v->color[0] = v->color[1] = v->color[2] = 1;
-            if (pp && pl >= 36) {
-                float sup = rdf(pp), g = rdf(pp + 8), in = rdf(pp + 16);
-                uint32_t c = rd32(pp + 24);
-                if (g >= 0 && g <= 1) v->amount = g;
-                if (in >= 0 && in <= 10) v->a = in;
-                if (sup >= 0 && sup <= 1) v->b = sup;
-                v->color[0] = (c & 255) / 255.0f; v->color[1] = ((c >> 8) & 255) / 255.0f; v->color[2] = ((c >> 16) & 255) / 255.0f;
-            }
-            if (v->amount <= 0 || v->a <= 0) v->type = VFX_NOOP;
         } else if (!strcmp(plug, FX_LINBLUR_GUID)) {
             /* doubles: angle (degrees), amount (as the OFX version) */
             size_t pl;

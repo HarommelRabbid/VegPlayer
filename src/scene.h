@@ -16,7 +16,6 @@ typedef struct {
     int cpu_fx;                /* layers whose effects were done on the CPU this time */
     int nlut, nblur;           /* layers drawn with the gradient-map / blur shader */
     int nshadow;               /* Track Motion shadow / glow layers */
-    int nglow;                 /* Glow effect layers */
     uint64_t build_us;
 } Scene;
 

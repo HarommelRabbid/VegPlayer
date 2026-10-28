@@ -185,19 +185,18 @@ static void luts_build(void)
 /* The chain (event effects, then track effects) becomes one GPU pass: colour effects fold into the matrix m;
  * a Gradient Map splits the chain (m before it, m2 after it); a blur is applied when sampling (it commutes with
  * the colour matrix). One special effect per layer: the first one wins. */
-typedef struct { int pass; float m[12], m2[12]; const VegVfx *special, *glow; } Chain;   /* glow: first Glow effect */
+typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; } Chain;
 
 static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
 {
     cm_identity(c->m); cm_identity(c->m2);
-    c->pass = PASS_MATRIX; c->special = NULL; c->glow = NULL;
+    c->pass = PASS_MATRIX; c->special = NULL;
     for (int pass = 0; pass < 2; pass++) {
         const VegVfx *fx = pass ? t->vfx : e->vfx;
         int n = pass ? t->nvfx : e->nvfx;
         for (int i = 0; i < n; i++) {
             const VegVfx *v = &fx[i];
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
-            if (v->type == VFX_GLOW) { if (!c->glow) c->glow = v; continue; }   /* an extra additive layer (build) */
             if (v->type == VFX_GRADIENT || v->type == VFX_LINEARBLUR || v->type == VFX_RADIALBLUR || v->type == VFX_GAUSSBLUR) {
                 if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
                     c->special = v;
@@ -422,78 +421,6 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
 
 /* ------------------------------------------------------------------ building */
 
-/* the Glow effect's light for layer S (drawn already): the same picture through the same colour matrix, its bright
- * parts spread over a disc and screened on top in the glow colour x intensity. Matched by eye to Vegas (a dmf project):
- * a wide, soft bloom from everything moderately bright. Guessed mapping: threshold 1 - 2 x glow percent, radius
- * glow percent x 16 % of the frame height. q: the frame's quarter-size copy (smoother), else the layer's own texture. */
-static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, const GpuImage *q, GpuLayer *L)
-{
-    if (S->pass == PASS_BLUR || S->blend != BLEND_NORMAL || S->tint[3] <= 0.002f) return 0;
-    *L = *S;
-    if (q) L->tex = &q->tex;
-    float ax = S->x[1] - S->x[0], ay = S->y[1] - S->y[0], bx = S->x[2] - S->x[0], by = S->y[2] - S->y[0];
-    float la = hypotf(ax, ay), lb = hypotf(bx, by);
-    if (la < 2 || lb < 2) return 0;
-    float r = (float)g->amount * 0.16f * frame_h;
-    float rx = r / la, ry = r / lb;
-    if (rx > 0.5f) rx = 0.5f;
-    if (ry > 0.5f) ry = 0.5f;
-    float thr = 1.0f - 2.0f * (float)g->amount;   /* the haze: only the brighter half of the picture */
-    thr = thr < 0.05f ? 0.05f : thr > 0.9f ? 0.9f : thr;
-    L->soft[0] = rx; L->soft[1] = ry; L->soft[2] = thr; L->soft[3] = 1.0f / (1.0f - thr);
-    L->pass = PASS_GLOW;
-    L->blend = BLEND_SCREEN;   /* bright parts get hazy instead of clipping to white (as in Vegas) */
-    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a * S->tint[3] * 0.6f;   /* milder: the halo does most */
-    L->tint[3] = S->tint[3];
-    L->fx = 1;
-    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
-    float x0 = S->x[0], y0 = S->y[0];
-    for (int i = 0; i < 4; i++) {
-        float u = CU[i] ? 1 + rx : -rx, w = CV[i] ? 1 + ry : -ry;
-        L->u[i] = u; L->v[i] = w;
-        L->x[i] = x0 + u * ax + w * bx;
-        L->y[i] = y0 + u * ay + w * by;
-    }
-    return 1;
-}
-
-/* Glow halo for layer S: S's shape grown by 0.8 x the glow radius, its edge fading out over the radius (full light
- * up to 0.3 radius past the picture, nothing past 1.3), in the glow colour x intensity, drawn just behind S. This is what Vegas's Glow
- * mostly looks like on Sparta tiles: a soft light around each picture. */
-static int glow_halo(const GpuLayer *S, const VegVfx *g, float frame_h, const GpuImage *img, GpuLayer *L)
-{
-    if (S->pass == PASS_BLUR || S->blend != BLEND_NORMAL || S->tint[3] <= 0.002f) return 0;
-    float ax = S->x[1] - S->x[0], ay = S->y[1] - S->y[0], bx = S->x[2] - S->x[0], by = S->y[2] - S->y[0];
-    float la = hypotf(ax, ay), lb = hypotf(bx, by);
-    if (la < 2 || lb < 2) return 0;
-    float r = (float)g->amount * 0.2f * frame_h;
-    float gx = 0.8f * r / la, gy = 0.8f * r / lb;     /* growth, as a fraction of the picture */
-    memset(L, 0, sizeof *L);
-    /* the grown picture: P0' = P0 - gx A - gy B, A' = A (1 + 2 gx), B' = B (1 + 2 gy) */
-    float x0 = S->x[0] - gx * ax - gy * bx, y0 = S->y[0] - gx * ay - gy * by;
-    float Ax = ax * (1 + 2 * gx), Ay = ay * (1 + 2 * gx), Bx = bx * (1 + 2 * gy), By = by * (1 + 2 * gy);
-    float ex = 0.5f * r / hypotf(Ax, Ay), ey = 0.5f * r / hypotf(Bx, By);   /* ramp half-width in its texcoords */
-    if (ex < 1e-4f) ex = 1e-4f;
-    if (ey < 1e-4f) ey = 1e-4f;
-    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
-    for (int i = 0; i < 4; i++) {
-        float u = CU[i] ? 1 + ex : -ex, w = CV[i] ? 1 + ey : -ey;
-        L->u[i] = u; L->v[i] = w;
-        L->x[i] = x0 + u * Ax + w * Bx;
-        L->y[i] = y0 + u * Ay + w * By;
-    }
-    L->soft[0] = 0.5f / ex; L->soft[1] = 0.5f / ey; L->soft[2] = ex; L->soft[3] = ey;
-    cm_identity(L->m); cm_identity(L->m2);
-    L->pass = PASS_SHADOW;
-    L->blend = BLEND_NORMAL;
-    L->tex = &img->tex;
-    L->fx = 1;
-    float in = (float)g->a;
-    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c];
-    L->tint[3] = S->tint[3] * (in > 1 ? 1 : in);
-    return 1;
-}
-
 /* a Track Motion shadow / glow layer for the picture img placed for event e: its shape, moved/scaled by fx, with edges
  * softened over the blur width, in the fx colour. Without the shadow shader: a flat, hard-edged quad of the colour. */
 static void tm_fx_layer(const VegProject *p, const VegEvent *e, const VegTrack *tr, double tau, int pw, int ph,
@@ -542,7 +469,7 @@ static void build(Scene *sc, int buf, double T)
 {
     VegProject *p = &g_s.proj;
     uint64_t t0 = time_us();
-    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = sc->nglow = 0;
+    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = 0;
     sc->vx = g_vx; sc->vy = g_vy; sc->vw = g_vw; sc->vh = g_vh;
     int fb_used = 0;
     /* Vegas: the first track is in front, so draw from the last track up */
@@ -572,7 +499,6 @@ static void build(Scene *sc, int buf, double T)
             if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
             place(p, e, tr, tau, pw, ph, NULL, L->x, L->y);
-            const GpuImage *full = img;   /* (the Glow samples this frame's quarter-size copy) */
             if (vm->type == VEG_MEDIA_FILE && m->vc.imgq && g_cfg.small_copies) {
                 /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
                 float sw = hypotf(L->x[1] - L->x[0], L->y[1] - L->y[0]), sh = hypotf(L->x[2] - L->x[0], L->y[2] - L->y[0]);
@@ -668,28 +594,7 @@ static void build(Scene *sc, int buf, double T)
                     sc->nshadow += nfx;
                 }
             }
-            /* Glow, part 1: a soft halo of the layer's shape behind it (the Track Motion glow's shader) */
-            if (ch.glow && g_cfg.glow && gpu_pass_ok(PASS_SHADOW) && sc->n + 2 < MAX_LAYERS) {
-                GpuLayer h;
-                if (glow_halo(&sc->layer[sc->n], ch.glow, g_vw * p->height / p->width, full, &h)) {
-                    sc->layer[sc->n + 1] = sc->layer[sc->n];
-                    sc->layer[sc->n] = h;
-                    sc->n++;
-                    sc->nglow++;
-                }
-            }
             sc->n++;
-            /* Glow, part 2: a mild haze of its bright parts on top (screened) */
-            const GpuImage *gq = NULL;   /* the frame's quarter-size copy: already averaged, so the wide glow comes out smooth */
-            if (ch.glow && vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
-                int slot = (int)(full - m->vc.img);
-                if (slot >= 0 && slot < m->vc.nimg && m->vc.imgq[slot].data) gq = &m->vc.imgq[slot];
-            }
-            if (ch.glow && g_cfg.glow && gpu_pass_ok(PASS_GLOW) && sc->n < MAX_LAYERS &&
-                glow_layer(&sc->layer[sc->n - 1], ch.glow, g_vw * p->height / p->width, gq, &sc->layer[sc->n])) {
-                sc->n++;
-                sc->nglow++;
-            }
         }
     }
     sc->build_us = time_us() - t0;

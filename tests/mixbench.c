@@ -9,7 +9,7 @@
 #include "media.h"
 #include "mixer.h"
 Session g_s;
-Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, 1, 1, 1, "" };
+Config g_cfg = { -1, -1, 1, 1, 0, 1, 1, 0, 1, 1, "" };
 void log_printf(const char *fmt, ...) { (void)fmt; }
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
