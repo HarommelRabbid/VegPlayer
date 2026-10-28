@@ -105,6 +105,17 @@ static int ci_contains(const char *h, const char *n)
     return 0;
 }
 
+static const char *ci_find(const char *h, const char *n)
+{
+    size_t nl = strlen(n);
+    for (; *h; h++) {
+        size_t k = 0;
+        while (k < nl && h[k] && tolower((unsigned char)h[k]) == tolower((unsigned char)n[k])) k++;
+        if (k == nl) return h;
+    }
+    return NULL;
+}
+
 const char *veg_basename(const char *path)
 {
     const char *a = strrchr(path, '\\'), *b = strrchr(path, '/');
@@ -218,6 +229,38 @@ static void parse_project(St *s, const uint8_t *b, size_t bl)
     for (size_t k = 0; bl > 12 && k < bl - 12; k += 2) {
         uint32_t w = rd32(b + k), h = rd32(b + k + 4), tag = rd32(b + k + 8);
         if (tag == 0x1c && w >= 16 && w <= 16384 && h >= 16 && h <= 16384 && !(w & 1) && !(h & 1)) { p->width = (int)w; p->height = (int)h; break; }
+    }
+    /* UTF-16 strings in the chunk: the project's save path (ends in .veg / .vf) and the editor's settings folder */
+    for (size_t k = 0; k + 16 <= bl; k += 2) {
+        /* a run of UTF-16 characters (any alphabet): no NULs, no control characters */
+        size_t n = 0;
+        while (k + n + 1 < bl && (b[k + n] | b[k + n + 1]) && !(b[k + n + 1] == 0 && b[k + n] < 0x20)) n += 2;
+        if (n < 12) continue;
+        char str[512];
+        u16_utf8(b + k, n, str, sizeof str);
+        size_t L = strlen(str);
+        if (!p->saved_path[0] && L > 4 && (ci_contains(str + L - 4, ".veg") || ci_contains(str + L - 3, ".vf")) && strchr(str, '\\'))
+            snprintf(p->saved_path, sizeof p->saved_path, "%s", str);
+        const char *ad = ci_find(str, "\\AppData\\Local\\");
+        if (!ad) ad = ci_find(str, "\\Application Data\\");
+        if (!p->app_dir[0] && ad) {
+            snprintf(p->app_dir, sizeof p->app_dir, "%s", str);
+            /* "...\Local\[Sony\]<product>\<version>\" */
+            const char *q = strchr(ad + 1, '\\');
+            q = q ? strchr(q + 1, '\\') : NULL;   /* after "AppData\" "Local\" */
+            if (q) {
+                char rest[256];
+                snprintf(rest, sizeof rest, "%s", q + 1);
+                char *parts[4] = { 0 }; int np = 0;
+                for (char *t = strtok(rest, "\\"); t && np < 4; t = strtok(NULL, "\\")) parts[np++] = t;
+                int sony = np && !strcmp(parts[0], "Sony");   /* Sony era: "Sony\\Vegas Pro\\11.0" */
+                int pi = sony || (np && !strcmp(parts[0], "MAGIX")) ? 1 : 0;
+                if (np > pi + 1)
+                    snprintf(p->app_name, sizeof p->app_name, "%s %s%s", parts[pi], parts[pi + 1], sony ? " (Sony)" : "");
+                else if (np > pi) snprintf(p->app_name, sizeof p->app_name, "%s", parts[pi]);
+            }
+        }
+        k += n - 2;   /* (the loop adds 2) */
     }
 }
 

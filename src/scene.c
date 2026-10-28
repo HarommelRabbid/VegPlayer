@@ -646,7 +646,8 @@ static int builder(unsigned argc, void *argp)
     return 0;
 }
 
-int scene_start(void)
+/* shared by playback and the offline (video export) builder: main thread */
+static void scene_setup(void)
 {
     if (g_scm.id < 0) mutex_init(&g_scm, "vp_scene");
     if (g_sema < 0) g_sema = sceKernelCreateSema("vp_scene_sema", 0, 0, 1, NULL);
@@ -654,10 +655,10 @@ int scene_start(void)
     memset(g_sc, 0, sizeof g_sc);
     luts_build();   /* gradient map textures (main thread: vita2d allocations) */
     /* scratch images for the CPU effect fallback, sized for the largest cache frame */
-    g_fb_ok = 0;
     if (!gpu_shaders_ok()) {
         int mw = 0, mh = 0;
         for (int i = 0; i < g_s.proj.nmedia; i++) { mw = MAX(mw, g_s.m[i].vc.cache_w); mh = MAX(mh, g_s.m[i].vc.cache_h); }
+        g_fb_ok = 0;
         if (mw > 0) {
             g_fb_ok = 1; g_fb_w = mw; g_fb_h = mh;
             for (int b = 0; b < 3 && g_fb_ok; b++)
@@ -666,6 +667,11 @@ int scene_start(void)
             LOG("scene: CPU effect fallback %s", g_fb_ok ? "ready" : "unavailable (no GPU memory left)");
         }
     }
+}
+
+int scene_start(void)
+{
+    scene_setup();
     g_run = 1;
     g_thid = thread_start("vp_scene", builder, NULL, 0x10000100 - 8, 64 * 1024, 0x40000);   /* core 2 */
     return g_thid >= 0 ? 0 : -1;
@@ -689,4 +695,16 @@ const Scene *scene_acquire(void)
     mutex_unlock(&g_scm);
     sceKernelSignalSema(g_sema, 1);
     return d >= 0 ? &g_sc[d] : NULL;
+}
+
+void scene_offline_begin(void)
+{
+    scene_stop();
+    scene_setup();
+}
+
+const Scene *scene_build_now(double T)
+{
+    build(&g_sc[0], 0, T);
+    return &g_sc[0];
 }

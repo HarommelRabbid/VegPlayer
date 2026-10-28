@@ -23,5 +23,8 @@ int scene_start(void);         /* spawn the builder (after prepare) */
 void scene_stop(void);
 const Scene *scene_acquire(void);   /* render thread: newest finished scene (stays valid until the next acquire) */
 void scene_set_viewport(float x, float y, float w, float h);
+/* offline rendering (video export), main thread, builder stopped: set up once, then build the scene at any time T */
+void scene_offline_begin(void);
+const Scene *scene_build_now(double T);
 
 #endif

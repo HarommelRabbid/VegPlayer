@@ -36,6 +36,7 @@ add_executable(${PROJECT_NAME}
   src/scene.c
   src/export.c
   src/pfs.c
+  src/vexport.c
   third_party/shine/bitstream.c
   third_party/shine/huffman.c
   third_party/shine/l3bitstream.c
@@ -79,6 +80,7 @@ target_link_libraries(${PROJECT_NAME}
   SceAudiodec_stub
   SceVideodec_stub
   SceAtrac_stub
+  SceLibMp4Recorder_stub
   ScePower_stub
   SceIofilemgr_stub
   SceProcessmgr_stub

@@ -157,6 +157,11 @@ typedef struct {
     VegMedia *media; int nmedia;
     int n_unknown_vfx, n_unknown_afx;
     char unknown_fx[1024];  /* short list of effect names we parse but can't play */
+    /* from the project settings chunk: where the project was saved, and the editor that saved it (its settings
+     * folder, e.g. "...\AppData\Local\Sony\Vegas Pro\11.0\") */
+    char saved_path[512];
+    char app_dir[512];
+    char app_name[96];      /* e.g. "Vegas Pro 11.0 (Sony)", "VEGAS Pro 20.0", "Movie Studio Platinum 12.0 (Sony)" */
 } VegProject;
 
 /* Parse a whole .veg already in memory. Returns 0 on success; errbuf receives a message on failure. */

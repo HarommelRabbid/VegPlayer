@@ -35,8 +35,18 @@ shaders, and the colour effects fall back to a CPU pass on the scene thread.
    (video, 0–100 %) or volume (audio, off/−40…+12 dB) with `LEFT/RIGHT`, plus the **master volume** on the first row.
    They start at the project's values; `SELECT` resets the selected one. All of it works live while playing too.
 4. `START` prepares (decodes what the timeline uses) and plays.
-5. `RIGHT` opens **Export audio**: the mix as it plays (track toggles, sliders, master volume) to WAV (48 kHz,
-   16-bit) or MP3 (128–320 kbps, the shine encoder), saved in `ux0:music/VegPlayer/`. It renders faster than real time.
+5. `RIGHT` opens **Export**:
+   - audio: the mix as it plays (track toggles, sliders, master volume) to WAV (48 kHz, 16-bit) or MP3 (128–320 kbps,
+     the shine encoder), saved in `ux0:data/vegplayer/exports/`. It renders faster than real time.
+   - video: MP4 (H.264 + AAC, 29.97 fps) through the system's own recorder (SceMp4Rec, what the system uses for clip
+     recording), in all its modes: 640×368, 480×272 (the PSP's screen) and 368×208, each at 2 or 1 Mbps. The picture
+     is rendered frame by frame on the GPU (the project letterboxed into the frame), so it can take longer than the
+     project; the recorder saves the file in `ux0:video`, where the Video app lists it. SceMp4Rec isn't documented:
+     every step is logged in `ux0:data/vegplayer/log.txt` (lines starting with `vexport:`) — send them if it fails.
+6. `LEFT` opens **Project info**: the editor and version that saved the project (e.g. *Vegas Pro 11.0 (Sony)*,
+   *VEGAS Pro 20.0*, *Movie Studio Platinum 12.0 (Sony)*, read from the editor's settings folder stored in the project),
+   where it was saved on the PC, format, length, track/event/media counts, missing sources, Track Motion, compositing
+   modes, Pan/Crop, the effects played and not played, time stretch and fades.
 
 Picture sources can also be MP3 files: their cover art (ID3v2 picture, front cover preferred) is used.
 
