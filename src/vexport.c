@@ -33,7 +33,7 @@ const VExportMode VEXPORT_MODES[VEXPORT_NMODES] = {
 
 VExport g_vexp;
 
-#define VIDEO_DIR "ux0:video"
+#define VIDEO_DIR "ux0:data/vegplayer/vexports"
 #define NYUV 3                     /* frames handed to the recorder rotate through this many buffers */
 #define NAUD 4
 #define AUD_FRAMES 1024
