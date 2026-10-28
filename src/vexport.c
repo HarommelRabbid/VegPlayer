@@ -290,6 +290,12 @@ int vexport_start(int mode)
     if (g_libc < 0) {
         /* the recorder links against SceLibc: it must be there before the recorder is loaded (imports resolve at
          * load time). If the recorder got loaded without it (an earlier version), reload it. */
+        /* libc.suprx imports from libfios2.suprx (its file I/O): that goes first, else 0x8002D003 (no such library) */
+        static SceUID fios = -1;
+        if (fios < 0) {
+            fios = sceKernelLoadStartModule("vs0:sys/external/libfios2.suprx", 0, NULL, 0, NULL, NULL);
+            LOG("vexport: load SceFios2: 0x%08X", (unsigned)fios);
+        }
         g_libc = sceKernelLoadStartModule("vs0:sys/external/libc.suprx", 0, NULL, 0, NULL, NULL);
         LOG("vexport: load SceLibc: 0x%08X", (unsigned)g_libc);
         if (g_libc < 0) return fail("Couldn't load the system's C library (needed by the recorder)", g_libc);
