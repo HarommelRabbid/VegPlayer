@@ -24,10 +24,9 @@ enum { VEG_STRETCH_NONE = 0, VEG_STRETCH_CLASSIC = 1, VEG_STRETCH_ELASTIQUE = 2 
 
 /* keyframe interpolation to the next keyframe (the player's own numbering; veg_key_type() converts what Vegas stores) */
 enum { VEG_KEY_LINEAR = 0, VEG_KEY_FAST, VEG_KEY_SLOW, VEG_KEY_SMOOTH, VEG_KEY_SHARP, VEG_KEY_HOLD };
-/* Vegas's stored Pan/Crop keyframe type (keyframe @16) -> VEG_KEY_*. Stored: 0 Linear, 1 Hold, 2 Slow,
- * 3 Fast, 4 Smooth, 5 Sharp - all checked in VEGAS Pro 11 (a test project with one keyframe of each type). */
+/* Vegas's stored keyframe type (Pan/Crop keyframe @16, Track Motion keyframe @4) -> VEG_KEY_*. Stored: 0 Linear, 1 Hold, 2 Slow,
+ * 3 Fast, 4 Smooth, 5 Sharp - all checked in VEGAS Pro 11 (test projects with one keyframe of each type, for Pan/Crop and for Track Motion). */
 int veg_key_type(uint32_t stored);
-int veg_tm_key_type(uint32_t stored);   /* Track Motion's own numbering (only Linear known so far) */
 typedef struct { double t, w, h, cx, cy, rot; int curve; } VegPanKey; /* t: seconds from event start; window in source pixels */
 
 /* video effects. Most are affine colour transforms and fold into one 3x4 matrix; Gradient Map (a colour lookup

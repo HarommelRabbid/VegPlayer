@@ -133,8 +133,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |
-| Pan/Crop keyframe type | keyframe @16: 0 Linear, 1 Hold, 2 Slow, 3 Fast, 4 Smooth, 5 Sharp | all six checked in VEGAS Pro 11 (a test project with one keyframe of each type, labelled) |
-| Track Motion keyframe type | keyframe @4, a different numbering | 0 and 2 are Linear (Northern Pacer); the rest unknown, played as Linear |
+| Pan/Crop / Track Motion keyframe type | Pan/Crop keyframe @16, Track Motion keyframe @4: 0 Linear, 1 Hold, 2 Slow, 3 Fast, 4 Smooth, 5 Sharp | all six checked in VEGAS Pro 11 for both (test projects with one labelled keyframe pair per type) |
 | Media path | media chunk: the first word is the path's offset (0x50 Vegas 8, 0x60, 0x80) | solid |
 | Vegas 8 differences | stretch chunk 24 bytes (semitones @0x10, no attribute); DXT Linear Blur `8dbe8301`; Solid Color floats after the generator GUID | from scan.veg (Vegas 8 and its Vegas 17 re-save) |
 | DXT effect values | the first keyframe's copy of the parameter block (the static block can be stale) | solid for Channel Blend, Gradient Map |
