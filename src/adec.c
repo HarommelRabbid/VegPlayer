@@ -624,55 +624,128 @@ static int dec_at9(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
 }
 
 /* ATRAC3 / ATRAC3plus through SceAudiocodec, one frame per call. The work memory, the frame and the output live in one
- * physically contiguous block (the codec hardware reads them directly, like the video decoder's buffers). */
+ * physically contiguous block (the codec hardware reads them directly, like the video decoder's buffers).
+ * The output layout isn't documented: a frame is 2048 (ATRAC3plus) or 1024 (ATRAC3) samples per channel, and the
+ * layout (interleaved 16-bit, 16-bit per channel one after the other, or 32-bit float) is picked from the first
+ * frames that carry sound: the one whose neighbouring samples correlate like real audio. The choice, the return codes
+ * and the first seconds (as decoded) go to the log and to ux0:data/vegplayer/at3_debug.wav. */
+enum { AT3_I16 = 0, AT3_PLANAR16, AT3_F32, AT3_LAYOUTS };
+
+/* sample k of channel c in the raw output, as a float -1..1 */
+static float at3_get(const void *raw, int layout, int spf, int ch, int k, int c)
+{
+    switch (layout) {
+    case AT3_PLANAR16: return ((const int16_t *)raw)[c * spf + k] * (1.0f / 32768.0f);
+    case AT3_F32: { float v = ((const float *)raw)[k * ch + c]; return v > 1.5f || v < -1.5f || v != v ? 0 : v; }
+    default: return ((const int16_t *)raw)[k * ch + c] * (1.0f / 32768.0f);
+    }
+}
+
+/* how much a frame looks like audio under a layout: lag-1 autocorrelation of channel 0 (music: close to 1) */
+static float at3_score(const void *raw, int layout, int spf, int ch, float *rms)
+{
+    double xx = 0, xy = 0, e = 0;
+    float prev = at3_get(raw, layout, spf, ch, 0, 0);
+    for (int k = 1; k < spf; k++) {
+        float x = at3_get(raw, layout, spf, ch, k, 0);
+        xx += (double)x * x; xy += (double)x * prev; prev = x;
+    }
+    e = xx / spf;
+    *rms = (float)sqrt(e);
+    return xx > 1e-9 ? (float)(xy / xx) : 0;
+}
+
 static int dec_at3(AudioSrc *a, Sink *s, volatile float *prog, volatile int *cancel, char *err, size_t errlen)
 {
     SceUInt32 type = a->atx ? SCE_AUDIOCODEC_ATX : SCE_AUDIOCODEC_AT3;
+    const char *nm = a->atx ? "AT3plus" : "AT3";
     SceAudiocodecCtrl ctrl;
     memset(&ctrl, 0, sizeof ctrl);
     if (a->atx) {
         ctrl.unk_atx_0C = 1;
         ctrl.atx.codecParam1 = a->atx_p1;
         ctrl.atx.codecParam2 = a->atx_p2;
-        ctrl.atx.inputEsSize = (SceUInt32)a->block;
     } else ctrl.at3.codecParam = a->at3_param;
     ctrl.inputEsSize = (SceUInt32)a->block;
     int r = sceAudiocodecQueryMemSize(&ctrl, type);
-    if (r < 0) { snprintf(err, errlen, "%s decoder size query failed (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
+    LOG("adec: %s %s: block %d, params %02X %02X / %u, ch %d, %d Hz, work %u (0x%08X)", nm, a->path, a->block, a->atx_p1, a->atx_p2,
+        (unsigned)a->at3_param, a->ch, a->rate, (unsigned)ctrl.neededWorkMem, r);
+    if (r < 0) { snprintf(err, errlen, "%s decoder size query failed (0x%08X)", nm, r); return -1; }
+    const int spf = a->atx ? 2048 : 1024;                   /* samples per channel per frame (fixed by the codec) */
     size_t work = ((size_t)ctrl.neededWorkMem + 255) & ~(size_t)255, esz = ((size_t)a->block + 255) & ~(size_t)255;
-    size_t pcmsz = 2048u * 2u * 2u * 2u;   /* generous: 2048 samples x 2 ch x 16-bit, doubled */
+    size_t pcmsz = (size_t)spf * 2 * 4 * 2;                 /* room for 2 ch of 32-bit samples, doubled */
     size_t total = (work + esz + pcmsz + 0xFFFFF) & ~(size_t)0xFFFFF;
     SceUID blk = sceKernelAllocMemBlock("vp_atrac3", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, total, NULL);
-    if (blk < 0) { snprintf(err, errlen, "no memory for the AT3 decoder (0x%08X)", blk); return -1; }
+    if (blk < 0) { snprintf(err, errlen, "no memory for the %s decoder (0x%08X)", nm, blk); return -1; }
     uint8_t *base = NULL;
     sceKernelGetMemBlockBase(blk, (void **)&base);
+    memset(base, 0, total);
     ctrl.pWorkMem = base;
     r = sceAudiocodecInit(&ctrl, type);
-    if (r < 0) { sceKernelFreeMemBlock(blk); snprintf(err, errlen, "%s decoder init failed (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
+    if (r < 0) { sceKernelFreeMemBlock(blk); snprintf(err, errlen, "%s decoder init failed (0x%08X)", nm, r); return -1; }
     uint8_t *es = base + work;
-    int16_t *pcm = (int16_t *)(base + work + esz);
-    int spf = a->atx ? 2048 : 1024;
-    SceSize ps = 0;
-    if (sceAudiocodecQueryPcmSize(&ctrl, type, &ps) >= 0 && ps >= 4 && ps <= pcmsz) spf = (int)(ps / 2 / (unsigned)a->ch);
+    uint8_t *raw = base + work + esz;
+    SceSize ps = 0, pmax = 0;
+    int qr = sceAudiocodecQueryPcmSize(&ctrl, type, &ps), qm = sceAudiocodecQueryMaxPcmSize(&ctrl, type, &pmax);
+    LOG("adec: %s init ok; pcm size %u (0x%08X), max %u (0x%08X)", nm, (unsigned)ps, qr, (unsigned)pmax, qm);
+    int16_t *pcm = malloc(sizeof(int16_t) * (size_t)spf * (size_t)a->ch);
+    /* the first seconds as decoded (16-bit stereo), for checking on a PC */
+    FILE *dbg = NULL;
+    static int dumped;
+    if (!dumped) { dumped = 1; mkdir_p(APP_DIR); dbg = fopen(APP_DIR "/at3_debug.wav", "wb"); if (dbg) { uint8_t z[44] = { 0 }; fwrite(z, 1, 44, dbg); } }
+    int64_t dbg_frames = 0;
     int64_t frames = a->data_len / a->block, skip = a->skip, out = 0;
-    int errors = 0, ok = 0;
-    for (int64_t k = 0; k < frames && !sink_done(s) && !*cancel && out < a->total; k++) {
+    int errors = 0, ok = 0, layout = -1;
+    for (int64_t k = 0; pcm && k < frames && !sink_done(s) && !*cancel && out < a->total; k++) {
         memcpy(es, a->buf + a->data_off + k * a->block, (size_t)a->block);
+        memset(raw, 0, pcmsz);
         ctrl.pEs = es;
         ctrl.inputEsSize = (SceUInt32)a->block;
-        ctrl.pPcm = pcm;
+        ctrl.pPcm = raw;
         r = sceAudiocodecDecode(&ctrl, type);
-        if (r < 0) { if (errors++ < 4) LOG("adec: sceAudiocodecDecode 0x%08X (frame %d)", r, (int)k); memset(pcm, 0, (size_t)spf * 2 * a->ch); }
+        if (k < 3) LOG("adec: %s frame %d: 0x%08X, es size now %u, pcm size %u", nm, (int)k, r, (unsigned)ctrl.inputEsSize, (unsigned)ctrl.outputPcmSize);
+        if (r < 0) { if (errors++ < 4) LOG("adec: sceAudiocodecDecode 0x%08X (frame %d)", r, (int)k); memset(raw, 0, pcmsz); }
         else ok++;
+        if (layout < 0 && r >= 0) {
+            float sc[AT3_LAYOUTS], rm[AT3_LAYOUTS];
+            int best = AT3_I16;
+            for (int ly = 0; ly < AT3_LAYOUTS; ly++) { sc[ly] = at3_score(raw, ly, spf, a->ch, &rm[ly]); if (sc[ly] > sc[best]) best = ly; }
+            if (rm[AT3_I16] > 1e-4f || rm[AT3_PLANAR16] > 1e-4f || rm[AT3_F32] > 1e-4f) {   /* a frame with sound decides */
+                layout = best;
+                LOG("adec: %s output layout %s (scores i16 %.2f, planar %.2f, f32 %.2f; rms %.4f %.4f %.4f)", nm,
+                    best == AT3_I16 ? "interleaved 16-bit" : best == AT3_PLANAR16 ? "16-bit per channel" : "32-bit float",
+                    sc[0], sc[1], sc[2], rm[0], rm[1], rm[2]);
+            }
+        }
+        int ly = layout < 0 ? AT3_I16 : layout;
+        for (int q = 0; q < spf; q++)
+            for (int c = 0; c < a->ch; c++) {
+                float v = at3_get(raw, ly, spf, a->ch, q, c) * 32767.0f;
+                pcm[q * a->ch + c] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+            }
+        if (dbg && dbg_frames < (int64_t)a->rate * 6) {
+            for (int q = 0; q < spf; q++) { int16_t st[2] = { pcm[q * a->ch], pcm[q * a->ch + (a->ch > 1)] }; fwrite(st, 2, 2, dbg); }
+            dbg_frames += spf;
+        }
         int n = spf, off = 0;
         if (skip > 0) { int d = skip < n ? (int)skip : n; off = d; n -= d; skip -= d; }
         if (out + n > a->total) n = (int)(a->total - out);
         if (n > 0) { sink_put(s, pcm + off * a->ch, n, a->ch); out += n; }
         if (prog) *prog = (float)s->pos / (float)(s->end ? s->end : 1);
     }
+    if (dbg) {   /* WAV header for what was written */
+        uint8_t h[44]; uint32_t data = (uint32_t)dbg_frames * 4;
+        memcpy(h, "RIFF", 4); h[4] = (uint8_t)(36 + data); h[5] = (uint8_t)((36 + data) >> 8); h[6] = (uint8_t)((36 + data) >> 16); h[7] = (uint8_t)((36 + data) >> 24);
+        memcpy(h + 8, "WAVEfmt ", 8); h[16] = 16; h[17] = h[18] = h[19] = 0; h[20] = 1; h[21] = 0; h[22] = 2; h[23] = 0;
+        uint32_t sr = (uint32_t)a->rate, br = sr * 4;
+        for (int b = 0; b < 4; b++) { h[24 + b] = (uint8_t)(sr >> (8 * b)); h[28 + b] = (uint8_t)(br >> (8 * b)); h[40 + b] = (uint8_t)(data >> (8 * b)); }
+        h[32] = 4; h[33] = 0; h[34] = 16; h[35] = 0; memcpy(h + 36, "data", 4);
+        fseek(dbg, 0, SEEK_SET); fwrite(h, 1, 44, dbg); fclose(dbg);
+    }
+    free(pcm);
     sceKernelFreeMemBlock(blk);
-    if (!ok) { snprintf(err, errlen, "the %s decoder rejected this file (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
-    if (errors) LOG("adec: %d AT3 frames failed in %s", errors, a->path);
+    LOG("adec: %s done: %d frames ok, %d errors, %lld samples", nm, ok, errors, (long long)out);
+    if (!ok) { snprintf(err, errlen, "the %s decoder rejected this file (0x%08X)", nm, r); return -1; }
     return 0;
 }
 
