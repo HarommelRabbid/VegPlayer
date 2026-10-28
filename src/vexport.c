@@ -18,6 +18,7 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/sysmodule.h>
 #include <vita2d.h>
@@ -90,6 +91,53 @@ static void mem_free(Block *b)
 {
     if (b->uid > 0) sceKernelFreeMemBlock(b->uid);
     memset(b, 0, sizeof *b);
+}
+
+/* ------------------------------------------------------------------ recorder module dump (for reverse engineering)
+ * sceMp4RecCreateRecorder crashes calling a null pointer; to see why, the loaded recorder module (and the modules it
+ * pulled in) are written to ux0:data/vegplayer/mp4rec/ once, with a text file of their load addresses. */
+#define DUMP_DIR APP_DIR "/mp4rec"
+
+static int dump_modules(void)
+{
+    SceUID ids[256];
+    SceSize n = 256;
+    int r = sceKernelGetModuleList(0xFF, ids, &n);
+    LOG("vexport: module list: 0x%08X, %u modules", (unsigned)r, (unsigned)n);
+    if (r < 0) return -1;
+    mkdir_p(DUMP_DIR);
+    FILE *idx = fopen(DUMP_DIR "/modules.txt", "w");
+    int dumped = 0;
+    for (SceSize i = 0; i < n; i++) {
+        SceKernelModuleInfo mi;
+        memset(&mi, 0, sizeof mi);
+        mi.size = sizeof mi;
+        if (sceKernelGetModuleInfo(ids[i], &mi) < 0) continue;
+        mi.module_name[sizeof mi.module_name - 1] = 0;
+        if (idx) {
+            fprintf(idx, "%s  %s  start %p stop %p\n", mi.module_name, mi.path, mi.start_entry, mi.stop_entry);
+            for (int k = 0; k < 4; k++)
+                if (mi.segments[k].memsz)
+                    fprintf(idx, "    seg%d vaddr %p memsz 0x%X perms 0x%X\n", k, mi.segments[k].vaddr, (unsigned)mi.segments[k].memsz,
+                            (unsigned)mi.segments[k].perms);
+        }
+        if (!strstr(mi.module_name, "Mp4") && !strstr(mi.module_name, "VideoExport") && !strstr(mi.module_name, "Aacenc") &&
+            !strstr(mi.module_name, "Videoenc") && !strstr(mi.module_name, "Avcenc") && !strstr(mi.module_name, "Codecengine"))
+            continue;
+        for (int k = 0; k < 4; k++) {
+            if (!mi.segments[k].memsz || !mi.segments[k].vaddr) continue;
+            char path[300];
+            snprintf(path, sizeof path, DUMP_DIR "/%s_seg%d_%08X.bin", mi.module_name, k, (unsigned)(uintptr_t)mi.segments[k].vaddr);
+            FILE *f = fopen(path, "wb");
+            if (!f) continue;
+            fwrite(mi.segments[k].vaddr, 1, mi.segments[k].memsz, f);
+            fclose(f);
+            dumped++;
+            LOG("vexport: dumped %s", path);
+        }
+    }
+    if (idx) fclose(idx);
+    return dumped;
 }
 
 /* ------------------------------------------------------------------ finding the saved file */
@@ -280,6 +328,10 @@ int vexport_start(int mode)
         int r = sceSysmoduleLoadModule(SCE_SYSMODULE_MP4_RECORDER);
         LOG("vexport: load SceMp4Rec module: 0x%08X", (unsigned)r);
         if (r < 0) return fail("Couldn't load the system's MP4 recorder", r);
+    }
+    if (!file_exists(DUMP_DIR "/modules.txt")) {
+        int d = dump_modules();
+        if (d > 0) return fail("Saved the recorder's code to " DUMP_DIR " for analysis - please send that folder and log.txt", 0);
     }
     SceKernelFreeMemorySizeInfo fm;
     memset(&fm, 0, sizeof fm);
