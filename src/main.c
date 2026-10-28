@@ -915,7 +915,7 @@ static void export_frame(void)
     header("Export", "{X} export   {O} back");
     int vid = EXPORTS[g_esel].fmt >= EXPORT_MP4;
     if (vid) {
-        textf(40, 66, COL_DIM, 0.8f, "H.264 + AAC at 29.97 fps, made by the system's recorder; saved to ux0:video (the Video app lists it).");
+        textf(40, 66, COL_DIM, 0.8f, "H.264 + AAC at 29.97 fps, made by the system's recorder; saved to ux0:data/vegplayer/vexports.");
         textf(40, 86, COL_DIM, 0.8f, "Rendered frame by frame, so it may take longer than the project. Track toggles and sliders apply.");
     } else {
         textf(40, 66, COL_DIM, 0.8f, "The mix as it plays: track toggles, track sliders and the master volume apply.");

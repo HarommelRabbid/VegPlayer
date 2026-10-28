@@ -16,6 +16,7 @@
 
 #include <psp2/gxm.h>
 #include <psp2/io/dirent.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/sysmodule.h>
@@ -40,7 +41,8 @@ const VExportMode VEXPORT_MODES[VEXPORT_NMODES] = {
 
 VExport g_vexp;
 
-#define VIDEO_DIR "ux0:data/vegplayer/vexports"
+#define VIDEO_DIR "ux0:data/vegplayer/vexports"   /* where the finished file is moved */
+#define REC_DIR "ux0:video"                       /* where the recorder itself saves */
 #define NYUV 3                     /* frames handed to the recorder rotate through this many buffers */
 #define NAUD 4
 #define AUD_FRAMES 1024
@@ -228,15 +230,27 @@ static void finish(int discard)
     cleanup();
     if (!discard && !g_vexp.failed) {
         char **after = NULL; int na = 0;
-        list_videos(VIDEO_DIR, &after, &na, 0);
+        list_videos(REC_DIR, &after, &na, 0);
         const char *found = NULL;
         for (int i = 0; i < na && !found; i++) {
             int old = 0;
             for (int k = 0; k < X.nbefore && !old; k++) old = !strcmp(after[i], X.before[k]);
             if (!old) found = after[i];
         }
-        if (found) snprintf(g_vexp.msg, sizeof g_vexp.msg, "Saved %s", found);
-        else snprintf(g_vexp.msg, sizeof g_vexp.msg, "Done - the video is in " VIDEO_DIR " (the Video app lists it)");
+        if (found) {
+            /* move it next to the other exports, named after the project */
+            char name[256], dst[600];
+            const char *b = strrchr(g_s.veg_path, '/');
+            snprintf(name, sizeof name, "%s", b ? b + 1 : g_s.veg_path);
+            char *dot = strrchr(name, '.');
+            if (dot && dot != name) *dot = 0;
+            mkdir_p(VIDEO_DIR);
+            snprintf(dst, sizeof dst, VIDEO_DIR "/%s.mp4", name);
+            for (int k = 2; k < 100 && file_exists(dst); k++) snprintf(dst, sizeof dst, VIDEO_DIR "/%s (%d).mp4", name, k);
+            int mr = sceIoRename(found, dst);
+            LOG("vexport: move %s -> %s: 0x%08X", found, dst, (unsigned)mr);
+            snprintf(g_vexp.msg, sizeof g_vexp.msg, "Saved %s", mr >= 0 ? dst : found);
+        } else snprintf(g_vexp.msg, sizeof g_vexp.msg, "Done - the video should be in " REC_DIR);
         free_list(after, na);
     } else if (discard && !g_vexp.failed) snprintf(g_vexp.msg, sizeof g_vexp.msg, "Video export cancelled");
     free_list(X.before, X.nbefore); X.before = NULL; X.nbefore = 0;
@@ -341,7 +355,7 @@ int vexport_start(int mode)
     if (!X.rt || !X.mix) { finish(1); return fail("Not enough graphics memory for the video frame", 0); }
     g_vexp.preview = X.rt;
 
-    list_videos(VIDEO_DIR, &X.before, &X.nbefore, 0);
+    list_videos(REC_DIR, &X.before, &X.nbefore, 0);
     double dur = g_s.proj.duration;
     g_vexp.nframes = (int)ceil(dur * 30000.0 / 1001.0 - 1e-6);
     if (g_vexp.nframes < 1) g_vexp.nframes = 1;

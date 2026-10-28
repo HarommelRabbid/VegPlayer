@@ -41,7 +41,7 @@ shaders, and the colour effects fall back to a CPU pass on the scene thread.
    - video: MP4 (H.264 + AAC, 29.97 fps) through the system's own recorder (SceMp4Rec, what the system uses for clip
      recording), in all its modes: 640×368, 480×272 (the PSP's screen) and 368×208, each at 2 or 1 Mbps. The picture
      is rendered frame by frame on the GPU (the project letterboxed into the frame), so it can take longer than the
-     project; the recorder saves the file in `ux0:video`, where the Video app lists it. SceMp4Rec isn't documented:
+     project; the recorder saves into `ux0:video` and VegPlayer then moves the file to `ux0:data/vegplayer/vexports/`, named after the project. SceMp4Rec is undocumented:
      every step is logged in `ux0:data/vegplayer/log.txt` (lines starting with `vexport:`) — send them if it fails.
 6. `LEFT` opens **Project info**: the editor and version that saved the project (e.g. *Vegas Pro 11.0 (Sony)*,
    *VEGAS Pro 20.0*, *Movie Studio Platinum 12.0 (Sony)*, read from the editor's settings folder stored in the project),
