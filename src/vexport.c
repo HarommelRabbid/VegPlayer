@@ -20,6 +20,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/sysmodule.h>
 #include <vita2d.h>
 
@@ -72,6 +73,16 @@ static struct {
     char **before; int nbefore;    /* ux0:video files that existed before */
     int logged_add_err;
     int locked;                    /* we hold the mixer (audio_lock) */
+    /* pipeline: the main thread renders frame k+1 while vp_mp4v hands frame k to the recorder and vp_mp4a mixes and
+     * hands over the sound (the recorder serialises its own calls; mixing and rendering overlap with them) */
+    SceUID sem_free, sem_full;     /* free / filled YUV slots */
+    int th_v, th_a;
+    volatile int queued;           /* frames rendered and queued */
+    volatile int vdone;            /* frames the recorder took */
+    volatile int quit;             /* stop the threads */
+    volatile int err;              /* first recorder error (< 0) */
+    volatile int err_video;
+    volatile uint64_t t_vadd, t_audio;
 } X;
 
 static int mem_alloc(Block *b, const char *name, size_t size, unsigned type, size_t gran)
@@ -208,8 +219,56 @@ static int add_audio_block(void)
     return 0;
 }
 
+static int video_thread(unsigned argc, void *argp)
+{
+    (void)argc; (void)argp;
+    while (!X.quit) {
+        SceUInt to = 100000;
+        if (sceKernelWaitSema(X.sem_full, 1, &to) < 0) continue;
+        if (X.quit) break;
+        int k = X.vdone;
+        uint64_t t = time_us();
+        int r = add_sample(1, X.yuv[k % NYUV], X.w * X.h * 3 / 2);
+        X.t_vadd += time_us() - t;
+        if (r < 0) { if (!X.err) { X.err = r; X.err_video = 1; } break; }
+        X.vdone = k + 1;
+        sceKernelSignalSema(X.sem_free, 1);
+    }
+    return 0;
+}
+
+/* sound up to the end of the frames queued so far (all of it once every frame is queued) */
+static int audio_thread(unsigned argc, void *argp)
+{
+    (void)argc; (void)argp;
+    while (!X.quit && X.ablocks < X.ablocks_total) {
+        int q = X.queued;
+        int64_t target = q >= g_vexp.nframes ? X.ablocks_total : ((int64_t)q * 1001 * OUT_RATE / 30000 + AUD_FRAMES - 1) / AUD_FRAMES;
+        if (target > X.ablocks_total) target = X.ablocks_total;
+        if (X.ablocks >= target) { sleep_us(1000); continue; }
+        uint64_t t = time_us();
+        int r = add_audio_block();
+        X.t_audio += time_us() - t;
+        if (r < 0) { if (!X.err) X.err = r; break; }
+    }
+    return 0;
+}
+
+static void threads_stop(void)
+{
+    X.quit = 1;
+    if (X.sem_full > 0) sceKernelSignalSema(X.sem_full, 1);
+    if (X.th_v > 0) { thread_join(X.th_v); X.th_v = 0; }
+    if (X.th_a > 0) { thread_join(X.th_a); X.th_a = 0; }
+    if (X.sem_full > 0) { sceKernelDeleteSema(X.sem_full); X.sem_full = 0; }
+    if (X.sem_free > 0) { sceKernelDeleteSema(X.sem_free); X.sem_free = 0; }
+}
+
+static void stats_reset(void);
+
 static void cleanup(void)
 {
+    threads_stop();
     if (X.inited || X.created) {
         if (X.created) {
             int r = sceMp4RecDeleteRecorder(&X.rec);
@@ -226,6 +285,7 @@ static void cleanup(void)
 
 static void finish(int discard)
 {
+    threads_stop();
     if (X.inited) {
         SceMp4RecTermParam *tp = calloc(1, sizeof *tp);
         tp->size = sizeof *tp;
@@ -397,6 +457,12 @@ int vexport_start(int mode)
     X.locked = 1;
     mixer_reset();
     vita2d_set_vblank_wait(0);         /* the progress screen needn't wait for the display */
+    stats_reset();
+    X.sem_free = sceKernelCreateSema("vp_mp4_free", 0, NYUV, NYUV, NULL);
+    X.sem_full = sceKernelCreateSema("vp_mp4_full", 0, 0, NYUV, NULL);
+    X.th_v = thread_start("vp_mp4v", video_thread, NULL, 0x10000100, 32 * 1024, 0x40000);
+    X.th_a = thread_start("vp_mp4a", audio_thread, NULL, 0x10000100, 64 * 1024, 0x20000);
+    if (X.sem_free < 0 || X.sem_full < 0 || X.th_v < 0 || X.th_a < 0) { finish(1); return fail("Couldn't start the export threads", 0); }
     g_vexp.running = 1;
     LOG("vexport: %d frames, %lld audio blocks, project %dx%d -> %dx%d", g_vexp.nframes, (long long)X.ablocks_total, pr->width, pr->height, X.w, X.h);
     return 0;
@@ -435,58 +501,60 @@ static void render(double T)
 }
 
 /* time spent per stage (us), logged every 300 frames: shows where an export's time goes */
-static uint64_t g_t_render, g_t_csc, g_t_vadd, g_t_audio;
+static uint64_t g_t_render, g_t_csc, g_t_wait, g_t0;
 static int g_t_n;
+
+static void stats_reset(void) { g_t_render = g_t_csc = g_t_wait = 0; g_t_n = 0; g_t0 = 0; }
 
 static void stats_log(void)
 {
     if (!g_t_n) return;
-    LOG("vexport: per frame: render %.1f ms, colour conversion %.1f ms (%s), add video %.1f ms, sound %.1f ms (%d frames)",
-        g_t_render / 1000.0 / g_t_n, g_t_csc / 1000.0 / g_t_n, X.csc_mode == 0 ? "hardware" : X.csc_mode == 1 ? "hardware, copied" : "CPU",
-        g_t_vadd / 1000.0 / g_t_n, g_t_audio / 1000.0 / g_t_n, g_t_n);
-    g_t_render = g_t_csc = g_t_vadd = g_t_audio = 0;
+    uint64_t wall = time_us() - g_t0;
+    LOG("vexport: per frame: %.1f ms overall; render %.1f ms, colour conversion %.1f ms (%s), waiting for a free slot %.1f ms; "
+        "recorder thread: add video %.1f ms; sound thread: %.1f ms (%d frames)",
+        wall / 1000.0 / g_t_n, g_t_render / 1000.0 / g_t_n, g_t_csc / 1000.0 / g_t_n,
+        X.csc_mode == 0 ? "hardware" : X.csc_mode == 1 ? "hardware, copied" : "CPU", g_t_wait / 1000.0 / g_t_n,
+        X.t_vadd / 1000.0 / g_t_n, X.t_audio / 1000.0 / g_t_n, g_t_n);
+    g_t_render = g_t_csc = g_t_wait = 0;
+    X.t_vadd = X.t_audio = 0;
     g_t_n = 0;
-}
-
-/* one video frame and the sound up to its end; < 0 = stopped */
-static int one_frame(void)
-{
-    int k = g_vexp.frame;
-    uint64_t t0 = time_us();
-    render(k * 1001.0 / 30000.0);
-    uint64_t t1 = time_us();
-    uint8_t *f = X.yuv[k % NYUV];
-    convert(f);
-    uint64_t t2 = time_us();
-    int r = add_sample(1, f, X.w * X.h * 3 / 2);
-    if (r < 0) { fail("The recorder stopped taking frames", r); return -1; }
-    uint64_t t3 = time_us();
-    int64_t until = (int64_t)(k + 1) * 1001 * OUT_RATE;   /* x 30000 */
-    while (X.ablocks < X.ablocks_total && X.ablocks * AUD_FRAMES * 30000 < until)
-        if ((r = add_audio_block()) < 0) { fail("The recorder stopped taking sound", r); return -1; }
-    uint64_t t4 = time_us();
-    g_t_render += t1 - t0; g_t_csc += t2 - t1; g_t_vadd += t3 - t2; g_t_audio += t4 - t3;
-    if (++g_t_n == 300) stats_log();
-    g_vexp.frame = k + 1;
-    g_vexp.progress = (float)g_vexp.frame / g_vexp.nframes;
-    return 0;
+    g_t0 = time_us();
 }
 
 void vexport_step(void)
 {
     if (!g_vexp.running) return;
     if (g_vexp.cancel) { stats_log(); finish(1); return; }
-    /* as many frames as fit in ~50 ms, then let the progress screen draw (one frame per screen refresh would cap
-     * the export at 60 frames a second, and the display wait made it real time) */
+    if (!g_t0) g_t0 = time_us();
+    /* render as many frames as fit in ~50 ms, then let the progress screen draw */
     uint64_t start = time_us();
-    do {
-        if (g_vexp.frame >= g_vexp.nframes) {
+    while (time_us() - start < 50000) {
+        if (X.err) {
+            fail(X.err_video ? "The recorder stopped taking frames" : "The recorder stopped taking sound", X.err);
             stats_log();
-            while (X.ablocks < X.ablocks_total)
-                if (add_audio_block() < 0) { fail("The recorder stopped taking sound", 0); finish(1); return; }
-            finish(0);
+            finish(1);
             return;
         }
-        if (one_frame() < 0) { stats_log(); finish(1); return; }
-    } while (time_us() - start < 50000);
+        if (X.queued >= g_vexp.nframes) {   /* everything rendered: wait for the threads to hand it all over */
+            if (X.vdone >= g_vexp.nframes && X.ablocks >= X.ablocks_total) { stats_log(); finish(0); return; }
+            sleep_us(2000);
+            continue;
+        }
+        uint64_t t0 = time_us();
+        SceUInt to = 2000;
+        if (sceKernelWaitSema(X.sem_free, 1, &to) < 0) { g_t_wait += time_us() - t0; continue; }
+        uint64_t t1 = time_us();
+        int k = X.queued;
+        render(k * 1001.0 / 30000.0);
+        uint64_t t2 = time_us();
+        convert(X.yuv[k % NYUV]);
+        uint64_t t3 = time_us();
+        X.queued = k + 1;
+        sceKernelSignalSema(X.sem_full, 1);
+        g_t_wait += t1 - t0; g_t_render += t2 - t1; g_t_csc += t3 - t2;
+        g_vexp.frame = k + 1;
+        g_vexp.progress = (float)X.vdone / g_vexp.nframes;
+        if (++g_t_n == 300) stats_log();
+    }
+    g_vexp.progress = (float)X.vdone / g_vexp.nframes;
 }
