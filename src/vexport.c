@@ -22,6 +22,13 @@
 #include <vita2d.h>
 
 #include "../third_party/sce/mp4rec.h"
+
+/* exported by the library but not in vita-headers: the library-wide set-up and tear-down. Without it,
+ * sceMp4RecCreateRecorder calls through a null pointer (crash dump: PC 0 from SceLibMp4Recorder + 0x193, after it
+ * printed "Mp4Rec: Require TRC R3146 test"). The arguments aren't known; zeros are passed explicitly. */
+int sceMp4RecRecorderInit(int a, int b, int c, int d);
+int sceMp4RecRecorderEnd(int a, int b, int c, int d);
+static int g_lib_inited;
 #include "common.h"
 #include "media.h"
 #include "mixer.h"
@@ -267,6 +274,12 @@ int vexport_start(int mode)
         LOG("vexport: free memory: main %d KB, CDRAM %d KB, contiguous %d KB", fm.size_user >> 10, fm.size_cdram >> 10, fm.size_phycont >> 10);
 
     /* the recorder object's own memory: its size isn't documented, so grow it until the recorder accepts it */
+    if (!g_lib_inited) {
+        LOG("vexport: calling sceMp4RecRecorderInit");
+        int ri = sceMp4RecRecorderInit(0, 0, 0, 0);
+        LOG("vexport: sceMp4RecRecorderInit: 0x%08X", (unsigned)ri);
+        if (ri >= 0) g_lib_inited = 1;
+    }
     static const unsigned BASE_KB[] = { 256, 1024, 4096 };
     int r = -1;
     for (int i = 0; i < 3; i++) {
@@ -276,6 +289,7 @@ int vexport_start(int mode)
         X.rec.base = X.base.p;
         X.rec.base_size = (uint32_t)X.base.size;
         X.rec.unk = 0;
+        LOG("vexport: calling sceMp4RecCreateRecorder (%u KB at %p)", BASE_KB[i], X.base.p);
         r = sceMp4RecCreateRecorder(&X.rec);
         LOG("vexport: sceMp4RecCreateRecorder (%u KB): 0x%08X", BASE_KB[i], (unsigned)r);
         if (r >= 0) break;

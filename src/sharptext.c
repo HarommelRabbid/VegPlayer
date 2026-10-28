@@ -375,6 +375,20 @@ static int make_pgf(stext_font *f, Glyph *g, int fi, unsigned int c, double s)
     return r;
 }
 
+/* flip a stored glyph left-right within its advance */
+static void mirror_glyph(stext_font *f, Glyph *g)
+{
+    if (g->page < 0 || !g->w) return;
+    vita2d_texture *t = f->page[g->page]->tex;
+    uint8_t *d = (uint8_t *)vita2d_texture_get_datap(t);
+    unsigned int stride = vita2d_texture_get_stride(t);
+    for (int j = 0; j < g->h; j++) {
+        uint8_t *row = d + (size_t)(g->y + j) * stride + g->x;
+        for (int a = 0, b = g->w - 1; a < b; a++, b--) { uint8_t tmp = row[a]; row[a] = row[b]; row[b] = tmp; }
+    }
+    g->left = (int16_t)lroundf(g->adv - g->left - g->w);
+}
+
 /* cached glyph for (char, size); NULL if the font doesn't have it */
 static const Glyph *glyph(stext_font *f, unsigned int c, int q, int *fi_out)
 {
@@ -387,7 +401,11 @@ static const Glyph *glyph(stext_font *f, unsigned int c, int q, int *fi_out)
         g = tab_find(f, key, 1);
         if (!g) return NULL;
         double s = q / 64.0;
-        int r = f->kind == K_PVF ? make_pvf(f, g, fi, c, s) : make_pgf(f, g, fi, c, s);
+        /* the system fonts draw U+005C as a yen sign (Japanese code page heritage): make the backslash from the
+         * slash, mirrored */
+        unsigned int src = c == '\\' ? '/' : c;
+        int r = f->kind == K_PVF ? make_pvf(f, g, fi, src, s) : make_pgf(f, g, fi, src, s);
+        if (r > 0 && src != c) mirror_glyph(f, g);
         if (r > 0) return g;
         if (r < 0 && attempt == 0) { cache_reset(f); continue; }   /* atlas full: start over, retry once */
         g->page = -2; g->adv = 0;   /* missing glyph: remember it */
