@@ -24,9 +24,9 @@ enum { VEG_STRETCH_NONE = 0, VEG_STRETCH_CLASSIC = 1, VEG_STRETCH_ELASTIQUE = 2 
 
 /* keyframe interpolation to the next keyframe (the player's own numbering; veg_key_type() converts what Vegas stores) */
 enum { VEG_KEY_LINEAR = 0, VEG_KEY_FAST, VEG_KEY_SLOW, VEG_KEY_SMOOTH, VEG_KEY_SHARP, VEG_KEY_HOLD };
-/* Vegas's stored code (Pan/Crop keyframe @16, Track Motion keyframe @4) -> VEG_KEY_*. Stored: 0 Smooth (the default
- * type of new keyframes), 1 Linear, 2 Slow, 3 Fast, 4 Sharp, 5 Hold. 3 = Fast is confirmed in VEGAS (Porta veg), 4 = Sharp
- * matches the Electrum veg; the rest follow the menu's pairs. */
+/* Vegas's stored code (Pan/Crop keyframe @16, Track Motion keyframe @4) -> VEG_KEY_*. Stored: 0 Linear, 1 Hold, 2 Slow,
+ * 3 Fast, 4 Smooth, 5 Sharp. Checked in VEGAS Pro: 0 = Linear (scan), 3 = Fast (Porta), 4 = Smooth (Electrum); 1, 2 and 5
+ * are inferred from the pairs (Slow next to Fast, Sharp next to Smooth). */
 int veg_key_type(uint32_t stored);
 typedef struct { double t, w, h, cx, cy, rot; int curve; } VegPanKey; /* t: seconds from event start; window in source pixels */
 

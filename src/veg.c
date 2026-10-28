@@ -962,7 +962,7 @@ const char *veg_comp_name(int mode)
 
 int veg_key_type(uint32_t stored)
 {
-    static const int MAP[] = { VEG_KEY_SMOOTH, VEG_KEY_LINEAR, VEG_KEY_SLOW, VEG_KEY_FAST, VEG_KEY_SHARP, VEG_KEY_HOLD };
+    static const int MAP[] = { VEG_KEY_LINEAR, VEG_KEY_HOLD, VEG_KEY_SLOW, VEG_KEY_FAST, VEG_KEY_SMOOTH, VEG_KEY_SHARP };
     return stored < 6 ? MAP[stored] : VEG_KEY_LINEAR;
 }
 
