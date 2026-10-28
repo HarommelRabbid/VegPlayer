@@ -434,26 +434,59 @@ static void render(double T)
     vita2d_wait_rendering_done();
 }
 
+/* time spent per stage (us), logged every 300 frames: shows where an export's time goes */
+static uint64_t g_t_render, g_t_csc, g_t_vadd, g_t_audio;
+static int g_t_n;
+
+static void stats_log(void)
+{
+    if (!g_t_n) return;
+    LOG("vexport: per frame: render %.1f ms, colour conversion %.1f ms (%s), add video %.1f ms, sound %.1f ms (%d frames)",
+        g_t_render / 1000.0 / g_t_n, g_t_csc / 1000.0 / g_t_n, X.csc_mode == 0 ? "hardware" : X.csc_mode == 1 ? "hardware, copied" : "CPU",
+        g_t_vadd / 1000.0 / g_t_n, g_t_audio / 1000.0 / g_t_n, g_t_n);
+    g_t_render = g_t_csc = g_t_vadd = g_t_audio = 0;
+    g_t_n = 0;
+}
+
+/* one video frame and the sound up to its end; < 0 = stopped */
+static int one_frame(void)
+{
+    int k = g_vexp.frame;
+    uint64_t t0 = time_us();
+    render(k * 1001.0 / 30000.0);
+    uint64_t t1 = time_us();
+    uint8_t *f = X.yuv[k % NYUV];
+    convert(f);
+    uint64_t t2 = time_us();
+    int r = add_sample(1, f, X.w * X.h * 3 / 2);
+    if (r < 0) { fail("The recorder stopped taking frames", r); return -1; }
+    uint64_t t3 = time_us();
+    int64_t until = (int64_t)(k + 1) * 1001 * OUT_RATE;   /* x 30000 */
+    while (X.ablocks < X.ablocks_total && X.ablocks * AUD_FRAMES * 30000 < until)
+        if ((r = add_audio_block()) < 0) { fail("The recorder stopped taking sound", r); return -1; }
+    uint64_t t4 = time_us();
+    g_t_render += t1 - t0; g_t_csc += t2 - t1; g_t_vadd += t3 - t2; g_t_audio += t4 - t3;
+    if (++g_t_n == 300) stats_log();
+    g_vexp.frame = k + 1;
+    g_vexp.progress = (float)g_vexp.frame / g_vexp.nframes;
+    return 0;
+}
+
 void vexport_step(void)
 {
     if (!g_vexp.running) return;
-    if (g_vexp.cancel) { finish(1); return; }
-    if (g_vexp.frame >= g_vexp.nframes) {
-        while (X.ablocks < X.ablocks_total)
-            if (add_audio_block() < 0) { fail("The recorder stopped taking sound", 0); finish(1); return; }
-        finish(0);
-        return;
-    }
-    int k = g_vexp.frame;
-    render(k * 1001.0 / 30000.0);
-    uint8_t *f = X.yuv[k % NYUV];
-    convert(f);
-    int r = add_sample(1, f, X.w * X.h * 3 / 2);
-    if (r < 0) { fail("The recorder stopped taking frames", r); finish(1); return; }
-    /* sound up to the end of this frame */
-    int64_t until = (int64_t)(k + 1) * 1001 * OUT_RATE;   /* x 30000 */
-    while (X.ablocks < X.ablocks_total && X.ablocks * AUD_FRAMES * 30000 < until)
-        if ((r = add_audio_block()) < 0) { fail("The recorder stopped taking sound", r); finish(1); return; }
-    g_vexp.frame = k + 1;
-    g_vexp.progress = (float)g_vexp.frame / g_vexp.nframes;
+    if (g_vexp.cancel) { stats_log(); finish(1); return; }
+    /* as many frames as fit in ~50 ms, then let the progress screen draw (one frame per screen refresh would cap
+     * the export at 60 frames a second, and the display wait made it real time) */
+    uint64_t start = time_us();
+    do {
+        if (g_vexp.frame >= g_vexp.nframes) {
+            stats_log();
+            while (X.ablocks < X.ablocks_total)
+                if (add_audio_block() < 0) { fail("The recorder stopped taking sound", 0); finish(1); return; }
+            finish(0);
+            return;
+        }
+        if (one_frame() < 0) { stats_log(); finish(1); return; }
+    } while (time_us() - start < 50000);
 }
