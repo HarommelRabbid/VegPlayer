@@ -460,8 +460,10 @@ int vexport_start(int mode)
     stats_reset();
     X.sem_free = sceKernelCreateSema("vp_mp4_free", 0, NYUV, NYUV, NULL);
     X.sem_full = sceKernelCreateSema("vp_mp4_full", 0, 0, NYUV, NULL);
-    X.th_v = thread_start("vp_mp4v", video_thread, NULL, 0x10000100, 32 * 1024, 0x40000);
-    X.th_a = thread_start("vp_mp4a", audio_thread, NULL, 0x10000100, 64 * 1024, 0x20000);
+    /* big stacks: the recorder's encoders run on the calling thread, and the AAC encoder overflowed 64 KB (crash
+     * at a function entry in SceAacenc) */
+    X.th_v = thread_start("vp_mp4v", video_thread, NULL, 0x10000100, 256 * 1024, 0x40000);
+    X.th_a = thread_start("vp_mp4a", audio_thread, NULL, 0x10000100, 1024 * 1024, 0x20000);
     if (X.sem_free < 0 || X.sem_full < 0 || X.th_v < 0 || X.th_a < 0) { finish(1); return fail("Couldn't start the export threads", 0); }
     g_vexp.running = 1;
     LOG("vexport: %d frames, %lld audio blocks, project %dx%d -> %dx%d", g_vexp.nframes, (long long)X.ablocks_total, pr->width, pr->height, X.w, X.h);
