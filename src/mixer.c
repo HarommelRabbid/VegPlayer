@@ -50,6 +50,12 @@ typedef struct {
     const float *win;
     double gp[2]; int64_t gk[2];
     int64_t gki; int goff;   /* grain of the next output frame and the offset in it (no division per sample) */
+    /* fixed-point read cursors of the two overlapping grains (0 = older, at offset goff + H; 1 = newer, at goff):
+     * integer frame + 32-bit fraction, advanced by addition; each caches the segment it reads */
+    struct { int32_t i; uint32_t f; int32_t lo, hi, cs; const int16_t *cp; } cur[2];
+    int cur_ok;
+    int sharp, sharp_next;   /* this / the next grain switch is a transient: a short crossfade, the attack plays once */
+    double onset;            /* source frame of the last attack placed (later grains must start after it), or -1e18 */
     int64_t fz_in, fz_out;   /* output frames before fz_in / from fz_out on are inside a fade */
     /* vibrato */
     int vib; double vfreq, vA, vphase;
@@ -201,10 +207,11 @@ static void mono_window(Voice *v, int lo, int n, float *dst)
 static double grain_nominal(const Voice *v, int64_t k) { return v->src0 + (double)(k * v->H) * v->ksrc * v->S; }
 
 #define SCR_LEN 16384
-static float g_scr[SCR_LEN];     /* search window (only the audio thread mixes) */
+static float g_scr[SCR_LEN], g_ref[SCR_LEN];   /* search window / reference (only the audio thread mixes) */
 
 /* WSOLA: start of grain k near its nominal position, chosen so its first half continues grain k-1 best.
- * The search window is copied to a mono float array once; candidates are then scored with plain array reads. */
+ * Also looks for an attack (a sudden energy jump) where grain k starts: then the grain is placed so the attack falls
+ * just after its start and the switch to it is short (v->sharp_next), so the attack is heard once, not smeared. */
 static double grain_aligned(Voice *v, int64_t k, double prev_pos)
 {
     /* Classic gets a much narrower search than the élastique approximation: it keeps some of Classic's flutter */
@@ -214,6 +221,7 @@ static double grain_aligned(Voice *v, int64_t k, double prev_pos)
     const int DEC = 16;
     int D = (int)(WSOLA_SEARCH * v->ksrc * (v->mode == 2 ? 1.0 : 0.3)) + 1;
     int npts = v->H / DEC;
+    v->sharp_next = 0;
     if (npts > 256) npts = 256;
     if (npts < 2) return nom;
     int offs[256];
@@ -221,21 +229,67 @@ static double grain_aligned(Voice *v, int64_t k, double prev_pos)
     int span = offs[npts - 1] + 1;
     if (span + 64 > SCR_LEN) return nom;
     if (2 * D + 16 + span > SCR_LEN) D = (SCR_LEN - 16 - span) / 2;
-    /* reference: how grain k-1 continues */
-    float y[256], ey = 0;
-    int nb = ifloor(nat);
-    for (int j = 0; j < npts; j++) { y[j] = mono1(v, (int64_t)nb + offs[j]); ey += y[j] * y[j]; }
-    if (ey < 1e-6f) return nom;          /* silence: nothing to align */
     int base = ifloor(nom) - D - 8;
     mono_window(v, base, 2 * D + 16 + span, g_scr);
+
+    /* attack detection on the raw window: 128-frame block energies from the nominal start over the first half */
+    {
+        const int B = 128;
+        int z = D + 8;                                  /* index of nom in g_scr */
+        /* scan what grain k plays in its first half (H frames at the read rate p) or, when the source advances
+         * faster than that, the whole hop: every attack is then caught by the earliest grain that would play it */
+        double hop = v->H * v->ksrc * v->S, reach = v->H * p > hop ? v->H * p : hop;
+        int lim = 2 * D + 16 + span - z - B;            /* what the window holds after nom */
+        int nb = (int)(reach < lim ? reach : lim) / B;
+        float prev = 0; int np = 0;
+        for (int b = -3; b < 0; b++) {                  /* the 3 blocks before nom */
+            int s0 = z + b * B;
+            if (s0 < 0) continue;
+            float e = 0;
+            for (int q = 0; q < B; q++) e += g_scr[s0 + q] * g_scr[s0 + q];
+            prev += e; np++;
+        }
+        prev = np ? prev / np : 0;
+        /* an attack placed for an earlier grain isn't detected again: scan from just after it */
+        int b0 = 0;
+        if (v->onset > nom - 4 * B) { double ob = (v->onset + 32 * p - nom) / B; b0 = ob > 0 ? (int)ob + 1 : 0; }
+        for (int b = b0; b < nb; b++) {
+            int s0 = z + b * B;
+            float e = 0, pk = 0;
+            for (int q = 0; q < B; q++) { float a = g_scr[s0 + q]; e += a * a; if (fabsf(a) > pk) pk = fabsf(a); }
+            if (e > 8.0f * prev + 0.02f * B * 1e-3f && e > B * 2e-4f) {   /* a jump of 9 dB+ above about -37 dBFS */
+                int q = 0;
+                while (q < B && fabsf(g_scr[s0 + q]) < 0.5f * pk) q++;   /* where it starts within the block */
+                int onset = base + s0 + q;
+                v->sharp_next = 1;
+                v->onset = onset;
+                return (double)onset - 48.0 * p;            /* the attack 48 output frames into the new grain */
+            }
+            prev = prev * 0.5f + e * 0.5f;
+        }
+    }
+
+    /* reference: how grain k-1 continues */
+    int nb = ifloor(nat);
+    mono_window(v, nb, span, g_ref);
+    float y[256], ey = 0;
+    for (int j = 0; j < npts; j++) { y[j] = g_ref[offs[j]]; ey += y[j] * y[j]; }
+    if (ey < 1e-6f) return nom;          /* silence: nothing to align */
     /* coarse to fine: every 16 frames scoring every other point, then every 4 within +-15, then every frame within
      * +-3 (about a third of the work of a step-8 search, same final precision) */
-    int bestd = 0;
+    /* after an attack: this grain mustn't start before it (it would play the attack a second time) */
+    int dmin = -D - 7;
+    if (v->onset > -1e17) {
+        double need = v->onset + 32.0 * p - (double)(base + D + 8);
+        if (need > D + 7) return v->onset + 32.0 * p;      /* the whole range is before the attack: just after it */
+        if (need > dmin) dmin = (int)ceil(need);
+    }
+    int bestd = dmin > 0 ? dmin : 0;
     static const int STEP[3] = { 16, 4, 1 }, HALF[3] = { 0, 15, 3 }, PSTEP[3] = { 2, 1, 1 };
     for (int pass = 0; pass < 3; pass++) {
         int centre = bestd;
-        int lo = pass ? centre - HALF[pass] : -D, hi = pass ? centre + HALF[pass] : D;
-        if (lo < -D - 7) lo = -D - 7;
+        int lo = pass ? centre - HALF[pass] : (-D > dmin ? -D : dmin), hi = pass ? centre + HALF[pass] : D;
+        if (lo < dmin) lo = dmin;
         if (hi > D + 7) hi = D + 7;
         float bestc = -1e30f;
         for (int d = lo; d <= hi; d += STEP[pass]) {
@@ -246,7 +300,22 @@ static double grain_aligned(Voice *v, int64_t k, double prev_pos)
             if (score > bestc) { bestc = score; bestd = d; }
         }
     }
-    return nom + bestd;
+    /* sub-sample: the peak of a parabola through the scores around the best offset. Whole-sample alignment leaves up
+     * to half a sample of phase error at every grain join, which is what limited a pure tone to ~30-40 dB */
+    float sc[3];
+    for (int q = -1; q <= 1; q++) {
+        int d = bestd + q;
+        if (d < dmin || d > D + 7) return (double)(base + D + 8) + bestd + (nat - nb);
+        const float *x = g_scr + (d + D + 8);
+        float c = 0, ex = 0;
+        for (int j = 0; j < npts; j++) { float xv = x[offs[j]]; c += xv * y[j]; ex += xv * xv; }
+        sc[q + 1] = ex > 1e-9f ? c / sqrtf(ex) : -1e30f;
+    }
+    float den = sc[0] - 2 * sc[1] + sc[2], frac = 0;
+    if (den < -1e-12f) { frac = 0.5f * (sc[0] - sc[2]) / den; if (frac > 0.5f) frac = 0.5f; if (frac < -0.5f) frac = -0.5f; }
+    /* the candidates were sampled from whole frames (base + D + 8 + d) against a reference sampled from floor(nat):
+     * the grain that continues grain k-1 exactly starts that far from floor(nat)'s match, plus nat's fraction */
+    return (double)(base + D + 8) + bestd + frac + (nat - nb);
 }
 
 static void grain_prepare(Voice *v, int64_t k)
@@ -259,7 +328,54 @@ static void grain_prepare(Voice *v, int64_t k)
     } else {   /* (re)start: no history */
         v->gk[0] = k - 1; v->gp[0] = grain_nominal(v, k - 1);
         v->gk[1] = k; v->gp[1] = grain_nominal(v, k);
+        v->sharp_next = 0;
     }
+}
+
+/* ---- grain cursors: fixed-point positions, per-cursor segment cache, cubic reads */
+
+static void cursor_seg(Voice *v, int c)
+{
+    float l, r;
+    int64_t i = v->cur[c].i;
+    frame_at(v->ac, i, &v->segc, &l, &r);   /* finds the segment (loop-aware) */
+    const AudioCache *ac = v->ac;
+    const PcmSeg *sg = &ac->seg[v->segc];
+    int64_t shift = 0;
+    if (ac->total > 0 && (i >= ac->total || i < 0)) { int64_t w = i % ac->total; if (w < 0) w += ac->total; shift = i - w; }
+    v->cur[c].cs = (int32_t)(sg->start + shift);
+    v->cur[c].cp = sg->pcm;
+    v->cur[c].lo = v->cur[c].cs + 1;                         /* cubic reads i-1 .. i+2 */
+    v->cur[c].hi = v->cur[c].cs + (int32_t)sg->count - 3;
+}
+
+static void cursor_set(Voice *v, int c, double pos)
+{
+    int i = ifloor(pos);
+    double fr = (pos - i) * 4294967296.0;
+    v->cur[c].i = i;
+    v->cur[c].f = fr >= 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)fr;
+    cursor_seg(v, c);
+}
+
+static inline void cursor_read(Voice *v, int c, float *l, float *r)
+{
+    int32_t i = v->cur[c].i;
+    float t = (float)v->cur[c].f * 2.3283064e-10f;
+    if (i < v->cur[c].lo || i > v->cur[c].hi) {
+        cursor_seg(v, c);
+        if (i < v->cur[c].lo || i > v->cur[c].hi) { fetch_cubic(v, (double)i + t, l, r); return; }   /* edge / gap / loop seam */
+    }
+    const int16_t *q = v->cur[c].cp + (ptrdiff_t)(i - v->cur[c].cs) * 2;
+    *l = ((float)q[0] + (float)(q[2] - q[0]) * t) * (1.0f / 32768.0f);
+    *r = ((float)q[1] + (float)(q[3] - q[1]) * t) * (1.0f / 32768.0f);
+}
+
+static inline void cursor_step(Voice *v, int c, int32_t si, uint32_t sf)
+{
+    uint32_t f = v->cur[c].f + sf;
+    v->cur[c].i += si + (f < sf);
+    v->cur[c].f = f;
 }
 
 /* ------------------------------------------------------------------ voices */
@@ -273,6 +389,7 @@ static void voice_setup(Voice *v, int ei, double t0)
     VegTrack *tr = &p->tracks[e->track];
     memset(v, 0, offsetof(Voice, dl));
     v->used = 1; v->ev = ei; v->track = e->track;
+    v->onset = -1e18;
     v->ac = &g_s.m[e->media].ac;
     v->ksrc = (double)v->ac->rate / OUT_RATE;
     v->S = event_audio_speed(e);
@@ -352,6 +469,9 @@ static void voice_render(Voice *v, float *out, int from, int to)
     double inv = 1.0 / OUT_RATE;
     double p = v->ksrc * v->S;          /* resampling: source frames per output frame */
     double gstep = v->ksrc * v->P;      /* granular: source frames per output frame inside a grain */
+    int32_t gsi = (int32_t)floor(gstep);   /* the same as 32.32 fixed point */
+    uint32_t gsf = (uint32_t)((gstep - gsi) * 4294967296.0);
+    const int XF = 32;                  /* crossfade at a transient, output frames */
     for (int j = from; j < to; j++, v->n++) {
         float l, r;
         if (v->mode == 0) {
@@ -359,14 +479,27 @@ static void voice_render(Voice *v, float *out, int from, int to)
             v->rpos += p;
         } else {
             if (v->goff >= v->H) { v->goff -= v->H; v->gki++; }
-            if (v->gk[1] != v->gki) grain_prepare(v, v->gki);
-            /* output frame = grain k at offset goff + grain k-1 at offset goff + H (50 % overlap) */
+            if (v->gk[1] != v->gki) {
+                int cont = v->cur_ok && v->gk[1] == v->gki - 1;
+                grain_prepare(v, v->gki);
+                /* the newer grain becomes the older one: its cursor is already where that one reads (offset H) */
+                if (cont) v->cur[0] = v->cur[1];
+                else cursor_set(v, 0, v->gp[0] + (v->goff + v->H) * gstep);
+                cursor_set(v, 1, v->gp[1] + v->goff * gstep);
+                v->sharp = cont ? v->sharp_next : 0;
+                v->cur_ok = 1;
+            }
+            /* output frame = grain k at offset goff + grain k-1 at offset goff + H (50 % overlap, Hann: sums to 1);
+             * at a transient: a short crossfade to grain k, then grain k alone */
             int i1 = v->goff, i0 = i1 + v->H;
-            float w1 = v->win ? v->win[i1] : 0.5f, w0 = v->win ? v->win[i0] : 0.5f, sl, sr;
-            fetch_linear(v, v->gp[1] + i1 * gstep, &sl, &sr);
+            float w1, w0, sl, sr;
+            if (v->sharp) { w1 = i1 < XF ? (float)i1 * (1.0f / XF) : 1.0f; w0 = 1.0f - w1; }
+            else { w1 = v->win ? v->win[i1] : 0.5f; w0 = v->win ? v->win[i0] : 0.5f; }
+            cursor_read(v, 1, &sl, &sr);
             l = w1 * sl; r = w1 * sr;
-            fetch_linear(v, v->gp[0] + i0 * gstep, &sl, &sr);
-            l += w0 * sl; r += w0 * sr;
+            if (w0 > 0) { cursor_read(v, 0, &sl, &sr); l += w0 * sl; r += w0 * sr; }
+            cursor_step(v, 0, gsi, gsf);
+            cursor_step(v, 1, gsi, gsf);
             v->goff++;
         }
         if (v->vib && v->dl) {
@@ -623,7 +756,7 @@ static void mix_block(float *out, int frames, int64_t start)
         int from = (int)(es > start ? es - start : 0);
         int64_t stop = es + v->len_n - start;
         int to = stop < frames ? (int)stop : frames;
-        int ri = g_track_rv && v->track < g_rv_ntracks ? g_track_rv[v->track] : -1;
+        int ri = g_cfg.reverb && g_track_rv && v->track < g_rv_ntracks ? g_track_rv[v->track] : -1;   /* off: straight to the mix */
         if (from < to) {
             voice_render(v, ri >= 0 ? g_rv[ri]->bus : out, from, to);
             if (ri >= 0) g_rv[ri]->idle = 0;
@@ -632,7 +765,7 @@ static void mix_block(float *out, int frames, int64_t start)
     }
     for (int i = 0; i < g_nrv; i++) {
         Reverb *r = g_rv[i];
-        if (r->idle >= r->tail || !g_s.track_on[r->track]) continue;   /* nothing playing and the tail has died away */
+        if (!g_cfg.reverb || r->idle >= r->tail || !g_s.track_on[r->track]) continue;   /* off, or nothing playing and the tail has died away */
         rv_process(r, out, frames);
         r->idle += frames;
     }

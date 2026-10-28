@@ -4,7 +4,7 @@
  *   AAC (MP4/M4A)  hardware (SceAudiodec AAC), raw access units, ADTS as a fallback
  *   WAV            PCM 8/16/24/32-bit, float
  *   OGG Vorbis     stb_vorbis
- *   AT3 / AT3plus  detected and refused: their decoder (SceAudiocodec) has no stubs in VitaSDK - see README
+ *   AT3 / AT3plus  hardware (SceAudiocodec; header and stub from DolceSDK in third_party/sce): .at3 (RIFF), .oma/.aa3
  * Everything is kept as 16-bit stereo at the source rate; only the time ranges the project uses are stored. */
 #include "common.h"
 #include "media.h"
@@ -19,6 +19,8 @@
 #include <psp2/atrac.h>
 #include <psp2/audiodec.h>
 #include <psp2/sysmodule.h>
+#include <psp2/kernel/sysmem.h>
+#include "../third_party/sce/audiocodec.h"
 
 #define DR_MP3_IMPLEMENTATION
 #define DR_MP3_NO_STDIO
@@ -43,6 +45,11 @@ struct AudioSrc {
     size_t mp3_start; int mp3_ver, mp3_layer; int64_t mp3_skip;
     /* MP4 */
     Mp4File mp4; int mp4_open;
+    /* ATRAC3 / ATRAC3plus (AF_AT3): frames of `block` bytes from data_off in buf */
+    int atx;                     /* 1 = ATRAC3plus */
+    uint32_t at3_param;          /* ATRAC3: sceAudiocodecGetAt3Config() */
+    uint8_t atx_p1, atx_p2;      /* ATRAC3plus: the two codec parameter bytes */
+    int64_t skip;                /* encoder delay to drop (frames) */
 };
 
 /* ------------------------------------------------------------------ PCM sink */
@@ -94,7 +101,7 @@ static int sink_done(const Sink *s) { return s->pos >= s->end; }
 
 /* ------------------------------------------------------------------ hardware decoder libraries */
 
-static int g_mp3_lib, g_aac_lib, g_atrac_mod;
+static int g_mp3_lib, g_aac_lib, g_atrac_mod, g_codec_mod;
 static Mutex g_at9_mtx = { -1 };   /* one SceAtrac decoder group at a time */
 
 void adec_global_init(void)
@@ -117,6 +124,11 @@ void adec_global_init(void)
     if (g_at9_mtx.id < 0) mutex_init(&g_at9_mtx, "vp_at9");
     g_atrac_mod = sceSysmoduleLoadModule(SCE_SYSMODULE_ATRAC) >= 0;
     if (!g_atrac_mod) LOG("adec: SceAtrac module failed to load");
+    /* ATRAC3 / ATRAC3plus: SceAudiocodec (the public module id first, then the internal one) */
+    int c1 = sceSysmoduleLoadModule(SCE_SYSMODULE_AUDIOCODEC), c2 = 0;
+    if (c1 < 0) c2 = sceSysmoduleLoadModuleInternal(SCE_SYSMODULE_INTERNAL_AUDIOCODEC);
+    g_codec_mod = c1 >= 0 || c2 >= 0;
+    if (!g_codec_mod) LOG("adec: SceAudiocodec module failed to load (0x%08X / 0x%08X)", c1, c2);
 }
 
 void adec_global_term(void)
@@ -253,6 +265,82 @@ static int wav_probe(AudioSrc *a, char *err, size_t errlen)
     return 0;
 }
 
+/* RIFF .at3: ATRAC3 (format 0x0270; coding mode in the extra data) or ATRAC3plus (WAVE_FORMAT_EXTENSIBLE with the
+ * AT3plus GUID; codec parameters at bytes 2-3 of the format-specific part). fact: samples, encoder delay. */
+static int at3_riff(AudioSrc *a, char *err, size_t errlen)
+{
+    const uint8_t *fmt = NULL, *fact = NULL;
+    uint32_t fmt_sz = 0, fact_sz = 0;
+    for (size_t q = 12; q + 8 <= a->len;) {
+        uint32_t sz = le32(a->buf + q + 4);
+        if (sz > a->len - q - 8) sz = (uint32_t)(a->len - q - 8);
+        if (!memcmp(a->buf + q, "fmt ", 4)) { fmt = a->buf + q + 8; fmt_sz = sz; }
+        else if (!memcmp(a->buf + q, "fact", 4)) { fact = a->buf + q + 8; fact_sz = sz; }
+        else if (!memcmp(a->buf + q, "data", 4)) { a->data_off = (int64_t)(q + 8); a->data_len = sz; break; }
+        q += 8 + sz + (sz & 1);
+    }
+    if (!fmt || fmt_sz < 16 || !a->data_off) { snprintf(err, errlen, "AT3 without fmt/data chunk"); return -1; }
+    int tag = le16(fmt);
+    a->ch = le16(fmt + 2); a->rate = (int)le32(fmt + 4); a->block = le16(fmt + 12);
+    if (tag == 0xFFFE && fmt_sz >= 44 && !memcmp(fmt + 24, AT3P_GUID, 16)) {
+        a->atx = 1;
+        a->atx_p1 = fmt[42]; a->atx_p2 = fmt[43];
+    } else if (tag == 0x0270 && fmt_sz >= 26) {
+        int js = le16(fmt + 24) != 0;   /* coding mode: 0 stereo, 1 joint stereo */
+        int r = a->ch == 1 ? sceAudiocodecGetAt3Config(2, (SceUInt32)a->block) : sceAudiocodecGetAt3Config(js, (SceUInt32)a->block / 2);
+        if (r < 0) { snprintf(err, errlen, "unsupported ATRAC3 bitrate (block %d, %d ch)", a->block, a->ch); return -1; }
+        a->at3_param = (uint32_t)r;
+    } else { snprintf(err, errlen, "unknown ATRAC3 variant"); return -1; }
+    if (a->block <= 0 || a->ch < 1 || a->ch > 2) { snprintf(err, errlen, "unsupported AT3 layout (%d ch, block %d)", a->ch, a->block); return -1; }
+    int spf = a->atx ? 2048 : 1024;
+    int64_t frames = a->data_len / a->block;
+    a->total = frames * spf;
+    if (fact && fact_sz >= 4) {
+        uint32_t n = le32(fact);
+        if (n > 0 && n <= (uint64_t)a->total) a->total = n;
+        if (fact_sz >= 8) { uint32_t d = le32(fact + 4); if (d < (uint32_t)(4 * spf)) a->skip = d; }
+    }
+    return 0;
+}
+
+/* .oma / .aa3 (PSP/Sony Music): an "ea3" ID3 tag, then a 96-byte "EA3" header: codec @32 (0 ATRAC3, 1 ATRAC3plus),
+ * 24-bit parameters @33, encryption id @6 (-1 / -128 = not encrypted); the frames follow. */
+static int at3_oma(AudioSrc *a, char *err, size_t errlen)
+{
+    size_t h = 0;
+    if (a->len >= 10 && !memcmp(a->buf, "ea3", 3)) {
+        size_t tag = (size_t)(a->buf[6] & 0x7f) << 21 | (size_t)(a->buf[7] & 0x7f) << 14 | (size_t)(a->buf[8] & 0x7f) << 7 | (a->buf[9] & 0x7f);
+        h = 10 + tag;
+    }
+    if (h + 96 > a->len || memcmp(a->buf + h, "EA3", 3)) { snprintf(err, errlen, "not an OMA/AA3 file"); return -1; }
+    const uint8_t *e = a->buf + h;
+    int eid = (int16_t)(e[6] << 8 | e[7]);
+    if (eid != -1 && eid != -128) { snprintf(err, errlen, "this OMA file is DRM-encrypted"); return -1; }
+    static const int SRATE[8] = { 32000, 44100, 48000, 88200, 96000, 0, 0, 0 };
+    uint32_t p = (uint32_t)e[33] << 16 | (uint32_t)e[34] << 8 | e[35];
+    a->rate = SRATE[(p >> 13) & 7];
+    if (e[32] == 0) {         /* ATRAC3 */
+        int js = (p >> 17) & 1;
+        a->ch = 2;
+        a->block = (int)(p & 0x3FF) * 8;
+        int r = sceAudiocodecGetAt3Config(js, (SceUInt32)a->block / 2);
+        if (r < 0) { snprintf(err, errlen, "unsupported ATRAC3 bitrate (block %d)", a->block); return -1; }
+        a->at3_param = (uint32_t)r;
+    } else if (e[32] == 1) {  /* ATRAC3plus */
+        static const int CH[8] = { 0, 1, 2, 3, 4, 6, 7, 8 };
+        a->atx = 1;
+        a->ch = CH[(p >> 10) & 7];
+        a->block = (int)(p & 0x3FF) * 8 + 8;
+        a->atx_p1 = e[34]; a->atx_p2 = e[35];
+        if (a->ch > 2) { snprintf(err, errlen, "%d-channel ATRAC3plus isn't supported", a->ch); return -1; }
+    } else { snprintf(err, errlen, "OMA codec %d isn't ATRAC3", e[32]); return -1; }
+    a->data_off = (int64_t)(h + 96);
+    a->data_len = (int64_t)(a->len - h - 96);
+    if (a->block <= 0 || a->ch < 1 || !a->rate) { snprintf(err, errlen, "bad OMA header"); return -1; }
+    a->total = a->data_len / a->block * (a->atx ? 2048 : 1024);
+    return 0;
+}
+
 int adec_open(const char *path, AudioSrc **out, char *err, size_t errlen)
 {
     AudioSrc *a = calloc(1, sizeof *a);
@@ -267,8 +355,11 @@ int adec_open(const char *path, AudioSrc **out, char *err, size_t errlen)
         a->f = f;
         if (wav_probe(a, err, errlen) < 0) goto fail;
         if (a->fmt == AF_AT3) {
-            snprintf(err, errlen, "ATRAC3/ATRAC3plus: no hardware decoder reachable with VitaSDK (convert to AT9)");
-            goto fail;
+            fclose(f); a->f = NULL;
+            a->buf = file_read_all(path, &a->len, 0);
+            if (!a->buf) { snprintf(err, errlen, "can't read the AT3 file"); goto fail; }
+            if (!g_codec_mod) { snprintf(err, errlen, "SceAudiocodec module unavailable"); goto fail; }
+            if (at3_riff(a, err, errlen) < 0) goto fail;
         }
         if (a->fmt == AF_AT9) {
             fclose(f); a->f = NULL;
@@ -284,10 +375,12 @@ int adec_open(const char *path, AudioSrc **out, char *err, size_t errlen)
             }
         }
     } else if ((got >= 3 && !memcmp(m, "ea3", 3)) || (got >= 3 && !memcmp(m, "EA3", 3))) {
-        snprintf(err, errlen, "OMA/AA3 (ATRAC3): no hardware decoder reachable with VitaSDK (convert to AT9)");
-        fclose(f);
-        free(a);
-        return -1;
+        fclose(f); f = NULL;
+        a->buf = file_read_all(path, &a->len, 0);
+        if (!a->buf) { snprintf(err, errlen, "can't read the file"); goto fail; }
+        if (!g_codec_mod) { snprintf(err, errlen, "SceAudiocodec module unavailable"); goto fail; }
+        if (at3_oma(a, err, errlen) < 0) goto fail;
+        a->fmt = AF_AT3;
     } else if (got >= 4 && !memcmp(m, "OggS", 4)) {
         fclose(f); f = NULL;
         a->buf = file_read_all(path, &a->len, 0);
@@ -338,6 +431,7 @@ const char *adec_codec_name(AudioSrc *a)
     case AF_MP3: return "MP3";
     case AF_OGG: return "Ogg Vorbis";
     case AF_AAC: return "AAC (hardware)";
+    case AF_AT3: return a->atx ? "AT3plus (hardware)" : "AT3 (hardware)";
     default: return "?";
     }
 }
@@ -529,6 +623,59 @@ static int dec_at9(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
     return result;
 }
 
+/* ATRAC3 / ATRAC3plus through SceAudiocodec, one frame per call. The work memory, the frame and the output live in one
+ * physically contiguous block (the codec hardware reads them directly, like the video decoder's buffers). */
+static int dec_at3(AudioSrc *a, Sink *s, volatile float *prog, volatile int *cancel, char *err, size_t errlen)
+{
+    SceUInt32 type = a->atx ? SCE_AUDIOCODEC_ATX : SCE_AUDIOCODEC_AT3;
+    SceAudiocodecCtrl ctrl;
+    memset(&ctrl, 0, sizeof ctrl);
+    if (a->atx) {
+        ctrl.unk_atx_0C = 1;
+        ctrl.atx.codecParam1 = a->atx_p1;
+        ctrl.atx.codecParam2 = a->atx_p2;
+        ctrl.atx.inputEsSize = (SceUInt32)a->block;
+    } else ctrl.at3.codecParam = a->at3_param;
+    ctrl.inputEsSize = (SceUInt32)a->block;
+    int r = sceAudiocodecQueryMemSize(&ctrl, type);
+    if (r < 0) { snprintf(err, errlen, "%s decoder size query failed (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
+    size_t work = ((size_t)ctrl.neededWorkMem + 255) & ~(size_t)255, esz = ((size_t)a->block + 255) & ~(size_t)255;
+    size_t pcmsz = 2048u * 2u * 2u * 2u;   /* generous: 2048 samples x 2 ch x 16-bit, doubled */
+    size_t total = (work + esz + pcmsz + 0xFFFFF) & ~(size_t)0xFFFFF;
+    SceUID blk = sceKernelAllocMemBlock("vp_atrac3", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, total, NULL);
+    if (blk < 0) { snprintf(err, errlen, "no memory for the AT3 decoder (0x%08X)", blk); return -1; }
+    uint8_t *base = NULL;
+    sceKernelGetMemBlockBase(blk, (void **)&base);
+    ctrl.pWorkMem = base;
+    r = sceAudiocodecInit(&ctrl, type);
+    if (r < 0) { sceKernelFreeMemBlock(blk); snprintf(err, errlen, "%s decoder init failed (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
+    uint8_t *es = base + work;
+    int16_t *pcm = (int16_t *)(base + work + esz);
+    int spf = a->atx ? 2048 : 1024;
+    SceSize ps = 0;
+    if (sceAudiocodecQueryPcmSize(&ctrl, type, &ps) >= 0 && ps >= 4 && ps <= pcmsz) spf = (int)(ps / 2 / (unsigned)a->ch);
+    int64_t frames = a->data_len / a->block, skip = a->skip, out = 0;
+    int errors = 0, ok = 0;
+    for (int64_t k = 0; k < frames && !sink_done(s) && !*cancel && out < a->total; k++) {
+        memcpy(es, a->buf + a->data_off + k * a->block, (size_t)a->block);
+        ctrl.pEs = es;
+        ctrl.inputEsSize = (SceUInt32)a->block;
+        ctrl.pPcm = pcm;
+        r = sceAudiocodecDecode(&ctrl, type);
+        if (r < 0) { if (errors++ < 4) LOG("adec: sceAudiocodecDecode 0x%08X (frame %d)", r, (int)k); memset(pcm, 0, (size_t)spf * 2 * a->ch); }
+        else ok++;
+        int n = spf, off = 0;
+        if (skip > 0) { int d = skip < n ? (int)skip : n; off = d; n -= d; skip -= d; }
+        if (out + n > a->total) n = (int)(a->total - out);
+        if (n > 0) { sink_put(s, pcm + off * a->ch, n, a->ch); out += n; }
+        if (prog) *prog = (float)s->pos / (float)(s->end ? s->end : 1);
+    }
+    sceKernelFreeMemBlock(blk);
+    if (!ok) { snprintf(err, errlen, "the %s decoder rejected this file (0x%08X)", a->atx ? "AT3plus" : "AT3", r); return -1; }
+    if (errors) LOG("adec: %d AT3 frames failed in %s", errors, a->path);
+    return 0;
+}
+
 static int dec_aac(AudioSrc *a, Sink *s, volatile float *prog, volatile int *cancel, char *err, size_t errlen)
 {
     if (!g_aac_lib) { snprintf(err, errlen, "AAC hardware decoder unavailable"); return -1; }
@@ -609,6 +756,7 @@ int adec_decode(AudioSrc *a, AudioCache *ac, const int64_t (*ranges)[2], int nr,
     case AF_OGG: r = dec_ogg(a, &s, prog, cancel); break;
     case AF_AT9: mutex_lock(&g_at9_mtx); r = dec_at9(a, &s, prog, cancel, err, errlen); mutex_unlock(&g_at9_mtx); break;
     case AF_AAC: r = dec_aac(a, &s, prog, cancel, err, errlen); break;
+    case AF_AT3: mutex_lock(&g_at9_mtx); r = dec_at3(a, &s, prog, cancel, err, errlen); mutex_unlock(&g_at9_mtx); break;
     case AF_MP3:
         r = dec_mp3_hw(a, &s, prog, cancel);
         if (r < 0) {

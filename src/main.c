@@ -545,7 +545,7 @@ static const int CACHE_OPTS[] = { 0, 64, 96, 128, 176, 224 };
 static void options_frame(void)
 {
     header("Options", "{LEFT}{RIGHT} change   {O} back");
-    char rows[10][160];
+    char rows[11][160];
     static const char *STR[] = { "as in the project", "None (resample)", "Classic", "elastique (WSOLA approx.)" };
     static const char *PSM[] = { "as in the project", "resample (speed + pitch)", "Classic (preserve duration)" };
     snprintf(rows[0], 160, "Audio stretch/pitch method:  %s", STR[g_cfg.force_stretch + 1]);
@@ -559,14 +559,15 @@ static void options_frame(void)
     snprintf(rows[7], 160, "Small-layer frame copies (more memory):  %s", g_cfg.small_copies ? "on" : "off");
     snprintf(rows[8], 160, "Track Motion shadow and glow:  %s", g_cfg.tm_fx ? "drawn" : "off");
     snprintf(rows[9], 160, "Glow effect:  %s", g_cfg.glow ? "drawn" : "off");
-    for (int i = 0; i < 10; i++) {
-        int y = 54 + i * 28;
-        if (i == g_osel) vita2d_draw_rectangle(10, y, SCREEN_W - 20, 26, COL_SEL);
-        text(24, y + 20, COL_TEXT, 0.9f, rows[i]);
+    snprintf(rows[10], 160, "Reverb (audio track FX):  %s", g_cfg.reverb ? "on" : "off");
+    for (int i = 0; i < 11; i++) {
+        int y = 54 + i * 26;
+        if (i == g_osel) vita2d_draw_rectangle(10, y, SCREEN_W - 20, 24, COL_SEL);
+        text(24, y + 18, COL_TEXT, 0.85f, rows[i]);
     }
     text(24, 350, COL_DIM, 0.8f, "The Vegas methods are reverse-engineered: if a project sounds wrong, try forcing them here.");
     text(24, 374, COL_DIM, 0.8f, "Audio changes apply immediately; the cache budget and frame copies at the next prepare.");
-    list_nav(&g_osel, 10, 10);
+    list_nav(&g_osel, 11, 11);
     int d = (g_repeat & SCE_CTRL_RIGHT) ? 1 : (g_repeat & SCE_CTRL_LEFT) ? -1 : (g_pressed & SCE_CTRL_CROSS) ? 1 : 0;
     if (d) {
         switch (g_osel) {
@@ -587,6 +588,7 @@ static void options_frame(void)
         case 7: g_cfg.small_copies ^= 1; g_s.prepared = 0; break;
         case 8: g_cfg.tm_fx ^= 1; break;
         case 9: g_cfg.glow ^= 1; break;
+        case 10: g_cfg.reverb ^= 1; mixer_reset(); break;
         }
         config_save();
         if (g_osel <= 2) mixer_reset();

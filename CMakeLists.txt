@@ -55,6 +55,7 @@ set_source_files_properties(${SHINE_SRC} PROPERTIES COMPILE_FLAGS "-marm -O3 -w"
 set_source_files_properties(src/adec.c src/image.c PROPERTIES COMPILE_FLAGS "-Wno-unused-function -Wno-unused-value -Wno-unused-but-set-variable -Wno-maybe-uninitialized -Wno-implicit-fallthrough")
 
 target_link_libraries(${PROJECT_NAME}
+  ${CMAKE_SOURCE_DIR}/third_party/sce/libSceAudiocodec_stub.a   # ATRAC3/ATRAC3plus (stub from DolceSDK)
   vita2d
   vitashark
   SceShaccCgExt

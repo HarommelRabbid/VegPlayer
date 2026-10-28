@@ -651,7 +651,7 @@ static int parse_afx_chain(St *s, const uint8_t *b, size_t bl, VegAfx **arr, int
             if (dl >= 0x28) {
                 int32_t rate = (int32_t)rd32(data + 0x1c), dep = (int32_t)rd32(data + 0x20);
                 if (rate >= 10 && rate <= 5000) a.rate_hz = rate / 100.0;
-                if (dep != 0 && dep >= -2400 && dep <= 2400) a.depth = fabs(dep) / 100.0;
+                if (dep != 0 && dep >= -2400 && dep <= 2400) a.depth = (dep < 0 ? -dep : dep) / 100.0;
             }
         } else if (is_rev && dl >= 44) {
             /* Sony Reverb, i32 params (guessed from scan.veg): dry out, reverb out, early out (centi-dB), -, mode,

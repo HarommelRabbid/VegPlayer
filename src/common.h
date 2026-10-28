@@ -58,6 +58,7 @@ typedef struct {
     int small_copies;         /* keep quarter-size frame copies for layers shown small (more memory) */
     int tm_fx;                /* draw Track Motion 2D Shadow / 2D Glow */
     int glow;                 /* draw the Glow video effect */
+    int reverb;               /* play the audio tracks' Reverb */
     char last_dir[512];
 } Config;
 extern Config g_cfg;

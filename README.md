@@ -60,14 +60,13 @@ Log: `ux0:data/vegplayer/log.txt`.
 | | AAC in MP4 / M4A | **hardware** (`sceAudiodec`) |
 | | MP3 | **hardware** (`sceAudiodec`); Layer I/II streams fall back to dr_mp3 |
 | | WAV (8/16/24/32-bit PCM, float), Ogg Vorbis | in code (stb_vorbis) |
-| | AT3 / AT3plus (`.at3`, `.oma`) | **detected and refused** — see below |
+| | AT3 / AT3plus (`.at3` RIFF, `.oma`/`.aa3` unencrypted) | **hardware** (`SceAudiocodec`) — see below |
 
-**About AT3.** The Vita does decode ATRAC3/ATRAC3plus in hardware, but through `SceAudiocodec`
-(`sceAudiocodecInit/Decode`, sysmodule `0x37`). VitaSDK has no header and no stubs for that library, and its NIDs and control-structure layout
-aren't documented anywhere VitaSDK-based code can use. Rather than add a software decoder, or guess a struct and
-risk crashing, AT3 files are recognised and reported as unsupported; converting them to AT9 works today. If you
-have the `SceAudiocodec` NIDs and `SceAudiocodecCtrl` layout (DolceSDK has them), `adec.c` is where an
-`AF_AT3` decoder would go: the RIFF/EA3 detection is already there.
+**About AT3.** ATRAC3/ATRAC3plus go through `SceAudiocodec` (sysmodule `0x37`, or the internal one). VitaSDK
+has no header or stub for it, so both come from DolceSDK (`third_party/sce`); the stub format is VitaSDK's, so it
+links unchanged. The decoder's work memory, frame and output buffers live in one physically contiguous block. The
+`fact` chunk's encoder delay is skipped; DRM-encrypted OMA files are refused. Not yet tested on hardware: if a file
+fails, the log has the SCE error code.
 
 Text and noise generators are skipped (as asked). Solid-colour generators are drawn.
 
@@ -101,13 +100,15 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   crossfades between overlapping events (dissolve).
 - **Audio pitch attribute** (Event Properties → Time stretch/pitch shift):
   - *None*: pitch follows the playback rate (plain resampling, cubic interpolation).
-  - *élastique*: WSOLA time-stretch/pitch-shift (grains aligned by cross-correlation). zplane's élastique is
-    proprietary, so this is an approximation.
+  - *élastique*: WSOLA time-stretch/pitch-shift (grains aligned by cross-correlation, to a fraction of a sample;
+    attacks are detected and played once from a single grain with a short crossfade, instead of being smeared or
+    doubled). zplane's élastique is proprietary, so this is an approximation. Measured with `tests/stretchq`: a pure
+    tone comes out about 78 dB clean (was 29–41 dB), clicks stay sharp and undoubled, at the same CPU cost.
   - *Classic*: granular overlap-add with a grain size per Classic mode (A01–A19) and a narrower alignment search.
 - **Pitch Shift plug-in**: *resample* (speed and pitch change together) and *Classic* (preserve duration).
 - **Vibrato plug-in** (Sony Vibrato): sine-modulated delay line with the project's rate and depth.
 - Event gain, audio track volume, fades, crossfades.
-- **Reverb** in an audio track's FX chain (Sony Reverb): a light per-track reverb (pre-delay, early reflections,
+- **Reverb** in an audio track's FX chain (Sony Reverb; Options can turn it off): a light per-track reverb (pre-delay, early reflections,
   damped tail) with the project's dry/reverb/early levels, decay time, pre-delay and high cut. Tracks without reverb
   cost nothing; a reverb stops processing once its tail has died away.
 

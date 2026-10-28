@@ -4,7 +4,7 @@
 VITAHEADERS ?= $(VITASDK)/arm-vita-eabi/include
 CFLAGS = -O2 -g -Wall -Wno-unused-parameter -Wno-unused-function -Wno-format-truncation -I../src
 
-all: vegdump mp4test mixtest mixbench reverbtest pipetest
+all: vegdump mp4test mixtest mixbench reverbtest pipetest stretchq
 
 vegdump: vegdump.c ../src/veg.c
 	$(CC) $(CFLAGS) $^ -lm -o $@
@@ -20,4 +20,7 @@ pipetest: pipetest.c ../src/veg.c ../src/mixer.c ../src/scale.c
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -idirafter $(VITAHEADERS) $^ -lm -o $@
 
 clean:
-	rm -f vegdump mp4test mixtest mixbench reverbtest pipetest fxpreview mix.raw
+	rm -f vegdump mp4test mixtest mixbench reverbtest pipetest fxpreview stretchq mix.raw
+
+stretchq: stretchq.c ../src/mixer.c
+	$(CC) $(CFLAGS) -idirafter $(VITAHEADERS) $^ -lm -o $@
