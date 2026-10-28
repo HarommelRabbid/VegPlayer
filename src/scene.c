@@ -438,12 +438,12 @@ static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, const G
     float rx = r / la, ry = r / lb;
     if (rx > 0.5f) rx = 0.5f;
     if (ry > 0.5f) ry = 0.5f;
-    float thr = 1.0f - 2.0f * (float)g->amount;
+    float thr = 1.0f - 2.0f * (float)g->amount;   /* the haze: only the brighter half of the picture */
     thr = thr < 0.05f ? 0.05f : thr > 0.9f ? 0.9f : thr;
     L->soft[0] = rx; L->soft[1] = ry; L->soft[2] = thr; L->soft[3] = 1.0f / (1.0f - thr);
     L->pass = PASS_GLOW;
     L->blend = BLEND_SCREEN;   /* bright parts get hazy instead of clipping to white (as in Vegas) */
-    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a * S->tint[3];   /* Screen takes premultiplied colour */
+    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c] * (float)g->a * S->tint[3] * 0.6f;   /* milder: the halo does most */
     L->tint[3] = S->tint[3];
     L->fx = 1;
     static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
@@ -454,6 +454,43 @@ static int glow_layer(const GpuLayer *S, const VegVfx *g, float frame_h, const G
         L->x[i] = x0 + u * ax + w * bx;
         L->y[i] = y0 + u * ay + w * by;
     }
+    return 1;
+}
+
+/* Glow halo for layer S: S's shape grown by 0.8 x the glow radius, its edge fading out over the radius (full light
+ * up to 0.3 radius past the picture, nothing past 1.3), in the glow colour x intensity, drawn just behind S. This is what Vegas's Glow
+ * mostly looks like on Sparta tiles: a soft light around each picture. */
+static int glow_halo(const GpuLayer *S, const VegVfx *g, float frame_h, const GpuImage *img, GpuLayer *L)
+{
+    if (S->pass == PASS_BLUR || S->blend != BLEND_NORMAL || S->tint[3] <= 0.002f) return 0;
+    float ax = S->x[1] - S->x[0], ay = S->y[1] - S->y[0], bx = S->x[2] - S->x[0], by = S->y[2] - S->y[0];
+    float la = hypotf(ax, ay), lb = hypotf(bx, by);
+    if (la < 2 || lb < 2) return 0;
+    float r = (float)g->amount * 0.2f * frame_h;
+    float gx = 0.8f * r / la, gy = 0.8f * r / lb;     /* growth, as a fraction of the picture */
+    memset(L, 0, sizeof *L);
+    /* the grown picture: P0' = P0 - gx A - gy B, A' = A (1 + 2 gx), B' = B (1 + 2 gy) */
+    float x0 = S->x[0] - gx * ax - gy * bx, y0 = S->y[0] - gx * ay - gy * by;
+    float Ax = ax * (1 + 2 * gx), Ay = ay * (1 + 2 * gx), Bx = bx * (1 + 2 * gy), By = by * (1 + 2 * gy);
+    float ex = 0.5f * r / hypotf(Ax, Ay), ey = 0.5f * r / hypotf(Bx, By);   /* ramp half-width in its texcoords */
+    if (ex < 1e-4f) ex = 1e-4f;
+    if (ey < 1e-4f) ey = 1e-4f;
+    static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
+    for (int i = 0; i < 4; i++) {
+        float u = CU[i] ? 1 + ex : -ex, w = CV[i] ? 1 + ey : -ey;
+        L->u[i] = u; L->v[i] = w;
+        L->x[i] = x0 + u * Ax + w * Bx;
+        L->y[i] = y0 + u * Ay + w * By;
+    }
+    L->soft[0] = 0.5f / ex; L->soft[1] = 0.5f / ey; L->soft[2] = ex; L->soft[3] = ey;
+    cm_identity(L->m); cm_identity(L->m2);
+    L->pass = PASS_SHADOW;
+    L->blend = BLEND_NORMAL;
+    L->tex = &img->tex;
+    L->fx = 1;
+    float in = (float)g->a;
+    for (int c = 0; c < 3; c++) L->tint[c] = g->color[c];
+    L->tint[3] = S->tint[3] * (in > 1 ? 1 : in);
     return 1;
 }
 
@@ -631,8 +668,18 @@ static void build(Scene *sc, int buf, double T)
                     sc->nshadow += nfx;
                 }
             }
+            /* Glow, part 1: a soft halo of the layer's shape behind it (the Track Motion glow's shader) */
+            if (ch.glow && g_cfg.glow && gpu_pass_ok(PASS_SHADOW) && sc->n + 2 < MAX_LAYERS) {
+                GpuLayer h;
+                if (glow_halo(&sc->layer[sc->n], ch.glow, g_vw * p->height / p->width, full, &h)) {
+                    sc->layer[sc->n + 1] = sc->layer[sc->n];
+                    sc->layer[sc->n] = h;
+                    sc->n++;
+                    sc->nglow++;
+                }
+            }
             sc->n++;
-            /* Glow: its light goes on top of the layer, added */
+            /* Glow, part 2: a mild haze of its bright parts on top (screened) */
             const GpuImage *gq = NULL;   /* the frame's quarter-size copy: already averaged, so the wide glow comes out smooth */
             if (ch.glow && vm->type == VEG_MEDIA_FILE && m->vc.imgq) {
                 int slot = (int)(full - m->vc.img);

@@ -88,10 +88,10 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
   (first keyframe; when the source has another shape, its moves are scaled with the rescaled layout so moved
   tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
-- **Glow** (the DXT Glow plug-in, still used by VEGAS 20): a wide, soft bloom from everything moderately bright,
-  screened on top in the glow colour (one extra draw per layer from the frame's quarter-size copy, which is made for
-  sources used with Glow; needs the shader compiler). Matched by eye to Vegas; how glow percent maps to the threshold
-  and radius is a guess. Options can turn it off.
+- **Glow** (the DXT Glow plug-in, still used by VEGAS 20): a soft halo of each picture's shape in the glow colour,
+  drawn behind it (the Track Motion glow's shader), plus a mild screened haze of the bright parts on top. Two extra
+  draws per layer; needs the shader compiler. Matched by eye to Vegas; the radius mapping is a guess. Options can turn
+  it off.
 - **VEGAS 20 effect names** (`com.vegascreativesoftware:*`): Channel Blend (OFX: per-channel weights and offsets,
   Normalize), Invert (`BlendAmount`), and the other OFX effects under their new prefix.
 - **Track Motion 2D Shadow and 2D Glow** (first keyframe): a soft copy of each layer's shape in the shadow/glow
