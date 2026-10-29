@@ -14,7 +14,6 @@
 #include "scene.h"
 #include "veg.h"
 #include "vexport.h"
-#include "encprobe.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -859,6 +858,8 @@ static const struct { int fmt, kbps; const char *label; } EXPORTS[] = {
     { EXPORT_MP3, 192, "MP3  192 kbps" },
     { EXPORT_MP3, 256, "MP3  256 kbps" },
     { EXPORT_MP3, 320, "MP3  320 kbps" },
+    { EXPORT_MP4 + 6, 0, "MP4  960 x 544, 6 Mbps  (Vita screen)" },
+    { EXPORT_MP4 + 7, 0, "MP4  848 x 480, 5 Mbps  (480p)" },
     { EXPORT_MP4 + 0, 0, "MP4  640 x 368, 2 Mbps" },
     { EXPORT_MP4 + 1, 0, "MP4  640 x 368, 1 Mbps" },
     { EXPORT_MP4 + 2, 0, "MP4  480 x 272, 2 Mbps  (PSP size)" },
@@ -913,21 +914,21 @@ static void export_frame(void)
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         return;
     }
-    header("Export", "{X} export   {T} encoder test   {O} back");
+    header("Export", "{X} export   {O} back");
     int vid = EXPORTS[g_esel].fmt >= EXPORT_MP4;
     if (vid) {
-        textf(40, 66, COL_DIM, 0.8f, "H.264 + AAC at 29.97 fps, made by the system's recorder; saved to ux0:data/vegplayer/vexports.");
+        textf(40, 66, COL_DIM, 0.8f, "H.264 + AAC at 29.97 fps; saved to ux0:data/vegplayer/vexports.");
         textf(40, 86, COL_DIM, 0.8f, "Rendered frame by frame, so it may take longer than the project. Track toggles and sliders apply.");
     } else {
         textf(40, 66, COL_DIM, 0.8f, "The mix as it plays: track toggles, track sliders and the master volume apply.");
         textf(40, 86, COL_DIM, 0.8f, "Saved to %s", export_dir());
     }
     for (int i = 0; i < n; i++) {
-        int y = 102 + i * 31;
-        if (i == g_esel) vita2d_draw_rectangle(30, y, SCREEN_W - 60, 28, COL_SEL);
-        text(50, y + 20, EXPORTS[i].fmt >= EXPORT_MP4 ? COL_ACCENT : COL_TEXT, 0.88f, EXPORTS[i].label);
+        int y = 100 + i * 27;
+        if (i == g_esel) vita2d_draw_rectangle(30, y, SCREEN_W - 60, 25, COL_SEL);
+        text(50, y + 18, EXPORTS[i].fmt >= EXPORT_MP4 ? COL_ACCENT : COL_TEXT, 0.88f, EXPORTS[i].label);
     }
-    if (!g_s.prepared) textf(40, 466, COL_WARN, 0.8f, "The sources are prepared first (as for playback).");
+    if (!g_s.prepared) textf(40, 470, COL_WARN, 0.8f, "The sources are prepared first (as for playback).");
     list_nav(&g_esel, n, n);
     if (g_pressed & SCE_CTRL_CROSS) {
         if (!g_s.prepared) { g_export_after_prepare = 1; prepare_start(); g_state = ST_PREPARE; return; }
@@ -937,12 +938,6 @@ static void export_frame(void)
             if (vexport_start(EXPORTS[g_esel].fmt - EXPORT_MP4) < 0) flash("%s", g_vexp.msg[0] ? g_vexp.msg : "Couldn't start the video export");
             else g_vexp_active = 1;
         } else if (export_start(EXPORTS[g_esel].fmt, EXPORTS[g_esel].kbps) < 0) flash("Couldn't start the export");
-    }
-    if (g_pressed & SCE_CTRL_TRIANGLE) {   /* hardware H.264 encoder test at 960x544; results in the log */
-        static char m[160];
-        audio_play(0);
-        encprobe_run(m, sizeof m);
-        flash("%s", m);
     }
     if (g_pressed & SCE_CTRL_CIRCLE) { g_export_after_prepare = 0; g_state = ST_PROJECT; }
 }

@@ -9,6 +9,7 @@
  * project's frame rate, and the sound is fed in 1024-frame blocks, kept just ahead of the picture. */
 #include "vexport.h"
 
+#include <malloc.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,8 @@
 #include <vita2d.h>
 
 #include "../third_party/sce/mp4rec.h"
+#include "encapi.h"
+#include "mp4mux.h"
 
 /* What the recorder needs, found by disassembling vs0:sys/external/libSceMp4Rec.suprx (FW 3.6x):
  *  - it imports memset/memcpy/mspace_create/mspace_malloc/... from SceLibc (vs0:sys/external/libc.suprx). SCE-SDK
@@ -46,6 +49,7 @@ static SceUID g_libc = -1;
 
 const VExportMode VEXPORT_MODES[VEXPORT_NMODES] = {
     { 640, 368, 2000 }, { 640, 368, 1000 }, { 480, 272, 2000 }, { 480, 272, 1000 }, { 368, 208, 2000 }, { 368, 208, 1000 },
+    { 960, 544, 6000 }, { 848, 480, 5000 },   /* our own encoder set-up (VEXPORT_DIRECT) */
 };
 
 VExport g_vexp;
@@ -85,6 +89,24 @@ static struct {
     volatile int err;              /* first recorder error (< 0) */
     volatile int err_video;
     volatile uint64_t t_vadd, t_audio, t_mix;
+    /* direct mode: the hardware encoder and the AAC encoder driven by us, our own MP4 writer */
+    int direct;
+    Block encmem, out, aacw;
+    SceUID ub;                     /* codec engine block over encmem */
+    uintptr_t m_lib, m_a, m_b;
+    int lib, enc_created;
+    AvcEncoder avc;
+    void *enc_work;
+    uint32_t stream_size;
+    uint8_t *au;                   /* one access unit, length-prefixed */
+    void *aac;                     /* AAC encoder handle */
+    uint8_t aacout[8192];
+    int aac_adts_logged;
+    Mp4Mux *mux;
+    char out_path[600];
+    int vout;                      /* access units written */
+    int64_t aframes;               /* AAC frames written */
+    volatile int ablocks_done;     /* direct: everything encoded and flushed */
 } X;
 
 static int mem_alloc(Block *b, const char *name, size_t size, unsigned type, size_t gran)
@@ -166,11 +188,41 @@ static void rgba_to_yvu420(const uint8_t *src, int stride_px, int w, int h, uint
     }
 }
 
+/* the hardware conversion through the encoder library (direct mode) */
+static int csc_direct(uint8_t *dst, void *src, int stride)
+{
+    EncPicture d, s;
+    memset(&d, 0, sizeof d); memset(&s, 0, sizeof s);
+    d.size = s.size = sizeof d;
+    d.pixelformat = ENC_PIXFMT_YUV420; d.pitch = (uint32_t)X.w; d.width = (uint32_t)X.w; d.height = (uint32_t)X.h;
+    d.buffer = dst; d.buffer2 = dst + (size_t)X.w * X.h;
+    s.pixelformat = ENC_PIXFMT_RGBA; s.pitch = (uint32_t)stride; s.width = (uint32_t)X.w; s.height = (uint32_t)X.h; s.buffer = src;
+    s.opt[1] = 1;   /* BT.601 */
+    return sceAvcencCsc(&d, &s);
+}
+
 static int convert(uint8_t *dst)
 {
     int w = X.w, h = X.h;
     int stride = (int)(vita2d_texture_get_stride(X.rt) / 4);
     uint8_t *src = vita2d_texture_get_datap(X.rt);
+    if (X.direct) {
+        if (X.csc_mode == 0) {
+            int r = csc_direct(dst, src, stride);
+            if (r >= 0) return 0;
+            LOG("vexport: sceAvcencCsc from the render target: 0x%08X - trying a contiguous copy", (unsigned)r);
+            X.csc_mode = 1;
+        }
+        if (X.csc_mode == 1) {
+            memcpy(X.stage, src, (size_t)stride * 4 * h);
+            int r = csc_direct(dst, X.stage, stride);
+            if (r >= 0) return 0;
+            LOG("vexport: sceAvcencCsc from a contiguous copy: 0x%08X - converting on the CPU", (unsigned)r);
+            X.csc_mode = 2;
+        }
+        rgba_to_yvu420(src, stride, w, h, dst);
+        return 0;
+    }
     SceMp4RecFrame d, s;
     memset(&d, 0, sizeof d); memset(&s, 0, sizeof s);
     d.size = sizeof d; d.pixelformat = SCE_MP4REC_PIXELFORMAT_YUV420_PACKED; d.stride = w; d.width = w; d.height = h; d.buffer = dst;
@@ -232,6 +284,30 @@ static int mix_thread(unsigned argc, void *argp)
     return 0;
 }
 
+/* direct mode: one AAC frame (or none, while the encoder fills up) to the file */
+static int aac_put(uint32_t n)
+{
+    if (!n) return 0;
+    const uint8_t *p = X.aacout;
+    if (n >= 7 && p[0] == 0xFF && (p[1] & 0xF0) == 0xF0) {   /* ADTS: drop the header */
+        uint32_t hl = (p[1] & 1) ? 7 : 9;
+        if (!X.aac_adts_logged) { X.aac_adts_logged = 1; LOG("vexport: the AAC encoder writes ADTS frames (header %u bytes)", hl); }
+        if (n <= hl) return 0;
+        p += hl; n -= hl;
+    }
+    X.aframes++;
+    return mux_audio(X.mux, p, n) < 0 ? -1 : 0;
+}
+
+static int aac_encode(const int16_t *pcm)
+{
+    uint32_t n = sizeof X.aacout;
+    int r = sceAacencInternalEncode(X.aac, pcm, AUD_FRAMES * 4, X.aacout, &n, 0);
+    if (r < 0) return r;
+    if (X.ablocks < 3) LOG("vexport: AAC block %lld: %u bytes out (%02X %02X)", (long long)X.ablocks, n, X.aacout[0], X.aacout[1]);
+    return aac_put(n);
+}
+
 /* hand over the next mixed sound block (waits for the mixer) */
 static int feed_audio_block(void)
 {
@@ -241,7 +317,7 @@ static int feed_audio_block(void)
         if (sceKernelWaitSema(X.sem_afull, 1, &to) >= 0) break;
     }
     uint64_t t = time_us();
-    int r = add_sample(0, X.aud[X.ablocks % NAUD], SCE_MP4REC_AUDIO_BUFFER_SIZE);
+    int r = X.direct ? aac_encode(X.aud[X.ablocks % NAUD]) : add_sample(0, X.aud[X.ablocks % NAUD], SCE_MP4REC_AUDIO_BUFFER_SIZE);
     X.t_audio += time_us() - t;
     if (r < 0) return r;
     X.ablocks++;
@@ -279,6 +355,102 @@ static int feeder_thread(unsigned argc, void *argp)
     return 0;
 }
 
+/* direct mode: the access units that came out of the encoder, to the file */
+static int enc_collect(EncStream *st, EncStreamArray *arr)
+{
+    if (!arr->count) return 0;
+    uint32_t len = 0;
+    int sync = st->pic_type == 4;
+    const uint8_t *sps = NULL, *pps = NULL; uint32_t sl = 0, pl = 0;
+    for (int k = 0; k < st->n_nal; k++) {
+        EncNal nal; memset(&nal, 0, sizeof nal);
+        int r = sceAvcencGetNalUnit(&X.avc, k, &nal);
+        if (r < 0) { LOG("vexport: sceAvcencGetNalUnit(%d): 0x%08X", k, (unsigned)r); return r; }
+        int type = nal.type & 31;
+        if (type == 7) { sps = nal.addr; sl = nal.size; continue; }
+        if (type == 8) { pps = nal.addr; pl = nal.size; continue; }
+        if (type == 9) continue;   /* access unit delimiter */
+        if (type == 5) sync = 1;
+        if (len + 4 + nal.size > X.stream_size + 4096) { LOG("vexport: access unit too big"); return -1; }
+        X.au[len] = (uint8_t)(nal.size >> 24); X.au[len + 1] = (uint8_t)(nal.size >> 16);
+        X.au[len + 2] = (uint8_t)(nal.size >> 8); X.au[len + 3] = (uint8_t)nal.size;
+        memcpy(X.au + len + 4, nal.addr, nal.size);
+        len += 4 + nal.size;
+    }
+    if (sps && pps) mux_set_avc_config(X.mux, sps, sl, pps, pl);
+    if (!len) return 0;
+    X.vout++;
+    return mux_video(X.mux, X.au, len, sync) < 0 ? -1 : 0;
+}
+
+/* direct mode: encode one frame (yuv) or, with yuv NULL, drain the encoder */
+static int enc_frame(uint8_t *yuv)
+{
+    EncStream st; EncStream *sp = &st;
+    EncStreamArray arr;
+    for (int rounds = 0; rounds < (yuv ? 1 : 8); rounds++) {
+        memset(&st, 0, sizeof st);
+        st.size = sizeof st; st.buf = X.out.p; st.buf_size = X.stream_size;
+        arr.count = 0; arr.max = 1; arr.streams = &sp;
+        int r;
+        if (yuv) {
+            EncPicture p; memset(&p, 0, sizeof p);
+            p.size = sizeof p; p.pixelformat = ENC_PIXFMT_YUV420; p.pitch = (uint32_t)X.w; p.width = (uint32_t)X.w; p.height = (uint32_t)X.h;
+            p.buffer = yuv; p.flags = 1;
+            r = sceAvcencEncode(&X.avc, &p, &arr);
+        } else r = sceAvcencEncodeStop(&X.avc, &arr);
+        if (r < 0) { LOG("vexport: sceAvcenc%s: 0x%08X", yuv ? "Encode" : "EncodeStop", (unsigned)r); return r; }
+        r = enc_collect(&st, &arr);
+        if (r < 0) return r;
+        if (!yuv && !arr.count) break;
+    }
+    return 0;
+}
+
+/* direct mode: like feeder_thread, but encoding ourselves. The encoder hands a frame's stream out one call later and
+ * may still read the previous picture, so a slot is released one frame late. */
+static int direct_thread(unsigned argc, void *argp)
+{
+    (void)argc; (void)argp;
+    int held = 0;
+    while (!X.quit) {
+        int k = X.vdone;
+        if (k >= g_vexp.nframes) {
+            int r = enc_frame(NULL);
+            if (held) { sceKernelSignalSema(X.sem_free, 1); held = 0; }
+            if (r < 0) { if (!X.err) { X.err = r; X.err_video = 1; } return 0; }
+            while (!X.quit && X.ablocks < X.ablocks_total) {
+                r = feed_audio_block();
+                if (r < 0) { if (!X.err) X.err = r; return 0; }
+            }
+            for (int i = 0; i < 8 && !X.quit; i++) {   /* the AAC encoder's last frames */
+                uint32_t n = sizeof X.aacout;
+                r = sceAacencInternalFlush(X.aac, X.aacout, &n, 0);
+                if (r < 0 || !n) break;
+                if (aac_put(n) < 0) { if (!X.err) X.err = -1; return 0; }
+            }
+            X.ablocks_done = 1;
+            break;
+        }
+        SceUInt to = 100000;
+        if (sceKernelWaitSema(X.sem_full, 1, &to) < 0) continue;
+        if (X.quit) break;
+        uint64_t t = time_us();
+        int r = enc_frame(X.yuv[k % NYUV]);
+        X.t_vadd += time_us() - t;
+        if (r < 0) { if (!X.err) { X.err = r; X.err_video = 1; } break; }
+        if (held) sceKernelSignalSema(X.sem_free, 1);
+        held = 1;
+        X.vdone = k + 1;
+        int64_t until = (int64_t)(k + 1) * 1001 * OUT_RATE;   /* x 30000 */
+        while (!X.quit && X.ablocks < X.ablocks_total && X.ablocks * AUD_FRAMES * 30000 < until) {
+            r = feed_audio_block();
+            if (r < 0) { if (!X.err) X.err = r; return 0; }
+        }
+    }
+    return 0;
+}
+
 static void threads_stop(void)
 {
     X.quit = 1;
@@ -302,9 +474,23 @@ static void cleanup(void)
         }
         X.inited = X.created = 0;
     }
+    if (X.mux) { mux_close(X.mux, 1); X.mux = NULL; }
+    if (X.enc_created) { LOG("vexport: sceAvcencDeleteEncoder: 0x%08X", (unsigned)sceAvcencDeleteEncoder(&X.avc)); X.enc_created = 0; }
+    if (X.lib) { LOG("vexport: sceVideoencTermLibrary: 0x%08X", (unsigned)sceVideoencTermLibrary(ENC_TYPE_AVC)); X.lib = 0; }
+    if (X.ub > 0) {
+        if (X.m_b) sceCodecEngineFreeMemoryFromUnmapMemBlock(X.ub, X.m_b);
+        if (X.m_a) sceCodecEngineFreeMemoryFromUnmapMemBlock(X.ub, X.m_a);
+        if (X.m_lib) sceCodecEngineFreeMemoryFromUnmapMemBlock(X.ub, X.m_lib);
+        sceCodecEngineCloseUnmapMemBlock(X.ub);
+        X.ub = 0; X.m_a = X.m_b = X.m_lib = 0;
+    }
+    if (X.aac) { sceAacencInternalDelete(X.aac); X.aac = NULL; }
+    free(X.enc_work); X.enc_work = NULL;
+    free(X.au); X.au = NULL;
     if (X.rt) { vita2d_wait_rendering_done(); vita2d_free_texture(X.rt); X.rt = NULL; }
     g_vexp.preview = NULL;
     mem_free(&X.work); mem_free(&X.enc); mem_free(&X.av); mem_free(&X.base);
+    mem_free(&X.encmem); mem_free(&X.out); mem_free(&X.aacw);
     free(X.mix); X.mix = NULL;
     vita2d_set_vblank_wait(1);
 }
@@ -312,6 +498,25 @@ static void cleanup(void)
 static void finish(int discard)
 {
     threads_stop();
+    if (X.direct) {
+        if (X.locked) { mixer_reset(); audio_unlock(); X.locked = 0; }
+        int r = -1;
+        if (X.mux) {
+            uint64_t t = time_us();
+            r = mux_close(X.mux, discard || g_vexp.failed);
+            X.mux = NULL;
+            LOG("vexport: %d video frames, %lld AAC frames written; file %s (%.1f s)", X.vout, (long long)X.aframes,
+                discard || g_vexp.failed ? "discarded" : r >= 0 ? "completed" : "FAILED", (time_us() - t) / 1e6);
+        }
+        cleanup();
+        if (!discard && !g_vexp.failed) {
+            if (r >= 0) snprintf(g_vexp.msg, sizeof g_vexp.msg, "Saved %s", X.out_path);
+            else { g_vexp.failed = 1; snprintf(g_vexp.msg, sizeof g_vexp.msg, "The video file couldn't be completed"); }
+        } else if (discard && !g_vexp.failed) snprintf(g_vexp.msg, sizeof g_vexp.msg, "Video export cancelled");
+        LOG("vexport: %s (%.1f s, %d frames)", g_vexp.msg, (time_us() - g_vexp.t0) / 1e6, g_vexp.frame);
+        g_vexp.running = 0;
+        return;
+    }
     if (X.inited) {
         SceMp4RecTermParam *tp = calloc(1, sizeof *tp);
         tp->size = sizeof *tp;
@@ -364,43 +569,8 @@ static int fail(const char *what, int code)
     return -1;
 }
 
-int vexport_start(int mode)
+static int recorder_setup(int mode)
 {
-    if (g_vexp.running || mode < 0 || mode >= VEXPORT_NMODES) return -1;
-    memset(&g_vexp, 0, sizeof g_vexp);
-    memset(&X, 0, sizeof X);
-    g_vexp.mode = mode;
-    g_vexp.t0 = time_us();
-    X.w = VEXPORT_MODES[mode].w; X.h = VEXPORT_MODES[mode].h;
-
-    if (g_libc < 0) {
-        /* the recorder links against SceLibc: it must be there before the recorder is loaded (imports resolve at
-         * load time). If the recorder got loaded without it (an earlier version), reload it. */
-        /* libc.suprx imports from libfios2.suprx (its file I/O): that goes first, else 0x8002D003 (no such library) */
-        static SceUID fios = -1;
-        if (fios < 0) {
-            fios = sceKernelLoadStartModule("vs0:sys/external/libfios2.suprx", 0, NULL, 0, NULL, NULL);
-            LOG("vexport: load SceFios2: 0x%08X", (unsigned)fios);
-        }
-        g_libc = sceKernelLoadStartModule("vs0:sys/external/libc.suprx", 0, NULL, 0, NULL, NULL);
-        LOG("vexport: load SceLibc: 0x%08X", (unsigned)g_libc);
-        if (g_libc < 0) return fail("Couldn't load the system's C library (needed by the recorder)", g_libc);
-        if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) == 0) {
-            int u = sceSysmoduleUnloadModule(SCE_SYSMODULE_MP4_RECORDER);
-            LOG("vexport: unload SceMp4Rec (loaded without SceLibc): 0x%08X", (unsigned)u);
-        }
-    }
-    if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) != 0) {
-        int r = sceSysmoduleLoadModule(SCE_SYSMODULE_MP4_RECORDER);
-        LOG("vexport: load SceMp4Rec module: 0x%08X", (unsigned)r);
-        if (r < 0) return fail("Couldn't load the system's MP4 recorder", r);
-    }
-    SceKernelFreeMemorySizeInfo fm;
-    memset(&fm, 0, sizeof fm);
-    fm.size = sizeof fm;
-    if (sceKernelGetFreeMemorySize(&fm) >= 0)
-        LOG("vexport: free memory: main %d KB, CDRAM %d KB, contiguous %d KB", fm.size_user >> 10, fm.size_cdram >> 10, fm.size_phycont >> 10);
-
     /* the recorder object's own memory: its size isn't documented, so grow it until the recorder accepts it */
     static const unsigned BASE_KB[] = { REC_HEAP >> 10, 8192 };
     int r = -1;
@@ -445,6 +615,153 @@ int vexport_start(int mode)
     }
     if (r < 0) { cleanup(); return fail("The MP4 recorder couldn't start", r); }
     X.inited = 1;
+    return 0;
+}
+
+/* our own set-up of the hardware H.264 encoder (sizes the recorder doesn't offer) and of the AAC encoder */
+static const uint8_t PRESET4[0x50] = {   /* the kernel's encoder preset 4 (see direct_setup) */
+    0x42, 0x1e, 0x01, 0x02, 0x80, 0x02, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00,
+    0x80, 0x02, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0x96, 0x98, 0x00,
+    0x00, 0x1b, 0xb7, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, 0x84, 0x1e, 0x00, 0x00, 0x9f, 0x24, 0x00, 0x00, 0xc2, 0x01, 0x00, 0x3a, 0x00, 0x00, 0x00,
+    0xa4, 0x0f, 0x00, 0x00, 0x80, 0xa9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+static void put32(uint8_t *b, int o, uint32_t v) { memcpy(b + o, &v, 4); }
+
+static int direct_setup(int mode)
+{
+    int w = X.w, h = X.h, r;
+    uint32_t bitrate = (uint32_t)VEXPORT_MODES[mode].kbps * 1000;
+    sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);   /* the encoder's user library lives in the same module */
+
+    /* The encoder's full settings (0x50 bytes), for the "Internal" calls: the plain calls take 0x34 bytes, check them
+     * against 720x480 and expand them into this form from one of four built-in presets; the Internal calls only hold
+     * the size to the library's (960x576). Bytes: 0 profile (Baseline), 1 level x 10, 3 = 2 (the stream carries
+     * SPS/PPS before each keyframe; the recorder's 0 leaves them out), 4 pitch, 8/12 size, 16/20 size checked against
+     * the library, 48 bitrate, 52 max bitrate, 56 w*h*3/8, 60 keyframe interval (58), 64/68 frame rate as
+     * time_scale / (2 * tick), 72..79 VUI colour description (BT.601). */
+    static const uint8_t VUI601[8] = { 0x01, 0x00, 0x02, 0x00, 0x01, 0x06, 0x06, 0x06 };
+    uint8_t full[0x50];
+    memcpy(full, PRESET4, sizeof full);
+    full[1] = 31;   /* level 3.1: 960x544 at 29.97 fps is past level 3.0 */
+    full[3] = 2;
+    put32(full, 4, (uint32_t)w); put32(full, 8, (uint32_t)w); put32(full, 12, (uint32_t)h);
+    put32(full, 16, (uint32_t)w); put32(full, 20, (uint32_t)h); put32(full, 24, 1);
+    put32(full, 48, bitrate); put32(full, 52, bitrate / 5 * 6);
+    put32(full, 56, (uint32_t)(w * h * 3 / 8));
+    put32(full, 64, 1001); put32(full, 68, 60000);   /* tick 1001, time scale 60000: 29.97 frames a second */
+    memcpy(full + 72, VUI601, 8);
+
+    EncLibInit li; memset(&li, 0, sizeof li);
+    li.size = 0x14; li.width = (uint32_t)w; li.height = (uint32_t)h; li.n_encoders = 1; li.n_unk = 1;
+    uint32_t lib_size = 0;
+    r = sceVideoencQueryMemSize(ENC_TYPE_AVC, NULL, &li, &lib_size);
+    EncMemOut mo; memset(&mo, 0, sizeof mo);
+    int r2 = r < 0 ? r : sceAvcencQueryEncoderMemSizeInternal(ENC_TYPE_AVC, full, &mo);
+    LOG("vexport: encoder %dx%d %u kbps: library %u KB (0x%08X), encoder %u + %u KB, stream %u KB (0x%08X)", w, h, bitrate / 1000,
+        lib_size >> 10, (unsigned)r, mo.mem_a >> 10, mo.mem_b >> 10, mo.stream_size >> 10, (unsigned)r2);
+    if (r < 0 || r2 < 0) return fail("The video encoder doesn't take this size", r < 0 ? r : r2);
+    const uint32_t A = 0x40000;
+    uint32_t total = (((lib_size + A - 1) & ~(A - 1)) + ((mo.mem_a + A - 1) & ~(A - 1)) + ((mo.mem_b + A - 1) & ~(A - 1)) + (1u << 20) + 0xFFFFF) & ~0xFFFFFu;
+    if (mem_alloc_phys(&X.encmem, "vp_enc", total) < 0)
+        return fail("Not enough memory for the video encoder - lower the frame cache budget in Options and prepare again", 0);
+    X.ub = sceCodecEngineOpenUnmapMemBlock(X.encmem.p, (SceSize)X.encmem.size);
+    if (X.ub < 0) { r = X.ub; X.ub = 0; cleanup(); return fail("The codec engine refused the encoder memory", r); }
+    X.m_lib = sceCodecEngineAllocMemoryFromUnmapMemBlock(X.ub, lib_size, A);
+    X.m_a = sceCodecEngineAllocMemoryFromUnmapMemBlock(X.ub, mo.mem_a, A);
+    X.m_b = sceCodecEngineAllocMemoryFromUnmapMemBlock(X.ub, mo.mem_b, A);
+    if (!X.m_lib || !X.m_a || !X.m_b) { cleanup(); return fail("Couldn't divide the encoder memory", 0); }
+    EncLibMem lm; memset(&lm, 0, sizeof lm);
+    lm.addr = (void *)X.m_lib; lm.size = lib_size;
+    r = sceVideoencInitLibraryWithUnmapMem(ENC_TYPE_AVC, &lm, NULL, &li);
+    LOG("vexport: sceVideoencInitLibraryWithUnmapMem: 0x%08X", (unsigned)r);
+    if (r < 0) { cleanup(); return fail("The video encoder library couldn't start", r); }
+    X.lib = 1;
+    X.enc_work = memalign(64, 0x400);
+    X.avc.mem_a = (void *)X.m_a; X.avc.mem_a_size = mo.mem_a;
+    X.avc.mem_b = (void *)X.m_b; X.avc.mem_b_size = mo.mem_b;
+    X.avc.work = X.enc_work; X.avc.work_size = 0x400;
+    r = X.enc_work ? sceAvcencCreateEncoderInternal(ENC_TYPE_AVC, &X.avc, full) : -1;
+    LOG("vexport: sceAvcencCreateEncoderInternal: 0x%08X", (unsigned)r);
+    if (r < 0) { cleanup(); return fail("The video encoder couldn't be created", r); }
+    X.enc_created = 1;
+    EncParam ep; memset(&ep, 0, sizeof ep); ep.r[3] = 0x1C;
+    r = sceAvcencSetEncoderParameter(&X.avc, &ep);
+    if (r < 0) LOG("vexport: sceAvcencSetEncoderParameter: 0x%08X", (unsigned)r);
+    X.stream_size = mo.stream_size ? mo.stream_size : 1u << 20;
+    X.au = malloc(X.stream_size + 4096);
+    if (!X.au || mem_alloc(&X.out, "vp_enc_out", X.stream_size, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 4096) < 0) {
+        cleanup(); return fail("Not enough memory for the encoder output", 0);
+    }
+
+    /* AAC, 48 kHz stereo 128 kbps, with the recorder's settings */
+    uint32_t aws = sceAacencInternalGetWorkSize(1);
+    if (mem_alloc(&X.aacw, "vp_aacenc", aws, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 4096) < 0) { cleanup(); return fail("Not enough memory for the sound encoder", 0); }
+    memset(X.aacw.p, 0, X.aacw.size);
+    r = sceAacencInternalCreate(&X.aac, X.aacw.p);
+    if (r < 0) { X.aac = NULL; cleanup(); return fail("The sound encoder couldn't be created", r); }
+    static const uint32_t P20[4] = { 0, 1, 1, 0 }, P24[2] = { 2, 2 };
+    AacencParam ap; memset(&ap, 0, sizeof ap);
+    ap.channels = 2; ap.sample_rate = OUT_RATE; ap.bitrate = 128000;
+    ap.r14 = 1; ap.r1c = 1; ap.p20 = P20; ap.p24 = P24; ap.r48 = 1; ap.r4c = 2; ap.r50 = 1;
+    r = sceAacencInternalSetParam(X.aac, &ap);
+    LOG("vexport: AAC encoder (work %u KB): 0x%08X", aws >> 10, (unsigned)r);
+    if (r < 0) { cleanup(); return fail("The sound encoder refused its settings", r); }
+
+    /* the file, named after the project */
+    char name[256];
+    const char *b = strrchr(g_s.veg_path, '/');
+    snprintf(name, sizeof name, "%s", b ? b + 1 : g_s.veg_path);
+    char *dot = strrchr(name, '.');
+    if (dot && dot != name) *dot = 0;
+    mkdir_p(VIDEO_DIR);
+    snprintf(X.out_path, sizeof X.out_path, VIDEO_DIR "/%s.mp4", name);
+    for (int k = 2; k < 100 && file_exists(X.out_path); k++) snprintf(X.out_path, sizeof X.out_path, VIDEO_DIR "/%s (%d).mp4", name, k);
+    X.mux = mux_open(X.out_path, w, h, 30000, 1001, OUT_RATE, 2);
+    if (!X.mux) { cleanup(); return fail("Couldn't create the video file", 0); }
+    LOG("vexport: writing %s", X.out_path);
+    return 0;
+}
+
+int vexport_start(int mode)
+{
+    if (g_vexp.running || mode < 0 || mode >= VEXPORT_NMODES) return -1;
+    memset(&g_vexp, 0, sizeof g_vexp);
+    memset(&X, 0, sizeof X);
+    g_vexp.mode = mode;
+    g_vexp.t0 = time_us();
+    X.w = VEXPORT_MODES[mode].w; X.h = VEXPORT_MODES[mode].h;
+
+    if (g_libc < 0) {
+        /* the recorder links against SceLibc: it must be there before the recorder is loaded (imports resolve at
+         * load time). If the recorder got loaded without it (an earlier version), reload it. */
+        /* libc.suprx imports from libfios2.suprx (its file I/O): that goes first, else 0x8002D003 (no such library) */
+        static SceUID fios = -1;
+        if (fios < 0) {
+            fios = sceKernelLoadStartModule("vs0:sys/external/libfios2.suprx", 0, NULL, 0, NULL, NULL);
+            LOG("vexport: load SceFios2: 0x%08X", (unsigned)fios);
+        }
+        g_libc = sceKernelLoadStartModule("vs0:sys/external/libc.suprx", 0, NULL, 0, NULL, NULL);
+        LOG("vexport: load SceLibc: 0x%08X", (unsigned)g_libc);
+        if (g_libc < 0) return fail("Couldn't load the system's C library (needed by the recorder)", g_libc);
+        if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) == 0) {
+            int u = sceSysmoduleUnloadModule(SCE_SYSMODULE_MP4_RECORDER);
+            LOG("vexport: unload SceMp4Rec (loaded without SceLibc): 0x%08X", (unsigned)u);
+        }
+    }
+    if (sceSysmoduleIsLoaded(SCE_SYSMODULE_MP4_RECORDER) != 0) {
+        int r = sceSysmoduleLoadModule(SCE_SYSMODULE_MP4_RECORDER);
+        LOG("vexport: load SceMp4Rec module: 0x%08X", (unsigned)r);
+        if (r < 0) return fail("Couldn't load the system's MP4 recorder", r);
+    }
+    SceKernelFreeMemorySizeInfo fm;
+    memset(&fm, 0, sizeof fm);
+    fm.size = sizeof fm;
+    if (sceKernelGetFreeMemorySize(&fm) >= 0)
+        LOG("vexport: free memory: main %d KB, CDRAM %d KB, contiguous %d KB", fm.size_user >> 10, fm.size_cdram >> 10, fm.size_phycont >> 10);
+
+    X.direct = mode >= VEXPORT_FIRST_DIRECT;
+    if ((X.direct ? direct_setup(mode) : recorder_setup(mode)) < 0) return -1;
 
     /* frame buffers: NV12 frames, an RGBA staging copy and the audio buffers, in one contiguous block */
     size_t yuv = ((size_t)X.w * X.h * 3 / 2 + 4095) & ~(size_t)4095;
@@ -463,10 +780,12 @@ int vexport_start(int mode)
     if (!X.rt || !X.mix) { finish(1); return fail("Not enough graphics memory for the video frame", 0); }
     g_vexp.preview = X.rt;
 
-    list_videos(REC_DIR, &X.before, &X.nbefore, 0);
     double dur = g_s.proj.duration;
-    if (dur > REC_MAX_S) { LOG("vexport: the recorder stops at 30 minutes: exporting the first 30"); dur = REC_MAX_S; }
-    if (dur < REC_MIN_S) dur = REC_MIN_S;   /* the recorder's minimum: the rest is silent black */
+    if (!X.direct) {
+        list_videos(REC_DIR, &X.before, &X.nbefore, 0);
+        if (dur > REC_MAX_S) { LOG("vexport: the recorder stops at 30 minutes: exporting the first 30"); dur = REC_MAX_S; }
+        if (dur < REC_MIN_S) dur = REC_MIN_S;   /* the recorder's minimum: the rest is silent black */
+    }
     g_vexp.nframes = (int)ceil(dur * 30000.0 / 1001.0 - 1e-6);
     if (g_vexp.nframes < 1) g_vexp.nframes = 1;
     X.ablocks_total = (int64_t)ceil(dur * OUT_RATE / AUD_FRAMES - 1e-6);
@@ -489,7 +808,7 @@ int vexport_start(int mode)
     X.sem_afree = sceKernelCreateSema("vp_mp4_afree", 0, NAUD, NAUD, NULL);
     X.sem_afull = sceKernelCreateSema("vp_mp4_afull", 0, 0, NAUD, NULL);
     /* big stacks: the recorder's encoders run on the calling thread (the AAC encoder overflowed 64 KB) */
-    X.th_v = thread_start("vp_mp4feed", feeder_thread, NULL, 0x10000100, 1024 * 1024, 0x40000);
+    X.th_v = thread_start("vp_mp4feed", X.direct ? direct_thread : feeder_thread, NULL, 0x10000100, 1024 * 1024, 0x40000);
     X.th_a = thread_start("vp_mp4mix", mix_thread, NULL, 0x10000100 + 2, 256 * 1024, 0x20000);
     if (X.sem_free < 0 || X.sem_full < 0 || X.sem_afree < 0 || X.sem_afull < 0 || X.th_v < 0 || X.th_a < 0) {
         finish(1);
@@ -562,13 +881,14 @@ void vexport_step(void)
     uint64_t start = time_us();
     while (time_us() - start < 50000) {
         if (X.err) {
-            fail(X.err_video ? "The recorder stopped taking frames" : "The recorder stopped taking sound", X.err);
+            if (X.direct) fail(X.err_video ? "The video encoder failed" : "The sound encoder or the file write failed", X.err);
+            else fail(X.err_video ? "The recorder stopped taking frames" : "The recorder stopped taking sound", X.err);
             stats_log();
             finish(1);
             return;
         }
         if (X.queued >= g_vexp.nframes) {   /* everything rendered: wait for the threads to hand it all over */
-            if (X.vdone >= g_vexp.nframes && X.ablocks >= X.ablocks_total) { stats_log(); finish(0); return; }
+            if (X.vdone >= g_vexp.nframes && X.ablocks >= X.ablocks_total && (!X.direct || X.ablocks_done)) { stats_log(); finish(0); return; }
             sleep_us(2000);
             continue;
         }

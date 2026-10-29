@@ -37,7 +37,7 @@ add_executable(${PROJECT_NAME}
   src/export.c
   src/pfs.c
   src/vexport.c
-  src/encprobe.c
+  src/mp4mux.c
   third_party/shine/bitstream.c
   third_party/shine/huffman.c
   third_party/shine/l3bitstream.c
@@ -81,6 +81,7 @@ target_link_libraries(${PROJECT_NAME}
   SceAudiodec_stub
   SceVideodec_stub
   SceAvcodecUser_stub
+  ${CMAKE_SOURCE_DIR}/third_party/sce/libSceAacenc_stub_weak.a   # AAC encoder (our stub, see third_party/sce)
   SceCodecEngine_stub
   SceAtrac_stub
   SceLibMp4Recorder_stub
