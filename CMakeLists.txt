@@ -37,8 +37,6 @@ add_executable(${PROJECT_NAME}
   src/export.c
   src/pfs.c
   src/vexport.c
-  src/vdec_sw.c
-  src/m4vprobe.c
   third_party/shine/bitstream.c
   third_party/shine/huffman.c
   third_party/shine/l3bitstream.c
@@ -55,13 +53,10 @@ file(GLOB SHINE_SRC third_party/shine/*.c)
 set_source_files_properties(${SHINE_SRC} PROPERTIES COMPILE_FLAGS "-marm -O3 -w")
 
 # third_party/*.h and stb_vorbis.c are compiled through image.c / adec.c
-set_source_files_properties(src/vdec_sw.c PROPERTIES INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/third_party/ffmpeg/include)
 set_source_files_properties(src/adec.c src/image.c PROPERTIES COMPILE_FLAGS "-Wno-unused-function -Wno-unused-value -Wno-unused-but-set-variable -Wno-maybe-uninitialized -Wno-implicit-fallthrough")
 
 target_link_libraries(${PROJECT_NAME}
   ${CMAKE_SOURCE_DIR}/third_party/sce/libSceAudiocodec_stub.a   # ATRAC3/ATRAC3plus (stub from DolceSDK)
-  ${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib/libavcodec.a       # MPEG-4 Part 2 video only (see third_party/ffmpeg/README.md)
-  ${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib/libavutil.a
   vita2d
   vitashark
   SceShaccCgExt

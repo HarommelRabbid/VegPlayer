@@ -268,10 +268,8 @@ static int video_worker(unsigned argc, void *argp)
         set_line("Decoding pictures of %s", vm->name);
         char err[128] = "";
         if (vj->mp4_ok) {
-            int m4v = vj->mp4.video.codec == 0x6D703476u;   /* 'mp4v': MPEG-4 Part 2, decoded in software */
-            int ok = m4v ? vdec_fill_cache_sw(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err)
-                         : vdec_fill_cache(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err);
-            if (ok == 0) {
+            int m4v = vj->mp4.video.codec == 0x6D703476u;   /* 'mp4v': MPEG-4 Part 2 */
+            if (vdec_fill_cache(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err) == 0) {
                 /* frames that failed: point them at the nearest decoded neighbour */
                 VideoCache *vc = &m->vc;
                 int last = -1;
@@ -426,7 +424,7 @@ int prepare_start(void)
     free(g_vjobs);
     g_vjobs = calloc((size_t)(p->nmedia ? p->nmedia : 1), sizeof(VJob));
     g_nvjobs = 0;
-    int max_w = 0, max_h = 0, max_refs = 2, navc = 0;
+    int max_w = 0, max_h = 0, max_refs = 2, nm4v = 0;
     double need_bytes4 = 0;     /* bytes at full (screen-capped) size, RGBA */
     int max_cw[64] = { 0 };
     (void)max_cw;
@@ -449,7 +447,6 @@ int prepare_start(void)
         }
         vj->mp4_ok = 1;
         Mp4Track *t = &vj->mp4.video;
-        if (t->codec == 0x6D703476u) { void m4v_probe(int w, int h); m4v_probe(t->width, t->height); }   /* TEMPORARY research */
         VideoCache *vc = &m->vc;
         vc->nframes = (int)t->n;
         vc->pts = malloc(sizeof(float) * t->n);
@@ -486,20 +483,17 @@ int prepare_start(void)
         double s = MIN(1.0, MIN((double)SCREEN_W / t->width, (double)SCREEN_H / t->height));
         vj->cw = MAX(16, (int)(t->width * s)); vj->ch = MAX(16, (int)(t->height * s));
         need_bytes4 += (double)vj->nneed * (((vj->cw + 7) & ~7) * vj->ch + (g_s.m[vj->media].vc.want_q ? ((QUARTER(vj->cw) + 7) & ~7) * QUARTER(vj->ch) : 0)) * 4;
-        if (t->codec != 0x6D703476u) {   /* the hardware H.264 decoder is sized for the H.264 sources only */
-            max_w = MAX(max_w, t->width); max_h = MAX(max_h, t->height);
-            if (t->max_ref_frames + 1 > max_refs) max_refs = t->max_ref_frames + 1;
-            navc++;
-        }
+        max_w = MAX(max_w, t->width); max_h = MAX(max_h, t->height);
+        if (t->max_ref_frames + 1 > max_refs) max_refs = t->max_ref_frames + 1;
+        if (t->codec == 0x6D703476u) nm4v++;
         LOG("%s: %dx%d, %u frames, %.2f s, %d needed, refs %d", vm->name, t->width, t->height, t->n, vc->duration, vj->nneed, t->max_ref_frames);
         g_nvjobs++;
     }
     if (max_refs > 16) max_refs = 16;
 
     /* 2. the hardware decoder's memory first (physically contiguous), then the frame-cache arenas */
-    if (navc && vdec_global_init(max_w, max_h, max_refs) < 0) {
+    if (g_nvjobs && vdec_global_init(max_w, max_h, max_refs, nm4v > 0) < 0) {
         for (int j = 0; j < g_nvjobs; j++) {
-            if (g_vjobs[j].mp4.video.codec == 0x6D703476u) continue;
             snprintf(g_s.m[g_vjobs[j].media].vmsg, sizeof g_s.m[0].vmsg, "video: hardware decoder unavailable (%dx%d, see log)", max_w, max_h);
             mp4_close(&g_vjobs[j].mp4); g_vjobs[j].mp4_ok = 0;
             g_vjobs[j].nneed = 0;

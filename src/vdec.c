@@ -1,4 +1,8 @@
-/* vdec.c - H.264 through the Vita's hardware decoder (sceAvcdec) into the frame cache.
+/* vdec.c - H.264 (sceAvcdec) and MPEG-4 Part 2 (sceM4vdec) through the Vita's hardware decoders into the frame cache.
+ *
+ * sceM4vdec isn't in any SDK header. Found so far (probing on hardware): its codec type is 0x1002, and its decoder
+ * size query takes the same {width, height, refs} struct as AVC's (320x240 -> 256 KB, 720x480 -> 1280 KB). The rest
+ * of its interface is assumed to mirror sceAvcdec (same wrappers, same module) and every step is logged.
  *
  * Only the frames the project actually shows are kept (Sparta remixes reuse a few seconds of a source thousands
  * of times), so playback never has to seek a decoder: every visible frame is already a GPU texture.
@@ -19,6 +23,23 @@
 
 /* in the SceVideodec stub but not in vita-headers' videodec.h */
 int sceAvcdecDecodeStop(const SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *array_picture);
+/* MPEG-4 Part 2: prototypes modelled on the AVC twins */
+int sceM4vdecQueryDecoderMemSize(uint32_t type, const SceAvcdecQueryDecoderInfo *q, SceAvcdecDecoderInfo *info);
+int sceM4vdecCreateDecoder(uint32_t type, SceAvcdecCtrl *ctrl, const SceAvcdecQueryDecoderInfo *q);
+int sceM4vdecDeleteDecoder(SceAvcdecCtrl *ctrl);
+int sceM4vdecDecode(const SceAvcdecCtrl *ctrl, const SceAvcdecAu *au, SceAvcdecArrayPicture *pics);
+int sceM4vdecDecodeStop(const SceAvcdecCtrl *ctrl, SceAvcdecArrayPicture *pics);
+#define TYPE_M4V 0x1002u
+
+typedef struct {
+    const char *name;
+    uint32_t type;
+    int (*del)(SceAvcdecCtrl *);
+    int (*decode)(const SceAvcdecCtrl *, const SceAvcdecAu *, SceAvcdecArrayPicture *);
+    int (*stop)(const SceAvcdecCtrl *, SceAvcdecArrayPicture *);
+} Codec;
+static const Codec AVC = { "H.264", SCE_VIDEODEC_TYPE_HW_AVCDEC, sceAvcdecDeleteDecoder, sceAvcdecDecode, sceAvcdecDecodeStop };
+static const Codec M4V = { "MPEG-4", TYPE_M4V, sceM4vdecDeleteDecoder, sceM4vdecDecode, sceM4vdecDecodeStop };
 
 #define ALIGN16(x) (((x) + 15) & ~15)
 #define ALIGN_MB(x) (((x) + 0xFFFFF) & ~0xFFFFF)
@@ -31,7 +52,23 @@ static SceUID g_dec_mem = -1, g_pic_mem = -1;
 static void *g_dec_base; static uint8_t *g_pic_base;
 static size_t g_dec_size;
 
-int vdec_global_init(int max_w, int max_h, int max_refs)
+static int g_m4v_inited;
+
+/* the MPEG-4 library set-up: its init struct isn't known, so a few shapes are tried (each logged); the decoder may
+ * also work with only the AVC library set up */
+static void m4v_lib_init(int w, int h)
+{
+    uint32_t W = (uint32_t)ALIGN16(w), H = (uint32_t)ALIGN16(h);
+    uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x10, W, H, 2 }, { 0x0C, W, H }, { 0x14, W, H, 1, 1 },
+                        { 0x18, W, H, 2, 1 }, { 0x1C, W, H, 2, 1 }, { 0x20, W, H, 2, 1 }, { 0x08, 1 }, { 0x14, 1, W, H, 2 } };
+    for (size_t i = 0; i < sizeof v / sizeof *v; i++) {
+        int r = sceVideodecInitLibrary(TYPE_M4V, (const SceVideodecQueryInitInfo *)v[i]);
+        LOG("vdec: sceVideodecInitLibrary(MPEG-4, shape %d: size 0x%X): 0x%08X", (int)i, (unsigned)v[i][0], (unsigned)r);
+        if (r >= 0) { g_m4v_inited = 1; return; }
+    }
+}
+
+int vdec_global_init(int max_w, int max_h, int max_refs, int with_m4v)
 {
     if (g_vdec_inited) return 0;
     sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);   /* not required on every firmware; harmless */
@@ -66,6 +103,7 @@ int vdec_global_init(int max_w, int max_h, int max_refs)
     sceKernelGetMemBlockBase(g_dec_mem, &g_dec_base);
     sceKernelGetMemBlockBase(g_pic_mem, (void **)&g_pic_base);
     LOG("vdec: hardware AVC decoder ready (%dx%d, %d refs, %u KB)", g_max_w, g_max_h, max_refs, (unsigned)(g_dec_size >> 10));
+    if (with_m4v && !g_m4v_inited) m4v_lib_init(max_w, max_h);
     return 0;
 }
 
@@ -74,13 +112,17 @@ void vdec_global_term(void)
     if (g_dec_mem >= 0) sceKernelFreeMemBlock(g_dec_mem);
     if (g_pic_mem >= 0) sceKernelFreeMemBlock(g_pic_mem);
     g_dec_mem = g_pic_mem = -1;
+    if (g_m4v_inited) sceVideodecTermLibrary(TYPE_M4V);
+    g_m4v_inited = 0;
     if (!g_vdec_inited) return;
     sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
     g_vdec_inited = 0;
 }
 
 typedef struct {
+    const Codec *codec;
     SceAvcdecCtrl ctrl;
+    SceUID m4v_mem;         /* MPEG-4: its own decoder memory */
     uint8_t *pic;           /* RGBA8888 output picture (physically contiguous, uncached) */
     int pitch, fw, fh;      /* picture buffer pitch / size in pixels */
     int created;
@@ -89,23 +131,43 @@ typedef struct {
 
 static void dec_destroy(Dec *d)
 {
-    if (d->created) sceAvcdecDeleteDecoder(&d->ctrl);
+    if (d->created) d->codec->del(&d->ctrl);
     d->created = 0;
+    if (d->m4v_mem > 0) sceKernelFreeMemBlock(d->m4v_mem);
+    d->m4v_mem = 0;
 }
 
-static int dec_create(Dec *d, int w, int h, int refs, char *err, size_t errlen)
+static int dec_create(Dec *d, const Codec *codec, int w, int h, int refs, char *err, size_t errlen)
 {
     memset(d, 0, sizeof *d);
+    d->codec = codec;
     if (g_dec_mem < 0) { snprintf(err, errlen, "hardware decoder not initialised"); return -1; }
     SceAvcdecQueryDecoderInfo q;
     memset(&q, 0, sizeof q);
     q.horizontal = (uint32_t)ALIGN16(w);
     q.vertical = (uint32_t)ALIGN16(h);
     q.numOfRefFrames = (uint32_t)refs;
-    d->ctrl.frameBuf.pBuf = g_dec_base;
-    d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
-    int r = sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &d->ctrl, &q);
-    if (r < 0) { snprintf(err, errlen, "H.264 decoder creation failed (0x%08X)", r); return -1; }
+    int r;
+    if (codec == &M4V) {
+        SceAvcdecDecoderInfo info;
+        memset(&info, 0, sizeof info);
+        r = sceM4vdecQueryDecoderMemSize(TYPE_M4V, &q, &info);
+        if (r < 0) { snprintf(err, errlen, "MPEG-4 decoder size query failed (0x%08X)", r); return -1; }
+        size_t sz = ALIGN_MB(info.frameMemSize);
+        d->m4v_mem = sceKernelAllocMemBlock("vp_m4vdec", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, sz, NULL);
+        if (d->m4v_mem < 0) { snprintf(err, errlen, "no contiguous memory for the MPEG-4 decoder (0x%08X)", d->m4v_mem); d->m4v_mem = 0; return -1; }
+        void *base = NULL;
+        sceKernelGetMemBlockBase(d->m4v_mem, &base);
+        d->ctrl.frameBuf.pBuf = base;
+        d->ctrl.frameBuf.size = (uint32_t)sz;
+        r = sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q);
+        LOG("vdec: sceM4vdecCreateDecoder(%dx%d, %u KB): 0x%08X, handle 0x%08X", w, h, (unsigned)(sz >> 10), (unsigned)r, (unsigned)d->ctrl.handle);
+    } else {
+        d->ctrl.frameBuf.pBuf = g_dec_base;
+        d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
+        r = sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &d->ctrl, &q);
+    }
+    if (r < 0) { snprintf(err, errlen, "%s decoder creation failed (0x%08X)", codec->name, r); dec_destroy(d); return -1; }
     d->created = 1;
     d->pitch = ALIGN16(w); d->fw = ALIGN16(w); d->fh = ALIGN16(h);
     d->pic = g_pic_base;
@@ -137,6 +199,7 @@ typedef struct {
     uint8_t *scratch;
     int src_w, src_h;
     int produced;
+    int logged_m4v;
 } Ctx;
 
 static void pending_add(Ctx *c, int k)
@@ -174,24 +237,26 @@ static void drain(Ctx *c, Dec *d)
         SceAvcdecPicture pic, *pp;
         SceAvcdecArrayPicture arr;
         pic_setup(d, &pic, &pp, &arr);
-        int r = sceAvcdecDecodeStop(&d->ctrl, &arr);
+        int r = d->codec->stop(&d->ctrl, &arr);
         if (r < 0 || arr.numOfOutput == 0) break;
         got_picture(c, d, &pic);
     }
     c->npending = 0;
     int w = d->w, h = d->h, refs = d->refs;
+    const Codec *codec = d->codec;
     char err[96];
     dec_destroy(d);
-    if (dec_create(d, w, h, refs, err, sizeof err) < 0) LOG("vdec: re-create failed: %s", err);
+    if (dec_create(d, codec, w, h, refs, err, sizeof err) < 0) LOG("vdec: re-create failed: %s", err);
 }
 
 int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen)
 {
     Mp4Track *t = &mf->video;
+    const Codec *codec = t->codec == 0x6D703476u ? &M4V : &AVC;   /* 'mp4v' */
     int w = t->width, h = t->height;
     if (w <= 0 || h <= 0) { snprintf(err, errlen, "bad video size"); return -1; }
     if (ALIGN16(w) > g_max_w || ALIGN16(h) > g_max_h) {
-        snprintf(err, errlen, "%dx%d is above the hardware decoder limit (%dx%d)", w, h, g_max_w, g_max_h);
+        snprintf(err, errlen, "%dx%d is above the hardware decoder's set-up size (%dx%d)", w, h, g_max_w, g_max_h);
         return -1;
     }
     /* display order <-> decode order */
@@ -219,8 +284,9 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
 
     int refs = t->max_ref_frames > 0 ? t->max_ref_frames + 1 : g_max_refs;
     if (refs > g_max_refs) refs = g_max_refs;
+    if (codec == &M4V) refs = 2;   /* I/P (and B) pictures: two references */
     Dec d;
-    if (dec_create(&d, w, h, refs, err, errlen) < 0) {
+    if (dec_create(&d, codec, w, h, refs, err, errlen) < 0) {
         free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
         return -1;
     }
@@ -247,7 +313,14 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
         while (pos < n && !*cancel) {
             if (t->s[pos].size > (2u << 20) - 1024) { pos++; continue; }
             if (mp4_read_sample(mf, t, (uint32_t)pos, raw) < 0) { errors++; pos++; continue; }
-            int len = mp4_avcc_to_annexb(t, raw, t->s[pos].size, es, 2u << 20, t->s[pos].sync);
+            int len;
+            if (codec == &M4V) {   /* elementary stream as is; the VOS/VOL headers (esds) before each keyframe */
+                uint32_t hl = t->s[pos].sync && t->dsi_len > 0 ? (uint32_t)t->dsi_len : 0;
+                if (hl + t->s[pos].size > (2u << 20)) { pos++; continue; }
+                if (hl) memcpy(es, t->dsi, hl);
+                memcpy(es + hl, raw, t->s[pos].size);
+                len = (int)(hl + t->s[pos].size);
+            } else len = mp4_avcc_to_annexb(t, raw, t->s[pos].size, es, 2u << 20, t->s[pos].sync);
             if (len <= 0) { pos++; continue; }
             SceAvcdecAu au;
             memset(&au, 0, sizeof au);
@@ -258,10 +331,14 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
             SceAvcdecArrayPicture arr;
             pic_setup(&d, &pic, &pp, &arr);
             pending_add(&c, disp_of[pos]);
-            int r = sceAvcdecDecode(&d.ctrl, &au, &arr);
+            int r = codec->decode(&d.ctrl, &au, &arr);
+            if (codec == &M4V && c.logged_m4v < 3) {
+                c.logged_m4v++;
+                LOG("vdec: sceM4vdecDecode(sample %d, %d bytes): 0x%08X, %u picture(s) out", pos, len, (unsigned)r, (unsigned)arr.numOfOutput);
+            }
             if (r < 0) {
                 errors++;
-                if (errors < 8) LOG("vdec: decode error 0x%08X at sample %d", r, pos);
+                if (errors < 8) LOG("vdec: %s decode error 0x%08X at sample %d", codec->name, r, pos);
                 c.npending--;   /* this AU produced nothing and never will */
             } else if (arr.numOfOutput) got_picture(&c, &d, &pic);
             if (pos == st) fed_target = 1;
@@ -281,7 +358,7 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
     }
     drain(&c, &d);
     dec_destroy(&d);
-    LOG("vdec: kept %d of %d needed frames (%d errors)", c.produced, total_need, errors);
+    LOG("vdec: %s: kept %d of %d needed frames (%d errors)", codec->name, c.produced, total_need, errors);
     free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
     if (!c.produced && result == 0) { snprintf(err, errlen, "no frames could be decoded"); result = -1; }
     return result;

@@ -69,14 +69,12 @@ void prepare_finish(void);                             /* joins them (after g_pr
 void session_free_caches(void);
 
 /* ---- decoders */
-/* video: hardware H.264 (sceAvcdec) into the frame cache. need[k] = 1 for display frames to keep. */
-int vdec_global_init(int max_w, int max_h, int max_refs);
+/* video: hardware H.264 (sceAvcdec) / MPEG-4 Part 2 (sceM4vdec) into the frame cache. need[k] = 1 for display frames
+ * to keep. with_m4v: also set up the MPEG-4 decoder library. */
+int vdec_global_init(int max_w, int max_h, int max_refs, int with_m4v);
 void vdec_global_term(void);
 struct Mp4File;
 int vdec_fill_cache(struct Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen);
-
-/* video: MPEG-4 Part 2 (mp4v) in software (FFmpeg's decoder), same contract as vdec_fill_cache */
-int vdec_fill_cache_sw(struct Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen);
 
 /* audio: decode into PCM segments covering `ranges` (source frames, sorted, disjoint) */
 typedef struct AudioSrc AudioSrc;
