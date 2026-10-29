@@ -54,17 +54,35 @@ static size_t g_dec_size;
 
 static int g_m4v_inited;
 
-/* the MPEG-4 library set-up: its init struct isn't known, so a few shapes are tried (each logged); the decoder may
- * also work with only the AVC library set up */
+/* the MPEG-4 library set-up. sceVideodecInitLibrary refuses type 0x1002 with every struct shape tried (0x80620802,
+ * the same answer it gives for nonexistent types: games may only get AVC through it), and the decoder then says
+ * "not initialised" (0x8062090C). So the Internal and Nongameapp variants are tried too (prototypes assumed to match
+ * the public one), each with a few shapes; every result is logged. */
+int sceVideodecInitLibraryInternal(uint32_t type, const void *init);
+int sceVideodecInitLibraryNongameapp(uint32_t type, const void *init);
+int sceVideodecQueryMemSizeInternal(uint32_t type, const void *init, void *mem);
+int sceVideodecQueryMemSizeNongameapp(uint32_t type, const void *init, void *mem);
+
 static void m4v_lib_init(int w, int h)
 {
     uint32_t W = (uint32_t)ALIGN16(w), H = (uint32_t)ALIGN16(h);
-    uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x10, W, H, 2 }, { 0x0C, W, H }, { 0x14, W, H, 1, 1 },
-                        { 0x18, W, H, 2, 1 }, { 0x1C, W, H, 2, 1 }, { 0x20, W, H, 2, 1 }, { 0x08, 1 }, { 0x14, 1, W, H, 2 } };
-    for (size_t i = 0; i < sizeof v / sizeof *v; i++) {
-        int r = sceVideodecInitLibrary(TYPE_M4V, (void *)v[i]);
-        LOG("vdec: sceVideodecInitLibrary(MPEG-4, shape %d: size 0x%X): 0x%08X", (int)i, (unsigned)v[i][0], (unsigned)r);
-        if (r >= 0) { g_m4v_inited = 1; return; }
+    uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x14, W, H, 0, 1 }, { 0x20, W, H, 2, 1 } };
+    const int nv = (int)(sizeof v / sizeof *v);
+    for (int i = 0; i < nv; i++) {
+        uint32_t m1[8] = { 0 }, m2[8] = { 0 };
+        int q1 = sceVideodecQueryMemSizeInternal(TYPE_M4V, v[i], m1);
+        int q2 = sceVideodecQueryMemSizeNongameapp(TYPE_M4V, v[i], m2);
+        LOG("vdec: MPEG-4 library size query, shape %d (size 0x%X): Internal 0x%08X (%u), Nongameapp 0x%08X (%u)", i, (unsigned)v[i][0],
+            (unsigned)q1, (unsigned)m1[0], (unsigned)q2, (unsigned)m2[0]);
+    }
+    static const char *names[] = { "InitLibrary", "InitLibraryInternal", "InitLibraryNongameapp" };
+    for (int f = 0; f < 3; f++) {
+        for (int i = 0; i < nv; i++) {
+            int r = f == 0 ? sceVideodecInitLibrary(TYPE_M4V, (void *)v[i])
+                  : f == 1 ? sceVideodecInitLibraryInternal(TYPE_M4V, v[i]) : sceVideodecInitLibraryNongameapp(TYPE_M4V, v[i]);
+            LOG("vdec: sceVideodec%s(MPEG-4, shape %d: size 0x%X): 0x%08X", names[f], i, (unsigned)v[i][0], (unsigned)r);
+            if (r >= 0) { g_m4v_inited = 1; return; }
+        }
     }
 }
 
