@@ -26,6 +26,7 @@ int sceAvcdecDecodeStop(const SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *arr
 /* MPEG-4 Part 2: prototypes modelled on the AVC twins */
 int sceM4vdecQueryDecoderMemSize(uint32_t type, const SceAvcdecQueryDecoderInfo *q, SceAvcdecDecoderInfo *info);
 int sceM4vdecCreateDecoder(uint32_t type, SceAvcdecCtrl *ctrl, const SceAvcdecQueryDecoderInfo *q);
+int sceM4vdecCreateDecoderInternal(uint32_t type, SceAvcdecCtrl *ctrl, const SceAvcdecQueryDecoderInfo *q);
 int sceM4vdecDeleteDecoder(SceAvcdecCtrl *ctrl);
 int sceM4vdecDecode(const SceAvcdecCtrl *ctrl, const SceAvcdecAu *au, SceAvcdecArrayPicture *pics);
 int sceM4vdecDecodeStop(const SceAvcdecCtrl *ctrl, SceAvcdecArrayPicture *pics);
@@ -68,18 +69,12 @@ static void m4v_lib_init(int w, int h)
     uint32_t W = (uint32_t)ALIGN16(w), H = (uint32_t)ALIGN16(h);
     uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x14, W, H, 0, 1 }, { 0x20, W, H, 2, 1 } };
     const int nv = (int)(sizeof v / sizeof *v);
-    for (int i = 0; i < nv; i++) {
-        uint32_t m1[8] = { 0 }, m2[8] = { 0 };
-        int q1 = sceVideodecQueryMemSizeInternal(TYPE_M4V, v[i], m1);
-        int q2 = sceVideodecQueryMemSizeNongameapp(TYPE_M4V, v[i], m2);
-        LOG("vdec: MPEG-4 library size query, shape %d (size 0x%X): Internal 0x%08X (%u), Nongameapp 0x%08X (%u)", i, (unsigned)v[i][0],
-            (unsigned)q1, (unsigned)m1[0], (unsigned)q2, (unsigned)m2[0]);
-    }
-    static const char *names[] = { "InitLibrary", "InitLibraryInternal", "InitLibraryNongameapp" };
+    /* found on hardware: InitLibraryInternal with the AVC-shaped struct (size 0x14) works */
+    static const char *names[] = { "InitLibraryInternal", "InitLibrary", "InitLibraryNongameapp" };
     for (int f = 0; f < 3; f++) {
         for (int i = 0; i < nv; i++) {
-            int r = f == 0 ? sceVideodecInitLibrary(TYPE_M4V, (void *)v[i])
-                  : f == 1 ? sceVideodecInitLibraryInternal(TYPE_M4V, v[i]) : sceVideodecInitLibraryNongameapp(TYPE_M4V, v[i]);
+            int r = f == 1 ? sceVideodecInitLibrary(TYPE_M4V, (void *)v[i])
+                  : f == 0 ? sceVideodecInitLibraryInternal(TYPE_M4V, v[i]) : sceVideodecInitLibraryNongameapp(TYPE_M4V, v[i]);
             LOG("vdec: sceVideodec%s(MPEG-4, shape %d: size 0x%X): 0x%08X", names[f], i, (unsigned)v[i][0], (unsigned)r);
             if (r >= 0) { g_m4v_inited = 1; return; }
         }
@@ -178,8 +173,20 @@ static int dec_create(Dec *d, const Codec *codec, int w, int h, int refs, char *
         sceKernelGetMemBlockBase(d->m4v_mem, &base);
         d->ctrl.frameBuf.pBuf = base;
         d->ctrl.frameBuf.size = (uint32_t)sz;
-        r = sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q);
-        LOG("vdec: sceM4vdecCreateDecoder(%dx%d, %u KB): 0x%08X, handle 0x%08X", w, h, (unsigned)(sz >> 10), (unsigned)r, (unsigned)d->ctrl.handle);
+        /* as with the library init, games may only get the public call refused: try it, then the Internal one, each
+         * with the memory block as reserved and with exactly the size the query asked for */
+        static int logged;
+        for (int a = 0; a < 4; a++) {
+            d->ctrl.handle = 0;
+            d->ctrl.frameBuf.size = a & 1 ? info.frameMemSize : (uint32_t)sz;
+            r = a < 2 ? sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q) : sceM4vdecCreateDecoderInternal(TYPE_M4V, &d->ctrl, &q);
+            if (logged < 8) {
+                logged++;
+                LOG("vdec: sceM4vdecCreateDecoder%s(%dx%d, buffer %u bytes): 0x%08X, handle 0x%08X", a < 2 ? "" : "Internal", w, h,
+                    (unsigned)d->ctrl.frameBuf.size, (unsigned)r, (unsigned)d->ctrl.handle);
+            }
+            if (r >= 0) break;
+        }
     } else {
         d->ctrl.frameBuf.pBuf = g_dec_base;
         d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
