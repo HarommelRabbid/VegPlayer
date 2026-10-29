@@ -449,6 +449,7 @@ int prepare_start(void)
         }
         vj->mp4_ok = 1;
         Mp4Track *t = &vj->mp4.video;
+        if (t->codec == 0x6D703476u) { void m4v_probe(int w, int h); m4v_probe(t->width, t->height); }   /* TEMPORARY research */
         VideoCache *vc = &m->vc;
         vc->nframes = (int)t->n;
         vc->pts = malloc(sizeof(float) * t->n);

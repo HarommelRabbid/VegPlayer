@@ -38,6 +38,7 @@ add_executable(${PROJECT_NAME}
   src/pfs.c
   src/vexport.c
   src/vdec_sw.c
+  src/m4vprobe.c
   third_party/shine/bitstream.c
   third_party/shine/huffman.c
   third_party/shine/l3bitstream.c
