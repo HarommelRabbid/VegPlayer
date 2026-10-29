@@ -1,8 +1,11 @@
 /* vdec.c - H.264 (sceAvcdec) and MPEG-4 Part 2 (sceM4vdec) through the Vita's hardware decoders into the frame cache.
  *
- * sceM4vdec isn't in any SDK header. Found so far (probing on hardware): its codec type is 0x1002, and its decoder
- * size query takes the same {width, height, refs} struct as AVC's (320x240 -> 256 KB, 720x480 -> 1280 KB). The rest
- * of its interface is assumed to mirror sceAvcdec (same wrappers, same module) and every step is logged.
+ * sceM4vdec isn't in any SDK header; its interface, from the kernel side (SceAvcodec) and probing on hardware:
+ *  - codec type 0x1002; the library is set up with sceVideodecInitLibraryInternal (the public call only takes AVC),
+ *    same 0x14-byte struct as AVC's {size, width, height, refs, streams}: width 64..1280, height 64..720, streams <= 4
+ *  - the decoder query/create struct is AVC's {width, height, x} but x is the largest access unit in bytes,
+ *    2048..0x17C000 (not a reference count); width and height multiples of 16, within the library's
+ *  - control, access unit and picture structs as AVC's (same sizes copied in and out by the kernel).
  *
  * Only the frames the project actually shows are kept (Sparta remixes reuse a few seconds of a source thousands
  * of times), so playback never has to seek a decoder: every visible frame is already a GPU texture.
@@ -26,7 +29,6 @@ int sceAvcdecDecodeStop(const SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *arr
 /* MPEG-4 Part 2: prototypes modelled on the AVC twins */
 int sceM4vdecQueryDecoderMemSize(uint32_t type, const SceAvcdecQueryDecoderInfo *q, SceAvcdecDecoderInfo *info);
 int sceM4vdecCreateDecoder(uint32_t type, SceAvcdecCtrl *ctrl, const SceAvcdecQueryDecoderInfo *q);
-int sceM4vdecCreateDecoderInternal(uint32_t type, SceAvcdecCtrl *ctrl, const SceAvcdecQueryDecoderInfo *q);
 int sceM4vdecDeleteDecoder(SceAvcdecCtrl *ctrl);
 int sceM4vdecDecode(const SceAvcdecCtrl *ctrl, const SceAvcdecAu *au, SceAvcdecArrayPicture *pics);
 int sceM4vdecDecodeStop(const SceAvcdecCtrl *ctrl, SceAvcdecArrayPicture *pics);
@@ -55,30 +57,16 @@ static size_t g_dec_size;
 
 static int g_m4v_inited;
 
-/* the MPEG-4 library set-up. sceVideodecInitLibrary refuses type 0x1002 with every struct shape tried (0x80620802,
- * the same answer it gives for nonexistent types: games may only get AVC through it), and the decoder then says
- * "not initialised" (0x8062090C). So the Internal and Nongameapp variants are tried too (prototypes assumed to match
- * the public one), each with a few shapes; every result is logged. */
+/* the MPEG-4 library set-up: the public sceVideodecInitLibrary refuses type 0x1002 (0x80620802), the Internal one
+ * takes it */
 int sceVideodecInitLibraryInternal(uint32_t type, const void *init);
-int sceVideodecInitLibraryNongameapp(uint32_t type, const void *init);
-int sceVideodecQueryMemSizeInternal(uint32_t type, const void *init, void *mem);
-int sceVideodecQueryMemSizeNongameapp(uint32_t type, const void *init, void *mem);
 
 static void m4v_lib_init(int w, int h)
 {
-    uint32_t W = (uint32_t)ALIGN16(w), H = (uint32_t)ALIGN16(h);
-    uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x14, W, H, 0, 1 }, { 0x20, W, H, 2, 1 } };
-    const int nv = (int)(sizeof v / sizeof *v);
-    /* found on hardware: InitLibraryInternal with the AVC-shaped struct (size 0x14) works */
-    static const char *names[] = { "InitLibraryInternal", "InitLibrary", "InitLibraryNongameapp" };
-    for (int f = 0; f < 3; f++) {
-        for (int i = 0; i < nv; i++) {
-            int r = f == 1 ? sceVideodecInitLibrary(TYPE_M4V, (void *)v[i])
-                  : f == 0 ? sceVideodecInitLibraryInternal(TYPE_M4V, v[i]) : sceVideodecInitLibraryNongameapp(TYPE_M4V, v[i]);
-            LOG("vdec: sceVideodec%s(MPEG-4, shape %d: size 0x%X): 0x%08X", names[f], i, (unsigned)v[i][0], (unsigned)r);
-            if (r >= 0) { g_m4v_inited = 1; return; }
-        }
-    }
+    uint32_t v[8] = { 0x14, (uint32_t)ALIGN16(w), (uint32_t)ALIGN16(h), 2, 1 };
+    int r = sceVideodecInitLibraryInternal(TYPE_M4V, v);
+    LOG("vdec: MPEG-4 library set-up (%ux%u): 0x%08X", (unsigned)v[1], (unsigned)v[2], (unsigned)r);
+    if (r >= 0) g_m4v_inited = 1;
 }
 
 int vdec_global_init(int max_w, int max_h, int max_refs, int with_m4v)
@@ -166,34 +154,15 @@ static int dec_create(Dec *d, const Codec *codec, int w, int h, int refs, char *
         memset(&info, 0, sizeof info);
         r = sceM4vdecQueryDecoderMemSize(TYPE_M4V, &q, &info);
         if (r < 0) { snprintf(err, errlen, "MPEG-4 decoder size query failed (0x%08X)", r); return -1; }
-        /* creation answers "invalid parameter" with the AVC-shaped structs: try the decoder memory in main RAM and
-         * in CDRAM, the third query word (reference frames for AVC) 0..3, and the buffer size as asked or as reserved */
-        static const unsigned TYPES[2] = { SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW };
-        static int logged;
-        r = -1;
-        for (int mt = 0; mt < 2 && r < 0; mt++) {
-            size_t gran = mt ? (256u << 10) : (1u << 20);
-            size_t sz = (info.frameMemSize + gran - 1) & ~(gran - 1);
-            d->m4v_mem = sceKernelAllocMemBlock("vp_m4vdec", TYPES[mt], sz, NULL);
-            if (d->m4v_mem < 0) { LOG("vdec: MPEG-4 decoder memory (type 0x%08X): 0x%08X", TYPES[mt], (unsigned)d->m4v_mem); d->m4v_mem = 0; continue; }
-            void *base = NULL;
-            sceKernelGetMemBlockBase(d->m4v_mem, &base);
-            for (uint32_t rf = 0; rf < 4 && r < 0; rf++) {
-                for (int a = 0; a < 2 && r < 0; a++) {
-                    q.numOfRefFrames = rf;
-                    d->ctrl.handle = 0;
-                    d->ctrl.frameBuf.pBuf = base;
-                    d->ctrl.frameBuf.size = a ? (uint32_t)sz : info.frameMemSize;
-                    r = sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q);
-                    if (logged < 20 || r >= 0) {
-                        logged++;
-                        LOG("vdec: sceM4vdecCreateDecoder(%dx%d, word3 %u, %s at %p, %u bytes): 0x%08X, handle 0x%08X", w, h, (unsigned)rf,
-                            mt ? "CDRAM" : "main RAM", base, (unsigned)d->ctrl.frameBuf.size, (unsigned)r, (unsigned)d->ctrl.handle);
-                    }
-                }
-            }
-            if (r < 0) { sceKernelFreeMemBlock(d->m4v_mem); d->m4v_mem = 0; }
-        }
+        size_t sz = ALIGN_MB(info.frameMemSize);
+        d->m4v_mem = sceKernelAllocMemBlock("vp_m4vdec", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, sz, NULL);
+        if (d->m4v_mem < 0) { snprintf(err, errlen, "no contiguous memory for the MPEG-4 decoder (0x%08X)", d->m4v_mem); d->m4v_mem = 0; return -1; }
+        void *base = NULL;
+        sceKernelGetMemBlockBase(d->m4v_mem, &base);
+        d->ctrl.frameBuf.pBuf = base;
+        d->ctrl.frameBuf.size = (uint32_t)sz;
+        r = sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q);
+        LOG("vdec: sceM4vdecCreateDecoder(%dx%d, AU buffer %u, %u KB): 0x%08X", w, h, (unsigned)q.numOfRefFrames, (unsigned)(sz >> 10), (unsigned)r);
     } else {
         d->ctrl.frameBuf.pBuf = g_dec_base;
         d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
@@ -316,7 +285,13 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
 
     int refs = t->max_ref_frames > 0 ? t->max_ref_frames + 1 : g_max_refs;
     if (refs > g_max_refs) refs = g_max_refs;
-    if (codec == &M4V) refs = 2;   /* I/P (and B) pictures: two references */
+    if (codec == &M4V) {   /* "refs" is the largest access unit (the VOS/VOL headers + the biggest sample), 2 KB granules */
+        uint32_t mx = 0;
+        for (uint32_t i = 0; i < t->n; i++) if (t->s[i].size > mx) mx = t->s[i].size;
+        mx += (uint32_t)(t->dsi_len > 0 ? t->dsi_len : 0) + 64;
+        mx = (mx + 2047) & ~2047u;
+        refs = (int)CLAMP(mx, 0x800u, 0x17C000u);
+    }
     Dec d;
     if (dec_create(&d, codec, w, h, refs, err, errlen) < 0) {
         free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);

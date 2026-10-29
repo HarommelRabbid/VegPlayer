@@ -65,7 +65,7 @@ Log: `ux0:data/vegplayer/log.txt`.
 | Kind | Formats | Decoder |
 |---|---|---|
 | Video | H.264 in MP4 / MOV / M4V (up to 1920×1088) | **hardware** (`sceAvcdec`) |
-| | MPEG-4 Part 2 (`mp4v`, e.g. PSP videos) in MP4 / MOV / M4V | **hardware** (`sceM4vdec`, undocumented: type 0x1002, being worked out — see the log's `vdec:` lines) |
+| | MPEG-4 Part 2 (`mp4v`, e.g. PSP videos) in MP4 / MOV / M4V | **hardware** (`sceM4vdec`, undocumented: type 0x1002, library via `sceVideodecInitLibraryInternal`; worked out from the kernel side) |
 | Pictures | PNG, JPEG, BMP, GIF (first frame), TGA, PSD, PNM, HDR | stb_image |
 | Audio | AT9 (`.at9`, RIFF) | **hardware** (`SceAtrac`) |
 | | AAC in MP4 / M4A | **hardware** (`sceAudiodec`) |
