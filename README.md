@@ -38,11 +38,20 @@ shaders, and the colour effects fall back to a CPU pass on the scene thread.
 5. `RIGHT` opens **Export**:
    - audio: the mix as it plays (track toggles, sliders, master volume) to WAV (48 kHz, 16-bit) or MP3 (128–320 kbps,
      the shine encoder), saved in `ux0:data/vegplayer/exports/`. It renders faster than real time.
-   - video: MP4 (H.264 + AAC, 29.97 fps) through the system's own recorder (SceMp4Rec, what the system uses for clip
-     recording), in all its modes: 640×368, 480×272 (the PSP's screen) and 368×208, each at 2 or 1 Mbps. The picture
-     is rendered frame by frame on the GPU (the project letterboxed into the frame), so it can take longer than the
-     project; the recorder saves into `ux0:video` and VegPlayer then moves the file to `ux0:data/vegplayer/vexports/`, named after the project. SceMp4Rec is undocumented:
-     every step is logged in `ux0:data/vegplayer/log.txt` (lines starting with `vexport:`) — send them if it fails.
+   - video: MP4 (H.264 + AAC 128 kbps, 29.97 fps), saved in `ux0:data/vegplayer/vexports/`, named after the project.
+     The picture is rendered frame by frame on the GPU (the project letterboxed into the frame), so it can take longer
+     than the project.
+     - 960×544 (the Vita's screen) at 6 Mbps and 848×480 (480p) at 5 Mbps: VegPlayer drives the hardware H.264
+       encoder and the system's AAC encoder itself and writes the MP4 itself. The encoder's normal set-up stops at
+       720×480; its full settings (the calls the system's recorder doesn't use) go up to 960×576, at Baseline level
+       3.1. 1280×720 is beyond the hardware. The encoder does about 22–26 frames a second at 960×544, so these
+       exports take about 1.5× the project's length.
+     - 640×368, 480×272 (the PSP's screen) and 368×208, each at 2 or 1 Mbps: through the system's own recorder
+       (SceMp4Rec, what the system uses for clip recording), which saves into `ux0:video`; VegPlayer then moves the
+       file. The recorder takes 5 s to 30 min.
+
+     None of this is documented: every step is logged in `ux0:data/vegplayer/log.txt` (lines starting with
+     `vexport:`) — send them if it fails.
 6. `LEFT` opens **Project info**: the editor and version that saved the project (e.g. *Vegas Pro 11.0 (Sony)*,
    *VEGAS Pro 20.0*, *Movie Studio Platinum 12.0 (Sony)*, read from the editor's settings folder stored in the project),
    where it was saved on the PC, format, length, track/event/media counts, missing sources, Track Motion, compositing

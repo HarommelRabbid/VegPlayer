@@ -16,6 +16,9 @@ void mux_set_avc_config(Mp4Mux *m, const uint8_t *sps, uint32_t sps_len, const u
 int mux_video(Mp4Mux *m, const uint8_t *data, uint32_t len, int sync);
 /* one raw AAC frame (no ADTS header) */
 int mux_audio(Mp4Mux *m, const uint8_t *data, uint32_t len);
+/* the AAC encoder's start-up delay: the first `priming` samples are skipped on playback (an edit list), and the
+ * sound lasts `samples` */
+void mux_set_audio_edit(Mp4Mux *m, uint32_t priming, uint64_t samples);
 /* writes the index and closes; with discard the file is deleted. Returns 0 if the file was completed. */
 int mux_close(Mp4Mux *m, int discard);
 /* bytes written so far */

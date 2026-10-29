@@ -29,6 +29,7 @@ struct Mp4Mux {
     uint32_t vts, vdur, arate;
     Track t[2];                                /* 0 video, 1 audio */
     uint8_t *sps, *pps; uint32_t sps_len, pps_len;
+    uint32_t priming; uint64_t asamples;
 };
 
 static int grow(void **p, uint32_t *cap, uint32_t need, size_t el)
@@ -115,6 +116,8 @@ static int add_sample(Mp4Mux *m, int ti, const uint8_t *data, uint32_t len, int 
     m->last = ti;
     return put(m, data, len);
 }
+
+void mux_set_audio_edit(Mp4Mux *m, uint32_t priming, uint64_t samples) { m->priming = priming; m->asamples = samples; }
 
 int mux_video(Mp4Mux *m, const uint8_t *data, uint32_t len, int sync) { return add_sample(m, 0, data, len, sync); }
 int mux_audio(Mp4Mux *m, const uint8_t *data, uint32_t len) { return add_sample(m, 1, data, len, 0); }
@@ -206,7 +209,7 @@ int mux_close(Mp4Mux *m, int discard)
         uint64_t mdat_end = m->off;
         Track *v = &m->t[0], *a = &m->t[1];
         uint64_t vdur = (uint64_t)v->n * m->vdur, adur = (uint64_t)a->n * 1024;
-        uint32_t vms = to_ms(vdur, m->vts), ams = to_ms(adur, m->arate);
+        uint32_t vms = to_ms(vdur, m->vts), ams = to_ms(adur > m->priming ? adur - m->priming : adur, m->arate);
         Box b; memset(&b, 0, sizeof b);
         b_open(&b, "moov");
         b_full(&b, "mvhd", 0); b_u32(&b, 0); b_u32(&b, 0); b_u32(&b, 1000); b_u32(&b, vms > ams ? vms : ams);
@@ -234,8 +237,16 @@ int mux_close(Mp4Mux *m, int discard)
         b_close(&b); b_close(&b); b_close(&b); b_close(&b);   /* stbl minf mdia trak */
 
         if (a->n) {
+            uint64_t avalid = adur > m->priming ? adur - m->priming : 0;
+            if (m->asamples && m->asamples < avalid) avalid = m->asamples;
+            uint32_t ems = m->priming ? to_ms(avalid, m->arate) : ams;
             b_open(&b, "trak");
-            b_tkhd(&b, 2, ams, 1, 0, 0);
+            b_tkhd(&b, 2, ems, 1, 0, 0);
+            if (m->priming) {
+                b_open(&b, "edts"); b_full(&b, "elst", 0); b_u32(&b, 1);
+                b_u32(&b, ems); b_u32(&b, m->priming); b_u32(&b, 0x10000);
+                b_close(&b); b_close(&b);
+            }
             b_open(&b, "mdia"); b_mdhd(&b, m->arate, (uint32_t)adur); b_hdlr(&b, "soun", "SoundHandler");
             b_open(&b, "minf");
             b_full(&b, "smhd", 0); b_u32(&b, 0); b_close(&b);

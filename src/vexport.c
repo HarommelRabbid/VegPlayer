@@ -503,6 +503,9 @@ static void finish(int discard)
         int r = -1;
         if (X.mux) {
             uint64_t t = time_us();
+            /* the AAC encoder starts with 2112 samples of its own (measured: a sound at the project's start comes out
+             * 44 ms late, and 6108 blocks in give 6111 frames out) */
+            mux_set_audio_edit(X.mux, 2112, (uint64_t)X.ablocks_total * AUD_FRAMES);
             r = mux_close(X.mux, discard || g_vexp.failed);
             X.mux = NULL;
             LOG("vexport: %d video frames, %lld AAC frames written; file %s (%.1f s)", X.vout, (long long)X.aframes,
