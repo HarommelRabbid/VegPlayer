@@ -167,6 +167,7 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_CHANBLEND_GUID "0bc15b73-83b9-11d4-9f67-00485481bd31" /* Sony Channel Blend (DXT) */
 #define FX_GRADMAP_GUID   "300f2f5f-d7c7-48be-b796-90fc740b654e" /* Sony Gradient Map (DXT) */
 #define FX_LINBLUR_GUID   "8dbe8301-d9a5-4fd5-8901-1d8bf4d3a6c0" /* Sony Linear Blur (DXT, Vegas 8) */
+#define FX_HSL_GUID       "b432972d-e08d-11d2-bf8a-006097c9ebf7" /* Sony HSL Adjust (DXT, up to Vegas 10; OFX from 11) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
 #define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
@@ -574,6 +575,20 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
                     v->mtx[o * 4 + 3] = 0;
                 }
             } else v->type = VFX_UNKNOWN;
+        } else if (!strcmp(plug, FX_HSL_GUID)) {
+            /* doubles: add to hue, saturation, luminance - what Vegas 11 turns into the OFX HSL Adjust's AddToHue,
+             * Saturation and Luminance (checked on a project saved by both: the keyframe copy's saturation 0 became
+             * Saturation 0, where the static block still said 1) */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            v->type = VFX_UNKNOWN;
+            if (pp && pl >= 24) {
+                double h = rdd(pp), sa = rdd(pp + 8), lu = rdd(pp + 16);
+                if (h > -100 && h < 100 && sa >= 0 && sa < 100 && lu >= 0 && lu < 100) {
+                    v->type = VFX_HSL; v->hue = h; v->sat = sa; v->lum = lu;
+                    if (fabs(h) < 1e-9 && fabs(sa - 1) < 1e-9 && fabs(lu - 1) < 1e-9) v->type = VFX_NOOP;
+                }
+            }
         } else if (!strcmp(plug, FX_LINBLUR_GUID)) {
             /* doubles: angle (degrees), amount (as the OFX version) */
             size_t pl;

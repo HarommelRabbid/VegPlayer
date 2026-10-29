@@ -141,8 +141,9 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Audio stretch/pitch | `d54ad82a`: method @0x0c, attribute @0x10, semitones (double) @0x14 | semitones solid; method numbering **guessed** (0 None, 1 Classic, 2 élastique: all sample events use 2) |
 | Pitch Shift plug-in | in `b66a95ce`: semitones, cents, ratio (double) | values solid; *preserve duration* flag position **guessed** |
 | Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params; rate (centi-Hz) @0x1c, depth (cents) @0x20 | rate varies per instance as a rate would (9.99, 3.02, 4.63 Hz); depth **guessed** |
-| OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust |
+| OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust's values; it is drawn as a colour matrix (hue rotation, saturation towards BT.709 luma, luminance as a gain), an approximation of a true HSL conversion |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
+| Legacy HSL Adjust (up to Vegas 10) | `1af0e4e6`, GUID `b432972d…`: doubles add-to-hue, saturation, luminance (the keyframe copy) | checked against the same project re-saved by Vegas 11 (OFX HSL Adjust, same values); hue units assumed equal to the OFX ones |
 | Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |
 | Pan/Crop / Track Motion keyframe type | Pan/Crop keyframe @16, Track Motion keyframe @4: 0 Linear, 1 Hold, 2 Slow, 3 Fast, 4 Smooth, 5 Sharp | all six checked in VEGAS Pro 11 for both (test projects with one labelled keyframe pair per type) |
 | Keyframe curve shapes | Fast 1−(1−u)², Slow u², Smooth 3u²−2u³, Sharp ½+4(u−½)³, Hold: none | **measured** from a VEGAS Pro 11 render (all within 0.3 % of the move) |
