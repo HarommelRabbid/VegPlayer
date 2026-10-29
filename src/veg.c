@@ -168,6 +168,10 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_GRADMAP_GUID   "300f2f5f-d7c7-48be-b796-90fc740b654e" /* Sony Gradient Map (DXT) */
 #define FX_LINBLUR_GUID   "8dbe8301-d9a5-4fd5-8901-1d8bf4d3a6c0" /* Sony Linear Blur (DXT, Vegas 8) */
 #define FX_HSL_GUID       "b432972d-e08d-11d2-bf8a-006097c9ebf7" /* Sony HSL Adjust (DXT, up to Vegas 10; OFX from 11) */
+#define FX_THRESH_GUID    "c3062be8-e69d-11d1-9aa9-00a0c99b12c5" /* Sony Threshold (DXT) */
+#define FX_DEFORM_GUID    "f4205ab4-e8c1-468f-9ad2-4feb8df04538" /* Sony Deform (DXT) */
+#define FX_SWIRL_GUID     "b3a8c4cf-e5ad-4b2f-a603-2f0fcb3b546e" /* Sony Swirl (DXT) */
+#define FX_WAVE_GUID      "ec1a2314-0c38-11d2-9aac-00a0c99b12c5" /* Sony Wave (DXT) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
 #define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
@@ -494,6 +498,7 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
             v->hue = ofx_get(ps, np, "AddToHue", 0);
             v->sat = ofx_get(ps, np, "Saturation", 1);
             v->lum = ofx_get(ps, np, "Luminance", 1);
+            if (fabs(v->hue) < 1e-9 && fabs(v->sat - 1) < 1e-9 && fabs(v->lum - 1) < 1e-9) v->type = VFX_NOOP;
         } else if (ci_contains(id, ":invert")) {
             v->type = VFX_INVERT;
             v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", ofx_get(ps, np, "BlendAmount", 1)));
@@ -527,6 +532,39 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
             v->contrast = ofx_get(ps, np, "Contrast", 0);
         } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur")) {
             lab_or_blur_ofx(v, id, ps, np);
+        } else if (ci_contains(id, ":colorcorrectorsecondary")) {
+            /* the mask: luminance (0..255: low, high, smooth), hue (degrees, as atan2(Cr, Cb) in BT.601 YCbCr: centre,
+             * width, smooth), each smoothstep-edged; inside it: hue rotation and saturation in YCbCr, then gamma (1/g on
+             * RGB), gain and offset. All checked against VEGAS renders of the presets (within 1/255 on average). The
+             * saturation limit and Alpha are not applied. */
+            float *q = v->prm;
+            q[0] = (float)ofx_get(ps, np, "RotateHue", 0); q[1] = (float)ofx_get(ps, np, "Saturation", 1);
+            q[2] = (float)ofx_get(ps, np, "Gamma", 1); q[3] = (float)ofx_get(ps, np, "Gain", 1); q[4] = (float)ofx_get(ps, np, "Offset", 0);
+            int el = ofx_get(ps, np, "EnableLimitLuminance", 1) != 0, eh = ofx_get(ps, np, "EnableLimitHue", 1) != 0;
+            q[5] = el ? (float)ofx_get(ps, np, "LimitLuminanceLow", 0) : 0; q[6] = el ? (float)ofx_get(ps, np, "LimitLuminanceHigh", 255) : 255;
+            q[7] = el ? (float)ofx_get(ps, np, "LimitLuminanceSmooth", 0) : 0;
+            q[8] = (float)ofx_get(ps, np, "LimitHueCenter", 180); q[9] = eh ? (float)ofx_get(ps, np, "LimitHueWidth", 360) : 360;
+            q[10] = (float)ofx_get(ps, np, "LimitHueSmooth", 0);
+            if (q[9] >= 360) q[9] = 1000;   /* every hue */
+            int noop = fabsf(q[0]) < 1e-6f && fabsf(q[1] - 1) < 1e-6f && fabsf(q[2] - 1) < 1e-6f && fabsf(q[3] - 1) < 1e-6f && fabsf(q[4]) < 1e-6f;
+            v->type = noop ? VFX_NOOP : VFX_SECCC;
+        } else if (ci_contains(id, ":cookiecutter")) {
+            /* Shape (0 circle, 1 oval, 2 portrait oval, 3 rectangle, 4 diamond, 5 square, 6 triangle), Method (0 keep the
+             * inside, 1 cut it out), Feather, Border (+ Color, three doubles), RepeatX/Y, Size, Center (x right, y up).
+             * Measured on VEGAS renders: the circle's radius is Size x the frame diagonal; the square has the circle's
+             * area; the rectangle is Size x the frame; the border (Border x half the frame width) is drawn inside the
+             * shape; the feather is a Gaussian edge (sigma = 0.1465 x Feather x half the width); repeats divide the frame
+             * into cells and scale the shape with them. */
+            float *q = v->prm;
+            const OfxParam *col = ofx_find(ps, np, "Color"), *cen = ofx_find(ps, np, "Center");
+            v->ip[0] = (int)ofx_get(ps, np, "Shape", 0); v->ip[1] = (int)ofx_get(ps, np, "Method", 0);
+            q[0] = (float)ofx_get(ps, np, "Size", 0.25); q[1] = (float)ofx_get(ps, np, "Feather", 0); q[2] = (float)ofx_get(ps, np, "Border", 0);
+            q[3] = (float)ofx_get(ps, np, "RepeatX", 1); q[4] = (float)ofx_get(ps, np, "RepeatY", 1);
+            q[5] = cen && cen->nv >= 2 ? (float)cen->v[0] : 0.5f; q[6] = cen && cen->nv >= 2 ? (float)cen->v[1] : 0.5f;
+            for (int k = 0; k < 3; k++) q[7 + k] = col && col->nv >= 3 ? (float)col->v[k] : 0;
+            if (q[3] < 1) q[3] = 1;
+            if (q[4] < 1) q[4] = 1;
+            v->type = VFX_COOKIE;
         } else if (ci_contains(id, ":colorcorrector") && !ci_contains(id, "secondary")) {
             /* saturation around luma, then gain and offset; the colour wheels and gamma are not applied */
             double sat = ofx_get(ps, np, "Saturation", 1), gain = ofx_get(ps, np, "Gain", 1), off = ofx_get(ps, np, "Offset", 0);
@@ -557,24 +595,57 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
             v->amount = dxt_param(b, bl, 1.0);
         } else if (!strcmp(plug, FX_CHANBLEND_GUID)) {
             /* 2 x 20 doubles; the first block: for each output channel (R,G,B,A) its weights from input R,G,B,A and
-             * one more value. "Red Only" = red output from R+G+B (normalised), green and blue zero: the picture's
-             * brightness in red. The second block stays identity (not applied). */
+             * one more value. The weights are divided by their sum when it passes 1, alpha's included: "Red Only"
+             * (1, 1, 1, 1) gives red = (R + G + B + A) / 4, "Grayscale" (1, 1, 1, 0) gives (R + G + B) / 3 (both
+             * checked against VEGAS renders). Alpha is taken as 1 (the constant column). The second block stays
+             * identity (not applied). */
             size_t pl;
             const uint8_t *pp = dxt_params(b, bl, &pl);
             if (pp && pl >= 20 * 8) {
                 v->type = VFX_MATRIX;
                 for (int o = 0; o < 3; o++) {
-                    double row[3], sum = 0;
-                    for (int in = 0; in < 3; in++) {
+                    double row[4], sum = 0;
+                    for (int in = 0; in < 4; in++) {
                         double w = rdd(pp + (size_t)(o * 5 + in) * 8);
                         row[in] = w > -16 && w < 16 ? w : 0;
                         sum += row[in];
                     }
                     double norm = sum > 1 ? sum : 1;   /* weights adding up past 1 are scaled back */
                     for (int in = 0; in < 3; in++) v->mtx[o * 4 + in] = (float)(row[in] / norm);
-                    v->mtx[o * 4 + 3] = 0;
+                    v->mtx[o * 4 + 3] = (float)(row[3] / norm);
                 }
             } else v->type = VFX_UNKNOWN;
+        } else if (!strcmp(plug, FX_THRESH_GUID)) {
+            /* a float after the preset name (0..1), repeated in the keyframe (u32 4 + float): each channel becomes 1
+             * where value >= threshold, else 0 (exact against VEGAS renders of the 25..75 % presets) */
+            size_t q = 0x38 + (bl >= 0x38 ? rd32(b + 0x34) : 0);
+            float t = q + 4 <= bl ? rdf(b + q) : 0.5f;
+            for (size_t k = q + 4; k + 8 <= bl; k += 4) if (rd32(b + k) == 4) { float x = rdf(b + k + 4); if (x >= 0 && x <= 1) t = x; }
+            v->type = VFX_THRESHOLD;
+            v->amount = t >= 0 && t <= 1 ? t : 0.5;
+        } else if (!strcmp(plug, FX_DEFORM_GUID) || !strcmp(plug, FX_SWIRL_GUID) || !strcmp(plug, FX_WAVE_GUID)) {
+            /* doubles (Deform's second value is a u32 flag); see VegVfx.prm and scene.c for what they do */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            int deform = !strcmp(plug, FX_DEFORM_GUID), swirl = !strcmp(plug, FX_SWIRL_GUID);
+            int need = deform ? 14 : swirl ? 5 : 6;
+            v->type = VFX_UNKNOWN;
+            if (pp && pl >= (size_t)need * 8) {
+                int ok = 1;
+                for (int k = 0; k < need; k++) {
+                    double x = deform && k == 1 ? (double)rd32(pp + 8) : rdd(pp + (size_t)k * 8);
+                    if (!(x > -1000 && x < 1000)) ok = 0;
+                    v->prm[k] = (float)x;
+                }
+                if (ok) {
+                    v->type = deform ? VFX_DEFORM : swirl ? VFX_SWIRL : VFX_WAVE;
+                    int zero = 1;
+                    if (deform) { if (v->prm[0] == 0) zero = 1; else for (int k = 4; k < 14; k++) if (v->prm[k] != 0) zero = 0; }
+                    else if (swirl) zero = v->prm[0] == 0;
+                    else zero = (v->prm[2] == 0 || v->prm[0] == 0) && (v->prm[3] == 0 || v->prm[1] == 0);
+                    if (zero) v->type = VFX_NOOP;
+                }
+            }
         } else if (!strcmp(plug, FX_HSL_GUID)) {
             /* doubles: add to hue, saturation, luminance - what Vegas 11 turns into the OFX HSL Adjust's AddToHue,
              * Saturation and Luminance (checked on a project saved by both: the keyframe copy's saturation 0 became
@@ -683,15 +754,32 @@ static int parse_afx_chain(St *s, const uint8_t *b, size_t bl, VegAfx **arr, int
             a.preserve = rd32(data + 0x0c) != 0;
             a.mode = (int)rd32(data + 0x10);
         } else if (is_vib) {
-            /* Sony Vibrato (d6802ba0-…), i32 params: 1200, 1000, -, 3, -, -, rate (centi-Hz), depth (cents, signed),
-             * 1000, second depth. Rate: the value that varies between instances (9.99 / 3.02 / 4.63 Hz); depth: the
-             * -100 values read as cents. Both guessed from two projects; the rest is unknown. */
+            /* Sony Vibrato (d6802ba0-...), i32 params: output gain (centi-dB), semitones x 100 (the graph's +- range),
+             * modulation frequency (mHz), blend graph edges, point count, then the graph's points (position in
+             * thousandths of the cycle, height in percent of the range). Only `count` points are used, even when more
+             * are stored (VEGAS's own "Triangle" preset keeps a third point it ignores: its pitch is 0 past the second).
+             * Checked against VEGAS renders of every system preset: the pitch follows the curve, interpolated linearly
+             * in semitones, from phase 0 at the event's start. */
             a.type = AFX_VIBRATO;
-            a.rate_hz = 5.0; a.depth = 1.0;
-            if (dl >= 0x28) {
-                int32_t rate = (int32_t)rd32(data + 0x1c), dep = (int32_t)rd32(data + 0x20);
-                if (rate >= 10 && rate <= 5000) a.rate_hz = rate / 100.0;
-                if (dep != 0 && dep >= -2400 && dep <= 2400) a.depth = (dep < 0 ? -dep : dep) / 100.0;
+            a.rate_hz = 1.0; a.range = 12.0; a.gain_db = 0; a.npts = 0;
+            if (dl >= 0x14) {
+                int32_t g = (int32_t)rd32(data), semi = (int32_t)rd32(data + 4), mhz = (int32_t)rd32(data + 8), n = (int32_t)rd32(data + 16);
+                if (g > -9600 && g <= 2400) a.gain_db = g / 100.0;
+                if (semi >= 0 && semi <= 2400) a.range = semi / 100.0;
+                if (mhz >= 1 && mhz <= 1000000) a.rate_hz = mhz / 1000.0;
+                if (n > 32) n = 32;
+                for (int k = 0; k < n && 0x14 + (size_t)k * 8 + 8 <= dl; k++) {
+                    int32_t x = (int32_t)rd32(data + 0x14 + k * 8), y = (int32_t)rd32(data + 0x18 + k * 8);
+                    if (x < 0 || x > 1000 || y < -100 || y > 100) break;
+                    if (a.npts && x < a.px[a.npts - 1] * 1000) break;
+                    a.px[a.npts] = x / 1000.0f; a.py[a.npts] = y / 100.0f; a.npts++;
+                }
+            }
+            if (!a.npts || a.range <= 0) a.type = AFX_NOOP;
+            else {
+                int flat = 1;
+                for (int k = 0; k < a.npts; k++) if (a.py[k] != 0) flat = 0;
+                if (flat && a.px[a.npts - 1] >= 1.0f && fabs(a.gain_db) < 1e-9) a.type = AFX_NOOP;   /* the default preset */
             }
         } else if (is_rev && dl >= 44) {
             /* Sony Reverb, i32 params (guessed from scan.veg): dry out, reverb out, early out (centi-dB), -, mode,

@@ -94,14 +94,21 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
 ## What is played
 
 - **Video effects** (event and track level, in chain order), all on the GPU (shaders compiled once with vitaShaRK):
-  - colour effects folded into one matrix per layer: Invert, Black and White, HSL Adjust, Sepia, Brightness/Contrast,
+  - colour effects folded into one matrix per layer: Invert, Black and White, Sepia, Brightness/Contrast,
     Channel Blend (e.g. Red/Green/Blue Only), LAB Adjust (lightness, a/b, Invert Luminosity, desaturate; done in
     YCbCr), Color Corrector (saturation, gain, offset) and Color Balance;
+  - HSL Adjust (a true HSL conversion, as VEGAS does), Threshold (each channel 0 or 1) and Color Corrector
+    (Secondary) (a luminance / hue mask, then hue rotation, saturation, gamma, gain, offset);
   - Gradient Map (brightness through a gradient texture, mixed by amount);
   - Linear Blur, Gaussian Blur and Radial Blur (17-tap blur pass). Like Vegas, blurs act after Pan/Crop on the
-    whole event frame: the amount is relative to the frame and the blur spills past the picture's edges. One Gradient
-    Map or blur per layer.
-  Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; blurs are skipped.
+    whole event frame: the amount is relative to the frame and the blur spills past the picture's edges;
+  - Swirl, Wave and Deform (each pixel's source position computed in the shader; Deform by a few Newton steps through
+    its edge patch) and Cookie Cutter (all seven shapes, border, feather, cut-out, repeats).
+  One of the effects after the first list per layer (the first in the chain); a later HSL Adjust falls back to a
+  colour-matrix approximation, the others are left out. All the effects in this list were fitted to VEGAS Pro renders
+  of every preset (a test image per preset): within 1–2/255 on average, except tightly wound Swirls (3–5) and
+  Cookie Cutter's Grate (about 6 px off, VEGAS rounds its cell size).
+  Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; the rest is skipped.
 - **Track compositing modes**: Add, Subtract, Cut, Multiply, Screen, Lighten, Darken. Overlay, Hard Light, Dodge, Burn
   and Difference need the picture underneath in the shader, so they draw normally for now.
 - **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; like Vegas, the window is rescaled to the
@@ -123,7 +130,10 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
     tone comes out about 78 dB clean (was 29–41 dB), clicks stay sharp and undoubled, at the same CPU cost.
   - *Classic*: granular overlap-add with a grain size per Classic mode (A01–A19) and a narrower alignment search.
 - **Pitch Shift plug-in**: *resample* (speed and pitch change together) and *Classic* (preserve duration).
-- **Vibrato plug-in** (Sony Vibrato): sine-modulated delay line with the project's rate and depth.
+- **Vibrato plug-in** (Sony Vibrato): the pitch curve drawn in the plug-in (its points, linear in semitones, times
+  the semitone range), repeated at the modulation frequency from the event's start, applied by resampling (the source
+  plays faster / slower). Matches VEGAS renders of every system preset sample for sample at constant pitch and within
+  a few milliseconds over 10 s for the fast curves.
 - Event gain, audio track volume, fades, crossfades.
 - **Reverb** in an audio track's FX chain (Sony Reverb; Options can turn it off): a light per-track reverb (pre-delay, early reflections,
   damped tail) with the project's dry/reverb/early levels, decay time, pre-delay and high cut. Tracks without reverb
@@ -140,8 +150,9 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Take | `168d206d`: in-point @0x10, media id @0x24, name @0x2a | solid |
 | Audio stretch/pitch | `d54ad82a`: method @0x0c, attribute @0x10, semitones (double) @0x14 | semitones solid; method numbering **guessed** (0 None, 1 Classic, 2 élastique: all sample events use 2) |
 | Pitch Shift plug-in | in `b66a95ce`: semitones, cents, ratio (double) | values solid; *preserve duration* flag position **guessed** |
-| Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params; rate (centi-Hz) @0x1c, depth (cents) @0x20 | rate varies per instance as a rate would (9.99, 3.02, 4.63 Hz); depth **guessed** |
-| OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust's values; it is drawn as a colour matrix (hue rotation, saturation towards BT.709 luma, luminance as a gain), an approximation of a true HSL conversion |
+| Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params: output gain (centi-dB), semitones x 100, modulation frequency (mHz), blend graph edges, point count, then (position ‰, height %) pairs; only `count` points are used, the pitch is 0 past the last one | checked against VEGAS renders of all system presets; output gain's unit assumed |
+| OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust, Cookie Cutter, Color Corrector (Secondary) (fitted to renders of their presets) |
+| Legacy Threshold / Deform / Swirl / Wave | `1af0e4e6`, GUIDs `c3062be8…` (float) / `f4205ab4…` (amount, u32 flag, -, -, shear x/y, squeeze t/b/l/r, curve t/b/l/r) / `b3a8c4cf…` (amount, centre x/y, scale x/y) / `ec1a2314…` (frequency x/y, amplitude x/y, phase x/y) | fitted to renders of every preset; Swirl's centre offset and Deform's two unused values not seen non-zero |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Legacy HSL Adjust (up to Vegas 10) | `1af0e4e6`, GUID `b432972d…`: doubles add-to-hue, saturation, luminance (the keyframe copy) | checked against the same project re-saved by Vegas 11 (OFX HSL Adjust, same values); hue units assumed equal to the OFX ones |
 | Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |

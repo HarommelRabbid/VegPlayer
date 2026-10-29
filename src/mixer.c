@@ -14,7 +14,7 @@
 #endif
 
 #define MAX_VOICES 64
-#define DL_LEN 4096              /* vibrato delay line, frames (85 ms) */
+#define VIB_N 512                /* Vibrato tables: samples per cycle */
 #define WSOLA_GRAIN 2048         /* élastique approximation: 43 ms grains, 50 % overlap */
 #define WSOLA_SEARCH 480         /* +-10 ms */
 
@@ -57,16 +57,18 @@ typedef struct {
     int sharp, sharp_next;   /* this / the next grain switch is a transient: a short crossfade, the attack plays once */
     double onset;            /* source frame of the last attack placed (later grains must start after it), or -1e18 */
     int64_t fz_in, fz_out;   /* output frames before fz_in / from fz_out on are inside a fade */
-    /* vibrato */
-    int vib; double vfreq, vA, vphase;
-    float *dl; int dlw;
+    /* Vibrato: the source is read at rate(phase) = 2^(curve(phase) * range / 12) times the normal speed; the phase
+     * runs at vfreq from the event's start. vt: rate per phase (VIB_N + 1 values), then the rate's running integral
+     * over the cycle (VIB_N + 1 values, in cycles), so a start in the middle of the event lands where VEGAS is */
+    int vib; double vfreq, vph, vstep, vcyc;
+    float *vt;
     /* gain */
-    float level;
+    float level, level_mul;
     double fi, fo, xi, xo, len;
 } Voice;
 
 static Voice g_v[MAX_VOICES];
-static float *g_dl_pool;
+static float *g_vt_pool;
 static int *g_next;              /* per track: next event that hasn't started */
 static int g_ntracks_alloc;
 static int64_t g_expect = -1;    /* sample the next mix call should start at */
@@ -380,6 +382,43 @@ static inline void cursor_step(Voice *v, int c, int32_t si, uint32_t sf)
 
 /* ------------------------------------------------------------------ voices */
 
+/* Vibrato's tables (see Voice.vt): the curve is linear in semitones between its points and 0 past the last one */
+static void vib_tables(const VegAfx *a, float *vt)
+{
+    float *cum = vt + VIB_N + 1;
+    for (int i = 0; i <= VIB_N; i++) {
+        float x = (float)i / VIB_N, y = 0;
+        int k = 0;
+        while (k + 1 < a->npts && a->px[k + 1] <= x) k++;
+        if (x >= a->px[0] && x <= a->px[a->npts - 1]) {
+            if (k + 1 < a->npts && a->px[k + 1] > a->px[k]) y = a->py[k] + (a->py[k + 1] - a->py[k]) * (x - a->px[k]) / (a->px[k + 1] - a->px[k]);
+            else y = a->py[k];
+        }
+        vt[i] = (float)pow(2.0, y * a->range / 12.0);
+    }
+    cum[0] = 0;
+    for (int i = 1; i <= VIB_N; i++) cum[i] = cum[i - 1] + 0.5f * (vt[i - 1] + vt[i]) / VIB_N;
+}
+
+/* the most a Vibrato makes an event read ahead of its normal speed (for the decoded source range) */
+double event_vibrato_reach(const VegEvent *e, const VegTrack *t)
+{
+    double m = 1.0;
+    for (int pass = 0; pass < 2; pass++) {
+        const VegAfx *fx = pass ? t->afx : e->afx;
+        int n = pass ? t->nafx : e->nafx;
+        for (int k = 0; k < n; k++) {
+            if (fx[k].type != AFX_VIBRATO) continue;
+            double top = 0;
+            for (int i = 0; i < fx[k].npts; i++) if (fx[k].py[i] > top) top = fx[k].py[i];
+            double r = pow(2.0, top * fx[k].range / 12.0);
+            if (r > m) m = r;
+            break;
+        }
+    }
+    return m;
+}
+
 static const int CLASSIC_MS[19] = { 80, 70, 60, 50, 40, 100, 120, 150, 30, 25, 20, 90, 110, 130, 35, 45, 55, 65, 75 };
 
 static void voice_setup(Voice *v, int ei, double t0)
@@ -387,7 +426,8 @@ static void voice_setup(Voice *v, int ei, double t0)
     VegProject *p = &g_s.proj;
     VegEvent *e = &p->events[ei];
     VegTrack *tr = &p->tracks[e->track];
-    memset(v, 0, offsetof(Voice, dl));
+    memset(v, 0, offsetof(Voice, vt));
+    v->level_mul = 1.0f;
     v->used = 1; v->ev = ei; v->track = e->track;
     v->onset = -1e18;
     v->ac = &g_s.m[e->media].ac;
@@ -406,13 +446,12 @@ static void voice_setup(Voice *v, int ei, double t0)
                 P *= pow(2.0, a->semitones / 12.0);
                 if (preserve) preserve_any = 1;
                 else if (pass) v->S *= pow(2.0, a->semitones / 12.0);   /* track-level resampling plug-in */
-            } else if (a->type == AFX_VIBRATO && !v->vib) {
+            } else if (a->type == AFX_VIBRATO && !v->vib && v->vt) {
                 v->vib = 1;
-                v->vfreq = a->rate_hz > 0.05 ? a->rate_hz : 5.0;
-                /* peak pitch deviation of a sine-modulated delay is A*2*pi*f (relative) */
-                double dev = pow(2.0, (a->depth > 0 ? a->depth : 0.5) / 12.0) - 1.0;
-                v->vA = dev / (2.0 * M_PI * v->vfreq);
-                if (v->vA > 0.038) v->vA = 0.038;
+                vib_tables(a, v->vt);
+                v->vfreq = a->rate_hz;
+                v->vcyc = v->vt[2 * VIB_N + 1];
+                if (a->gain_db != 0) v->level_mul *= (float)pow(10.0, a->gain_db / 20.0);
             }
         }
     }
@@ -431,11 +470,21 @@ static void voice_setup(Voice *v, int ei, double t0)
     v->len = e->length;
     v->len_n = (int64_t)llround(e->length * OUT_RATE);
     v->n = (int64_t)llround((t0 - e->start) * OUT_RATE);
-    v->level = g_cfg.apply_event_level ? e->level : 1.0f;   /* event gain (the track volume is applied live in voice_render) */
+    v->level = (g_cfg.apply_event_level ? e->level : 1.0f) * v->level_mul;   /* event gain (the track volume is applied live in voice_render) */
     v->fi = e->fade_in; v->fo = e->fade_out; v->xi = e->xfade_in; v->xo = e->xfade_out;
     v->segc = 0;
     seg_remember(v, v->ac->seg[0].start);
-    v->rpos = v->src0 + (double)v->n * v->ksrc * v->S;
+    if (v->vib) {
+        /* source frames read by output frame n: the rate integrated from the event's start */
+        v->vstep = v->vfreq / OUT_RATE;
+        double x = (double)v->n * v->vstep, c = floor(x), fr = x - c, k = fr * VIB_N;
+        int i = (int)k;
+        if (i >= VIB_N) i = VIB_N - 1;
+        const float *cum = v->vt + VIB_N + 1;
+        double part = cum[i] + (cum[i + 1] - cum[i]) * (k - i);
+        v->rpos = v->src0 + (c * v->vcyc + part) / v->vfreq * OUT_RATE * v->ksrc * v->S;
+        v->vph = fr;
+    } else v->rpos = v->src0 + (double)v->n * v->ksrc * v->S;
     if (v->mode) {
         v->gki = v->n >= 0 ? v->n / v->H : -((-v->n + v->H - 1) / v->H);   /* once per voice */
         v->goff = (int)(v->n - v->gki * v->H);
@@ -445,7 +494,6 @@ static void voice_setup(Voice *v, int ei, double t0)
         v->fz_in = fin > 1e-6 ? (int64_t)ceil(fin * OUT_RATE) : INT64_MIN;
         v->fz_out = fout > 1e-6 ? (int64_t)floor((v->len - fout) * OUT_RATE) : INT64_MAX;
     }
-    if (v->vib && v->dl) { memset(v->dl, 0, sizeof(float) * DL_LEN * 2); v->dlw = 0; }
 }
 
 static Voice *voice_new(int ei, double t0)
@@ -474,10 +522,24 @@ static void voice_render(Voice *v, float *out, int from, int to)
     const int XF = 32;                  /* crossfade at a transient, output frames */
     for (int j = from; j < to; j++, v->n++) {
         float l, r;
+        double vr = 1.0;
+        if (v->vib) {
+            double k = v->vph * VIB_N;
+            int i = (int)k;
+            if (i >= VIB_N) i = VIB_N - 1;
+            vr = v->vt[i] + (v->vt[i + 1] - v->vt[i]) * (k - i);
+            v->vph += v->vstep;
+            if (v->vph >= 1.0) v->vph -= 1.0;
+        }
         if (v->mode == 0) {
             fetch_cubic(v, v->rpos, &l, &r);
-            v->rpos += p;
+            v->rpos += p * vr;
         } else {
+            if (v->vib) {   /* granular voices: the pitch follows the curve (their timing stays the stretch's) */
+                double st = gstep * vr;
+                gsi = (int32_t)floor(st);
+                gsf = (uint32_t)((st - gsi) * 4294967296.0);
+            }
             if (v->goff >= v->H) { v->goff -= v->H; v->gki++; }
             if (v->gk[1] != v->gki) {
                 int cont = v->cur_ok && v->gk[1] == v->gki - 1;
@@ -501,19 +563,6 @@ static void voice_render(Voice *v, float *out, int from, int to)
             cursor_step(v, 0, gsi, gsf);
             cursor_step(v, 1, gsi, gsf);
             v->goff++;
-        }
-        if (v->vib && v->dl) {
-            v->dl[v->dlw * 2] = l; v->dl[v->dlw * 2 + 1] = r;
-            double d = (v->vA * (1.0 + sin(v->vphase)) + 0.001) * OUT_RATE;
-            v->vphase += 2.0 * M_PI * v->vfreq * inv;
-            if (v->vphase > 2.0 * M_PI) v->vphase -= 2.0 * M_PI;
-            double rp = v->dlw - d;
-            while (rp < 0) rp += DL_LEN;
-            int i0 = (int)rp, i1 = i0 + 1 == DL_LEN ? 0 : i0 + 1;
-            float t = (float)(rp - i0);
-            l = v->dl[i0 * 2] + (v->dl[i1 * 2] - v->dl[i0 * 2]) * t;
-            r = v->dl[i0 * 2 + 1] + (v->dl[i1 * 2 + 1] - v->dl[i0 * 2 + 1]) * t;
-            v->dlw = v->dlw + 1 == DL_LEN ? 0 : v->dlw + 1;
         }
         float g = v->level * tvol;
         if (v->n < v->fz_in || v->n >= v->fz_out) {
@@ -673,8 +722,8 @@ static void rv_process(Reverb *r, float *out, int frames)
 void mixer_init(void)
 {
     reverbs_init();
-    if (!g_dl_pool) g_dl_pool = calloc((size_t)MAX_VOICES * DL_LEN * 2, sizeof(float));
-    for (int i = 0; i < MAX_VOICES; i++) g_v[i].dl = g_dl_pool ? g_dl_pool + (size_t)i * DL_LEN * 2 : NULL;
+    if (!g_vt_pool) g_vt_pool = calloc((size_t)MAX_VOICES * (VIB_N + 1) * 2, sizeof(float));
+    for (int i = 0; i < MAX_VOICES; i++) g_v[i].vt = g_vt_pool ? g_vt_pool + (size_t)i * (VIB_N + 1) * 2 : NULL;
     mixer_reset();
 }
 

@@ -183,9 +183,30 @@ static void luts_build(void)
 /* ------------------------------------------------------------------ effect chain of a layer */
 
 /* The chain (event effects, then track effects) becomes one GPU pass: colour effects fold into the matrix m;
- * a Gradient Map splits the chain (m before it, m2 after it); a blur is applied when sampling (it commutes with
- * the colour matrix). One special effect per layer: the first one wins. */
+ * a Gradient Map or a non-linear colour effect (HSL Adjust, Threshold, Secondary Color Corrector) splits the chain
+ * (m before it, m2 after it); a blur, a warp (Swirl, Wave, Deform) or Cookie Cutter is applied when sampling (they
+ * commute with the colour matrix). One special effect per layer: the first one wins; a later HSL Adjust then folds
+ * into the matrix as an approximation, the other special effects are left out. */
 typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; } Chain;
+
+static int special_pass(int type)
+{
+    switch (type) {
+    case VFX_GRADIENT: return PASS_LUT;
+    case VFX_LINEARBLUR: case VFX_RADIALBLUR: case VFX_GAUSSBLUR: return PASS_BLUR;
+    case VFX_HSL: return PASS_HSL;
+    case VFX_THRESHOLD: return PASS_THRESH;
+    case VFX_SECCC: return PASS_SECCC;
+    case VFX_SWIRL: return PASS_SWIRL;
+    case VFX_WAVE: return PASS_WAVE;
+    case VFX_DEFORM: return PASS_DEFORM;
+    case VFX_COOKIE: return PASS_COOKIE;
+    }
+    return -1;
+}
+
+/* passes whose shader applies a second matrix after the effect */
+static int pass_has_post(int pass) { return pass == PASS_LUT || pass == PASS_HSL || pass == PASS_THRESH || pass == PASS_SECCC; }
 
 static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
 {
@@ -197,16 +218,21 @@ static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
         for (int i = 0; i < n; i++) {
             const VegVfx *v = &fx[i];
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
-            if (v->type == VFX_GRADIENT || v->type == VFX_LINEARBLUR || v->type == VFX_RADIALBLUR || v->type == VFX_GAUSSBLUR) {
+            int sp = special_pass(v->type);
+            if (sp == PASS_LUT || sp == PASS_BLUR) {
                 if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
                     c->special = v;
-                    c->pass = v->type == VFX_GRADIENT ? PASS_LUT : PASS_BLUR;
+                    c->pass = sp;
                 }
                 continue;
             }
+            if (sp >= 0) {
+                if (!c->special && gpu_pass_ok(sp)) { c->special = v; c->pass = sp; continue; }
+                if (v->type != VFX_HSL) continue;   /* HSL Adjust: the matrix approximation below */
+            }
             float f[12], r[12];
             vfx_matrix(v, f);
-            float *dst = c->pass == PASS_LUT ? c->m2 : c->m;
+            float *dst = pass_has_post(c->pass) ? c->m2 : c->m;
             cm_mul(r, f, dst);
             memcpy(dst, r, sizeof r);
         }
@@ -261,6 +287,64 @@ static void blur_params(const VegVfx *v, GpuLayer *L, float frame_w, float frame
         L->u[i] = u; L->v[i] = w;
         L->x[i] = x0 + u * ax + w * bx;
         L->y[i] = y0 + u * ay + w * by;
+    }
+}
+
+/* the newer effects' shader parameters (gpu.c describes each pass); pw x ph: the picture's own pixels. All measured on
+ * VEGAS renders of the effects' presets, with these exceptions: Swirl's centre offset (always 0 in the presets: taken as
+ * -1..1 across the picture, y up) and the hue rotation direction of the Secondary Color Corrector (180 degrees in the
+ * presets). The warps work in the picture's texture space (Vegas: the event frame; the same for unscaled pictures). */
+static void fx_params(const VegVfx *v, GpuLayer *L, int pw, int ph)
+{
+    float *f = L->fxp;
+    const float *q = v->prm;
+    memset(f, 0, sizeof L->fxp);
+    switch (v->type) {
+    case VFX_HSL: f[0] = (float)v->hue; f[1] = (float)v->sat; f[2] = (float)v->lum; break;
+    case VFX_THRESHOLD: f[0] = (float)v->amount; break;
+    case VFX_SECCC: {
+        float th = q[0] * (float)(M_PI / 180.0), g = q[2] > 0.01f ? q[2] : 0.01f;
+        f[0] = cosf(th) * q[1]; f[1] = sinf(th) * q[1]; f[2] = 1.0f / g; f[3] = q[3];
+        f[4] = q[4]; f[5] = q[5] - q[7]; f[6] = q[5]; f[7] = q[6];
+        f[8] = q[6] + q[7]; f[9] = q[8] / 360.0f; f[10] = q[9] * 0.5f / 360.0f; f[11] = (q[9] * 0.5f + q[10]) / 360.0f;
+        break;
+    }
+    case VFX_SWIRL: {
+        float sx = fabsf(q[3]) > 0.001f ? q[3] : 0.001f, sy = fabsf(q[4]) > 0.001f ? q[4] : 0.001f;
+        f[0] = 0.5f + 0.5f * q[1]; f[1] = 0.5f - 0.5f * q[2]; f[2] = 0.5f * sx; f[3] = 0.5f * sy;
+        f[4] = -15.0f * q[0];
+        break;
+    }
+    case VFX_WAVE:
+        f[0] = (float)M_PI * q[0]; f[1] = (float)M_PI * q[1]; f[2] = q[2]; f[3] = q[3]; f[4] = q[4]; f[5] = q[5];
+        break;
+    case VFX_DEFORM: {
+        /* edges: squeeze scales an edge's length (1 - A s), curve bows it by 0.5 A c x 4u(1-u) (the flag moves the
+         * edge's ends instead of its middle), shear slants it; the inside is blended between the edges */
+        float A = q[0], fl = q[1] != 0 ? 1.0f : 0.0f;
+        float kT = 1 - A * q[6], kB = 1 - A * q[7], kL = 1 - A * q[8], kR = 1 - A * q[9];
+        float exL = -0.5f * A * q[12] * fl, exR = -0.5f * A * q[13] * fl, eyT = 0.5f * A * q[10] * fl, eyB = 0.5f * A * q[11] * fl;
+        f[0] = 0.5f - 0.5f * kT + exL; f[1] = 0.5f - 0.5f * kL + eyT;   /* top left */
+        f[2] = 0.5f + 0.5f * kT + exR; f[3] = 0.5f - 0.5f * kR + eyT;   /* top right */
+        f[4] = 0.5f - 0.5f * kB + exL; f[5] = 0.5f + 0.5f * kL + eyB;   /* bottom left */
+        f[6] = 0.5f + 0.5f * kB + exR; f[7] = 0.5f + 0.5f * kR + eyB;   /* bottom right */
+        f[8] = -0.5f * A * q[10]; f[9] = -0.5f * A * q[11]; f[10] = 0.5f * A * q[12]; f[11] = 0.5f * A * q[13];
+        f[12] = A * q[4]; f[13] = A * q[5];
+        break;
+    }
+    case VFX_COOKIE: {
+        float rx = q[3], ry = q[4], rep = rx > ry ? rx : ry, half = pw * 0.5f / rep;
+        int shape = v->ip[0];
+        f[0] = (float)pw; f[1] = (float)ph; f[2] = rx; f[3] = ry;
+        f[4] = q[5]; f[5] = 1.0f - q[6];
+        f[6] = shape == 3 ? q[0] : q[0] * hypotf((float)pw, (float)ph) / rep;
+        f[7] = q[2] * half;
+        f[8] = 0.1465f * q[1] * half; if (f[8] < 0.4f) f[8] = 0.4f;
+        f[9] = (float)shape; f[10] = (float)v->ip[1];
+        f[12] = q[7]; f[13] = q[8]; f[14] = q[9];
+        break;
+    }
+    default: break;
     }
 }
 
@@ -548,7 +632,7 @@ static void build(Scene *sc, int buf, double T)
             } else if (ch.pass == PASS_BLUR) {
                 if (gpu_pass_ok(PASS_BLUR)) blur_params(ch.special, L, g_vw, g_vw * p->height / p->width, g_vx, g_vy);
                 else L->pass = PASS_MATRIX;   /* no blur shader: draw unblurred */
-            }
+            } else if (ch.pass >= PASS_HSL) fx_params(ch.special, L, pw, ph);
             L->fx = !cm_is_identity(L->m) || ch.pass != PASS_MATRIX;
             float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
             /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
@@ -576,7 +660,7 @@ static void build(Scene *sc, int buf, double T)
                 L->pass = PASS_MATRIX;
                 L->fx = 0;
             }
-            if (L->pass == PASS_BLUR && !gpu_pass_ok(PASS_BLUR)) L->pass = PASS_MATRIX;
+            if (L->pass != PASS_MATRIX && L->pass != PASS_LUT && !gpu_pass_ok(L->pass)) L->pass = PASS_MATRIX;
             if (L->pass == PASS_LUT) sc->nlut++;
             else if (L->pass == PASS_BLUR) sc->nblur++;
             /* track compositing mode -> blend */
@@ -597,7 +681,7 @@ static void build(Scene *sc, int buf, double T)
                     for (int c = 0; c < 3; c++) L->tint[c] *= al;   /* premultiplied: the opacity mixes towards neutral */
                 } else if (L->blend == BLEND_DARKEN) {
                     /* neutral for MIN is white: colour = a * c + (1 - a), folded into the last matrix */
-                    float *fm = L->pass == PASS_LUT ? L->m2 : L->m;
+                    float *fm = pass_has_post(L->pass) ? L->m2 : L->m;
                     for (int r = 0; r < 3; r++) {
                         for (int c = 0; c < 3; c++) fm[r * 4 + c] *= al * L->tint[r];
                         fm[r * 4 + 3] = fm[r * 4 + 3] * al * L->tint[r] + (1.0f - al);

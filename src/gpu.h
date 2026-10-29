@@ -11,7 +11,11 @@
 enum { BLEND_NORMAL = 0, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_LIGHTEN, BLEND_DARKEN, BLEND_CUT, BLEND_COUNT };
 /* layer passes: colour matrix; matrix -> brightness lookup (Gradient Map) -> matrix; blur along a line / towards a centre */
 /* PASS_SHADOW: the picture's shape (its alpha) with softened edges, filled with the tint colour (Track Motion shadow/glow) */
-enum { PASS_MATRIX = 0, PASS_LUT, PASS_BLUR, PASS_SHADOW, PASS_COUNT };
+/* PASS_HSL / PASS_THRESH / PASS_SECCC: matrix -> a non-linear colour effect (HSL Adjust, Threshold, Secondary Color
+ * Corrector) -> matrix m2. PASS_SWIRL / PASS_WAVE / PASS_DEFORM: where each pixel reads from in the picture, then the
+ * matrix. PASS_COOKIE: Cookie Cutter's mask (shape, border, feather, repeats), then the matrix. Parameters in fx[]. */
+enum { PASS_MATRIX = 0, PASS_LUT, PASS_BLUR, PASS_SHADOW, PASS_HSL, PASS_THRESH, PASS_SECCC, PASS_SWIRL, PASS_WAVE,
+       PASS_DEFORM, PASS_COOKIE, PASS_COUNT };
 
 /* ---- memory: big mapped blocks carved into textures (CDRAM first, then main RAM) */
 size_t gpu_arena_reserve(size_t want);       /* main thread; returns bytes actually reserved */
@@ -55,6 +59,7 @@ typedef struct {
     float rad[4];       /* PASS_BLUR: x = radial strength */
     float w[20];        /* PASS_BLUR: 17 tap weights (sum 1) */
     float soft[4];      /* PASS_SHADOW: 1 / (2 * edge), edge (texcoords, x and y); the quad is enlarged by edge */
+    float fxp[16];      /* PASS_HSL .. PASS_COOKIE: uniforms uFx0..uFx3 (see gpu.c) */
 } GpuLayer;
 
 void gpu_draw_layer(const GpuLayer *L);

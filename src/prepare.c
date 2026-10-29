@@ -196,6 +196,7 @@ void session_close(void)
 /* ------------------------------------------------------------------ what each source has to provide */
 
 double event_audio_speed(const VegEvent *e);   /* mixer.c */
+double event_vibrato_reach(const VegEvent *e, const VegTrack *t);   /* mixer.c */
 
 typedef struct { double a, b; } Rng;
 
@@ -317,7 +318,7 @@ static int audio_job(int i)
     for (int e = 0; e < p->nevents; e++) {
         VegEvent *ev = &p->events[e];
         if (ev->kind != VEG_KIND_AUDIO || ev->media != i) continue;
-        double s0 = ev->offset * ev->rate, len = ev->length * event_audio_speed(ev);
+        double s0 = ev->offset * ev->rate, len = ev->length * event_audio_speed(ev) * event_vibrato_reach(ev, &p->tracks[ev->track]);
         double grain = 0.15 * (1.0 + fabs(ev->pitch_semis) / 12.0);   /* granular pitch shifting reads a little around */
         add_range(&r, &n, &cap, s0 - 0.05, s0 + len + grain + 0.05, dur);
     }

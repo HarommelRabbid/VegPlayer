@@ -46,6 +46,12 @@ enum {
     VFX_RADIALBLUR,  /* Radial Blur: amount, centre (cx, cy 0..1) */
     VFX_NOOP,        /* recognised, nothing to do (e.g. default Color Corrector) */
     VFX_GAUSSBLUR,   /* Gaussian Blur: a = horizontal range, b = vertical range (fractions of the picture) */
+    VFX_THRESHOLD,   /* Threshold: each channel 0 or 1 at amount (0..1) */
+    VFX_SECCC,       /* Color Corrector (Secondary): prm = see veg.c */
+    VFX_DEFORM,      /* Deform: prm[0..13] as stored (amount, flag, -, -, shear x/y, squeeze t/b/l/r, curve t/b/l/r) */
+    VFX_SWIRL,       /* Swirl: prm = amount, centre x/y, scale x/y */
+    VFX_WAVE,        /* Wave: prm = frequency x/y, amplitude x/y, phase x/y */
+    VFX_COOKIE,      /* Cookie Cutter: see veg.c */
 };
 #define VFX_MAX_STOPS 8
 typedef struct {
@@ -59,6 +65,7 @@ typedef struct {
     float mtx[12];                    /* VFX_MATRIX / VFX_COLORCORR */
     int nstops; float stop_pos[VFX_MAX_STOPS], stop_rgb[VFX_MAX_STOPS][3];   /* Gradient Map */
     int lut;                          /* player side: gradient texture slot (-1 = none) */
+    float prm[24]; int ip[4];         /* the effects above from VFX_THRESHOLD on */
 } VegVfx;
 
 /* track compositing modes (Vegas's CompositeMode order; the track compositing chunk @0x64) */
@@ -77,8 +84,12 @@ typedef struct {
     double semitones;   /* Pitch Shift: total shift (semitones + cents) */
     int preserve;       /* Pitch Shift: 1 = preserve duration (Classic stretch), 0 = resample */
     int mode;           /* Pitch Shift: Classic mode index when preserving duration */
-    double rate_hz;     /* Vibrato */
-    double depth;       /* Vibrato: depth in semitones */
+    /* Vibrato: a pitch curve drawn over one cycle, repeated at rate_hz from the event's start; the curve's points
+     * (position 0..1 in the cycle, height -1..1) times `range` semitones; past the last point the pitch is 0.
+     * VEGAS resamples (the source plays faster / slower, no time stretch). gain_db: output gain. */
+    double rate_hz, range, gain_db;
+    int npts;
+    float px[32], py[32];
     /* Reverb (Sony Reverb, track FX): gains in dB, decay in seconds, pre-delay in ms, high cut in Hz (0 = off) */
     double dry_db, wet_db, early_db, decay_s, predelay_ms, hicut_hz;
 } VegAfx;

@@ -195,6 +195,150 @@ static const char FRAG_SHADOW_SRC[] =
     "    return float4(uTint.rgb, uTint.a * 0.25f * a * r.x * r.y);\n"
     "}\n";
 
+
+/* the non-linear colour passes share this frame: pre-matrix, the effect on o, post-matrix */
+#define NL_HEAD \
+    "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex,\n" \
+    "            uniform float4 uMatR, uniform float4 uMatG, uniform float4 uMatB,\n" \
+    "            uniform float4 uPostR, uniform float4 uPostG, uniform float4 uPostB,\n" \
+    "            uniform float4 uTint, uniform float4 uFx0, uniform float4 uFx1, uniform float4 uFx2) : COLOR\n" \
+    "{\n" \
+    "    float4 c = tex2D(tex, vTexcoord);\n" \
+    "    float4 p = float4(c.rgb, 1.0f);\n" \
+    "    float3 o = saturate(float3(dot(uMatR, p), dot(uMatG, p), dot(uMatB, p)));\n"
+#define NL_TAIL \
+    "    float4 q2 = float4(saturate(o), 1.0f);\n" \
+    "    o = float3(dot(uPostR, q2), dot(uPostG, q2), dot(uPostB, q2));\n" \
+    "    return float4(saturate(o), c.a) * uTint;\n" \
+    "}\n"
+
+/* PASS_HSL: HSL Adjust as VEGAS does it, through HSL (checked within 1/255 on its presets): hue + uFx0.x (turns),
+ * saturation x uFx0.y, lightness x uFx0.z */
+static const char FRAG_HSL_SRC[] = NL_HEAD
+    "    float4 K = float4(0.0f, -1.0f / 3.0f, 2.0f / 3.0f, -1.0f);\n"
+    "    float4 a = lerp(float4(o.bg, K.wz), float4(o.gb, K.xy), step(o.b, o.g));\n"
+    "    float4 q = lerp(float4(a.xyw, o.r), float4(o.r, a.yzx), step(a.x, o.r));\n"
+    "    float mn = min(q.w, q.y), d = q.x - mn;\n"
+    "    float h = abs(q.z + (q.w - q.y) / (6.0f * d + 0.000001f));\n"
+    "    float l = (q.x + mn) * 0.5f;\n"
+    "    float s = d / max(1.0f - abs(2.0f * l - 1.0f), 0.00001f);\n"
+    "    h = h + uFx0.x; s = saturate(s * uFx0.y); l = saturate(l * uFx0.z);\n"
+    "    float C = (1.0f - abs(2.0f * l - 1.0f)) * s;\n"
+    "    float3 hr = saturate(abs(frac(h + float3(1.0f, 2.0f / 3.0f, 1.0f / 3.0f)) * 6.0f - 3.0f) - 1.0f);\n"
+    "    o = l + C * (hr - 0.5f);\n"
+    NL_TAIL;
+
+/* PASS_THRESH: Threshold, each channel 0 or 1 at uFx0.x */
+static const char FRAG_THRESH_SRC[] = NL_HEAD
+    "    o = step(uFx0.xxx, o);\n"
+    NL_TAIL;
+
+/* PASS_SECCC: Color Corrector (Secondary). Mask: luminance (BT.601 Y x 255) rising over uFx1.yz, falling over uFx1.w..uFx2.x;
+ * hue (atan2(Cr, Cb), turns) within uFx2.z of uFx2.y, fading out by uFx2.w; both smoothstep-edged. Inside: (Cb, Cr) turned and
+ * scaled by uFx0.xy, then RGB ^ uFx0.z (1 / gamma) x uFx0.w (gain) + uFx1.x (offset) */
+static const char FRAG_SECCC_SRC[] =
+    "float ss(float a, float b, float x) { float t = saturate((x - a) / max(b - a, 0.0001f)); return t * t * (3.0f - 2.0f * t); }\n"
+    NL_HEAD
+    "    float y = dot(o, float3(0.299f, 0.587f, 0.114f));\n"
+    "    float cb = (o.b - y) / 1.772f, cr = (o.r - y) / 1.402f;\n"
+    "    float Y = y * 255.0f;\n"
+    "    float m = ss(uFx1.y, uFx1.z, Y) * (1.0f - ss(uFx1.w, uFx2.x, Y));\n"
+    "    float hue = atan2(cr, cb) * 0.15915494f;\n"
+    "    float dd = abs(frac(hue - uFx2.y + 0.5f) - 0.5f);\n"
+    "    m = m * (1.0f - ss(uFx2.z, uFx2.w, dd));\n"
+    "    float cb2 = uFx0.x * cb - uFx0.y * cr, cr2 = uFx0.y * cb + uFx0.x * cr;\n"
+    "    float r = y + 1.402f * cr2, b = y + 1.772f * cb2;\n"
+    "    float3 n = float3(r, (y - 0.299f * r - 0.114f * b) / 0.587f, b);\n"
+    "    n = pow(saturate(n), uFx0.zzz) * uFx0.w + uFx1.x;\n"
+    "    o = lerp(o, n, m);\n"
+    NL_TAIL;
+
+#define WARP_HEAD \
+    "float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex,\n" \
+    "            uniform float4 uMatR, uniform float4 uMatG, uniform float4 uMatB, uniform float4 uTint,\n" \
+    "            uniform float4 uFx0, uniform float4 uFx1, uniform float4 uFx2, uniform float4 uFx3) : COLOR\n" \
+    "{\n"
+#define WARP_TAIL \
+    "    float4 p = float4(c.rgb, 1.0f);\n" \
+    "    float3 o = float3(dot(uMatR, p), dot(uMatG, p), dot(uMatB, p));\n" \
+    "    return float4(saturate(o), c.a) * uTint;\n" \
+    "}\n"
+
+/* PASS_SWIRL: the picture turned around uFx0.xy by uFx1.x * (1 - r)^2 radians, r = distance / uFx0.zw (elliptical, the
+ * swirl's reach); measured on VEGAS renders: uFx1.x = -15 x amount, reach = the scale (1 = the whole picture) */
+static const char FRAG_SWIRL_SRC[] = WARP_HEAD
+    "    float2 d = (vTexcoord - uFx0.xy) / uFx0.zw;\n"
+    "    float f = saturate(1.0f - length(d));\n"
+    "    float th = uFx1.x * f * f;\n"
+    "    float cs = cos(th), sn = sin(th);\n"
+    "    float2 t = saturate(uFx0.xy + float2(cs * d.x - sn * d.y, sn * d.x + cs * d.y) * uFx0.zw);\n"
+    "    float4 c = tex2D(tex, t);\n"
+    WARP_TAIL;
+
+/* PASS_WAVE: x moved by uFx0.z * sin(uFx0.x * y + uFx1.x), y by uFx0.w * sin(uFx0.y * x + uFx1.y) (texcoords; edges stretch) */
+static const char FRAG_WAVE_SRC[] = WARP_HEAD
+    "    float2 v = vTexcoord;\n"
+    "    float2 t = saturate(v + float2(uFx0.z * sin(uFx0.x * v.y + uFx1.x), uFx0.w * sin(uFx0.y * v.x + uFx1.y)));\n"
+    "    float4 c = tex2D(tex, t);\n"
+    WARP_TAIL;
+
+/* PASS_DEFORM: Deform maps the picture through a Coons patch: corners uFx0 (TL, TR), uFx1 (BL, BR), edge bulges uFx2 (top, bottom
+ * in y; left, right in x, times 4u(1-u)), then shear uFx3.xy. Each pixel's source is found by 5 Newton steps; pixels no source
+ * lands on are transparent. */
+static const char FRAG_DEFORM_SRC[] = WARP_HEAD
+    "    float2 xy = vTexcoord, uv = xy, P = xy;\n"
+    "    for (int i = 0; i < 6; i++) {\n"
+    "        float2 t0 = lerp(uFx0.xy, uFx0.zw, uv.x), b0 = lerp(uFx1.xy, uFx1.zw, uv.x);\n"
+    "        float2 q = lerp(t0, b0, uv.y);\n"
+    "        float2 du = lerp(uFx0.zw - uFx0.xy, uFx1.zw - uFx1.xy, uv.y), dv = b0 - t0;\n"
+    "        float bu = 4.0f * uv.x * (1.0f - uv.x), bv = 4.0f * uv.y * (1.0f - uv.y);\n"
+    "        float kv = lerp(uFx2.x, uFx2.y, uv.y), ku = lerp(uFx2.z, uFx2.w, uv.x);\n"
+    "        q = q + float2(ku * bv, kv * bu);\n"
+    "        du = du + float2((uFx2.w - uFx2.z) * bv, kv * (4.0f - 8.0f * uv.x));\n"
+    "        dv = dv + float2(ku * (4.0f - 8.0f * uv.y), (uFx2.y - uFx2.x) * bu);\n"
+    "        P = float2(q.x + uFx3.x * (q.y - 0.5f), q.y + uFx3.y * (q.x - 0.5f));\n"
+    "        float j00 = du.x + uFx3.x * du.y, j01 = dv.x + uFx3.x * dv.y, j10 = du.y + uFx3.y * du.x, j11 = dv.y + uFx3.y * dv.x;\n"
+    "        float det = j00 * j11 - j01 * j10;\n"
+    "        det = abs(det) < 0.000001f ? 0.000001f : det;\n"
+    "        float2 r = xy - P;\n"
+    "        if (i < 5) uv = uv + clamp(float2(j11 * r.x - j01 * r.y, -j10 * r.x + j00 * r.y) / det, -0.5f, 0.5f);\n"
+    "    }\n"
+    "    float2 e = abs(P - xy);\n"
+    "    float ok = step(e.x, 0.002f) * step(e.y, 0.002f) * step(0.0f, uv.x) * step(uv.x, 1.0f) * step(0.0f, uv.y) * step(uv.y, 1.0f);\n"
+    "    float4 c = tex2D(tex, saturate(uv));\n"
+    "    c.a = c.a * ok;\n"
+    WARP_TAIL;
+
+/* PASS_COOKIE: Cookie Cutter. uFx0: picture size (pixels), repeats; uFx1: centre (texcoords), shape radius (pixels; the
+ * rectangle: Size), border width (pixels); uFx2: feather sigma (pixels), shape, method (0 keep the inside, 1 cut it out);
+ * uFx3: border colour. Coverage of the edge: a Gaussian (logistic approximation). */
+static const char FRAG_COOKIE_SRC[] = WARP_HEAD
+    "    float4 c = tex2D(tex, vTexcoord);\n"
+    "    float2 l = (vTexcoord - (uFx1.xy - 0.5f)) * uFx0.zw;\n"
+    "    float2 cell = clamp(floor(l), float2(0.0f, 0.0f), uFx0.zw - 1.0f);\n"
+    "    float2 cs = uFx0.xy / uFx0.zw;\n"
+    "    float2 d = (l - cell - 0.5f) * cs;\n"
+    "    float R = uFx1.z, sh = uFx2.y, dist;\n"
+    "    float2 a = abs(d);\n"
+    "    if (sh < 0.5f) dist = length(d) - R;\n"
+    "    else if (sh < 1.5f) dist = (length(d / float2(1.511f, 1.084f)) - R) * 1.084f;\n"
+    "    else if (sh < 2.5f) dist = (length(d / float2(1.084f, 1.511f)) - R) * 1.084f;\n"
+    "    else if (sh < 3.5f) dist = (max(a.x / cs.x, a.y / cs.y) - R) * min(cs.x, cs.y);\n"
+    "    else if (sh < 4.5f) dist = (a.x + a.y - R * 1.3445f) * 0.70710678f;\n"
+    "    else if (sh < 5.5f) dist = max(a.x, a.y) - R * 0.8862f;\n"
+    "    else dist = max(d.y, max(0.8660254f * d.x - 0.5f * d.y, -0.8660254f * d.x - 0.5f * d.y)) - R * 1.02715f;\n"
+    "    float k = 1.702f / uFx2.x;\n"
+    "    float inner = 1.0f / (1.0f + exp(clamp((dist + uFx1.w) * k, -60.0f, 60.0f)));\n"
+    "    float outer = 1.0f / (1.0f + exp(clamp(dist * k, -60.0f, 60.0f)));\n"
+    "    float ring = saturate(outer - inner);\n"
+    "    float4 p = float4(c.rgb, 1.0f);\n"
+    "    float3 o = saturate(float3(dot(uMatR, p), dot(uMatG, p), dot(uMatB, p)));\n"
+    "    float al;\n"
+    "    if (uFx2.z < 0.5f) { al = outer; o = (o * inner + uFx3.rgb * ring) / max(outer, 0.0001f); }\n"
+    "    else { al = 1.0f - inner; o = (o * (1.0f - outer) + uFx3.rgb * ring) / max(al, 0.0001f); }\n"
+    "    return float4(saturate(o), c.a * al) * uTint;\n"
+    "}\n";
+
 #define SHADER_VERSION 4   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
@@ -202,7 +346,7 @@ typedef struct {
     SceGxmProgram *gxp;
     SceGxmShaderPatcherId id;
     SceGxmFragmentProgram *fp[BLEND_COUNT];
-    const SceGxmProgramParameter *mat[3], *post[3], *tint, *lutp, *dir, *rad, *w[5], *soft;
+    const SceGxmProgramParameter *mat[3], *post[3], *tint, *lutp, *dir, *rad, *w[5], *soft, *fxu[4];
     int tex_unit, lut_unit;
     int ok;
 } FProg;
@@ -212,6 +356,13 @@ static FProg g_fp[PASS_COUNT] = {
     { .name = "lut", .src = FRAG_LUT_SRC },
     { .name = "blur", .src = FRAG_BLUR_SRC },
     { .name = "shadow", .src = FRAG_SHADOW_SRC },
+    { .name = "hsl", .src = FRAG_HSL_SRC },
+    { .name = "thresh", .src = FRAG_THRESH_SRC },
+    { .name = "seccc", .src = FRAG_SECCC_SRC },
+    { .name = "swirl", .src = FRAG_SWIRL_SRC },
+    { .name = "wave", .src = FRAG_WAVE_SRC },
+    { .name = "deform", .src = FRAG_DEFORM_SRC },
+    { .name = "cookie", .src = FRAG_COOKIE_SRC },
 };
 static SceGxmProgram *g_vprog_gxp;
 static SceGxmShaderPatcherId g_vid;
@@ -320,6 +471,8 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
     static const char *MAT[3] = { "uMatR", "uMatG", "uMatB" }, *POST[3] = { "uPostR", "uPostG", "uPostB" }, *W[5] = { "uW0", "uW1", "uW2", "uW3", "uW4" };
     for (int k = 0; k < 3; k++) { f->mat[k] = par(f->gxp, MAT[k]); f->post[k] = par(f->gxp, POST[k]); }
     for (int k = 0; k < 5; k++) f->w[k] = par(f->gxp, W[k]);
+    static const char *FXU[4] = { "uFx0", "uFx1", "uFx2", "uFx3" };
+    for (int k = 0; k < 4; k++) f->fxu[k] = par(f->gxp, FXU[k]);
     f->tint = par(f->gxp, "uTint"); f->lutp = par(f->gxp, "uLut"); f->dir = par(f->gxp, "uDir"); f->rad = par(f->gxp, "uRad"); f->soft = par(f->gxp, "uSoft");
     f->tex_unit = unit_of(f->gxp, "tex");
     f->lut_unit = unit_of(f->gxp, "lut");
@@ -384,8 +537,10 @@ int gpu_init(void)
     for (int i = 1; i < PASS_COUNT; i++)
         if (setup_fprog(&g_fp[i], sp) < 0) LOG("gpu: %s shader unavailable (that effect falls back)", g_fp[i].name);
     g_shaders_ok = 1;
-    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s, shadow/glow %s)",
-             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no", g_fp[PASS_SHADOW].ok ? "yes" : "no");
+    int nok = 0;
+    for (int i = PASS_HSL; i < PASS_COUNT; i++) nok += g_fp[i].ok;
+    snprintf(g_status, sizeof g_status, "GPU effect shaders ready (gradient map %s, blur %s, shadow/glow %s, %d of %d newer effects)",
+             g_fp[PASS_LUT].ok ? "yes" : "no", g_fp[PASS_BLUR].ok ? "yes" : "no", g_fp[PASS_SHADOW].ok ? "yes" : "no", nok, PASS_COUNT - PASS_HSL);
     LOG("gpu: %s", g_status);
     return 0;
 }
@@ -457,6 +612,9 @@ void gpu_draw_layer(const GpuLayer *L)
         for (int k = 0; k < 5; k++) if (f->w[k]) sceGxmSetUniformDataF(fbuf, f->w[k], 0, 4, L->w + 4 * k);
     } else if (pass == PASS_SHADOW) {
         sceGxmSetUniformDataF(fbuf, f->soft, 0, 4, L->soft);
+    } else if (pass >= PASS_HSL) {
+        for (int k = 0; k < 3; k++) if (f->post[k]) sceGxmSetUniformDataF(fbuf, f->post[k], 0, 4, L->m2 + 4 * k);
+        for (int k = 0; k < 4; k++) if (f->fxu[k]) sceGxmSetUniformDataF(fbuf, f->fxu[k], 0, 4, L->fxp + 4 * k);
     }
     sceGxmSetFragmentTexture(ctx, (unsigned)f->tex_unit, L->tex);
     sceGxmSetVertexStream(ctx, 0, v);
