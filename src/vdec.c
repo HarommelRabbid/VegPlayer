@@ -62,7 +62,7 @@ static void m4v_lib_init(int w, int h)
     uint32_t v[][8] = { { 0x14, W, H, 2, 1 }, { 0x10, W, H, 1 }, { 0x10, W, H, 2 }, { 0x0C, W, H }, { 0x14, W, H, 1, 1 },
                         { 0x18, W, H, 2, 1 }, { 0x1C, W, H, 2, 1 }, { 0x20, W, H, 2, 1 }, { 0x08, 1 }, { 0x14, 1, W, H, 2 } };
     for (size_t i = 0; i < sizeof v / sizeof *v; i++) {
-        int r = sceVideodecInitLibrary(TYPE_M4V, (const SceVideodecQueryInitInfo *)v[i]);
+        int r = sceVideodecInitLibrary(TYPE_M4V, (void *)v[i]);
         LOG("vdec: sceVideodecInitLibrary(MPEG-4, shape %d: size 0x%X): 0x%08X", (int)i, (unsigned)v[i][0], (unsigned)r);
         if (r >= 0) { g_m4v_inited = 1; return; }
     }
