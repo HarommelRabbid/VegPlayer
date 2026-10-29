@@ -268,7 +268,10 @@ static int video_worker(unsigned argc, void *argp)
         set_line("Decoding pictures of %s", vm->name);
         char err[128] = "";
         if (vj->mp4_ok) {
-            if (vdec_fill_cache(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err) == 0) {
+            int m4v = vj->mp4.video.codec == 0x6D703476u;   /* 'mp4v': MPEG-4 Part 2, decoded in software */
+            int ok = m4v ? vdec_fill_cache_sw(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err)
+                         : vdec_fill_cache(&vj->mp4, &m->vc, vj->need, &m->vprog, &g_prep.cancel, err, sizeof err);
+            if (ok == 0) {
                 /* frames that failed: point them at the nearest decoded neighbour */
                 VideoCache *vc = &m->vc;
                 int last = -1;
@@ -276,7 +279,7 @@ static int video_worker(unsigned argc, void *argp)
                 last = -1;
                 for (int k = vc->nframes - 1; k >= 0; k--) { if (vc->slot[k] >= 0) last = vc->slot[k]; else if (vj->need[k] && last >= 0) vc->slot[k] = last; }
                 vc->ok = 1;
-                snprintf(m->vmsg, sizeof m->vmsg, "H.264 %dx%d -> %d frames cached at %dx%d", vc->src_w, vc->src_h, vc->nimg, vc->cache_w, vc->cache_h);
+                snprintf(m->vmsg, sizeof m->vmsg, "%s %dx%d -> %d frames cached at %dx%d", m4v ? "MPEG-4" : "H.264", vc->src_w, vc->src_h, vc->nimg, vc->cache_w, vc->cache_h);
             } else {
                 snprintf(m->vmsg, sizeof m->vmsg, "video: %s", err);
                 LOG("%s: %s", vm->name, err);
@@ -423,7 +426,7 @@ int prepare_start(void)
     free(g_vjobs);
     g_vjobs = calloc((size_t)(p->nmedia ? p->nmedia : 1), sizeof(VJob));
     g_nvjobs = 0;
-    int max_w = 0, max_h = 0, max_refs = 2;
+    int max_w = 0, max_h = 0, max_refs = 2, navc = 0;
     double need_bytes4 = 0;     /* bytes at full (screen-capped) size, RGBA */
     int max_cw[64] = { 0 };
     (void)max_cw;
@@ -440,7 +443,7 @@ int prepare_start(void)
         memset(vj, 0, sizeof *vj);
         vj->media = i;
         if (mp4_open(&vj->mp4, m->vfile) < 0 || !vj->mp4.video.present) {
-            snprintf(m->vmsg, sizeof m->vmsg, "video: %s", vj->mp4.err[0] ? vj->mp4.err : "no H.264 video track");
+            snprintf(m->vmsg, sizeof m->vmsg, "video: %s", vj->mp4.err[0] ? vj->mp4.err : "no H.264 or MPEG-4 video track");
             if (vj->mp4.f) mp4_close(&vj->mp4);
             continue;
         }
@@ -482,16 +485,20 @@ int prepare_start(void)
         double s = MIN(1.0, MIN((double)SCREEN_W / t->width, (double)SCREEN_H / t->height));
         vj->cw = MAX(16, (int)(t->width * s)); vj->ch = MAX(16, (int)(t->height * s));
         need_bytes4 += (double)vj->nneed * (((vj->cw + 7) & ~7) * vj->ch + (g_s.m[vj->media].vc.want_q ? ((QUARTER(vj->cw) + 7) & ~7) * QUARTER(vj->ch) : 0)) * 4;
-        max_w = MAX(max_w, t->width); max_h = MAX(max_h, t->height);
-        if (t->max_ref_frames + 1 > max_refs) max_refs = t->max_ref_frames + 1;
+        if (t->codec != 0x6D703476u) {   /* the hardware H.264 decoder is sized for the H.264 sources only */
+            max_w = MAX(max_w, t->width); max_h = MAX(max_h, t->height);
+            if (t->max_ref_frames + 1 > max_refs) max_refs = t->max_ref_frames + 1;
+            navc++;
+        }
         LOG("%s: %dx%d, %u frames, %.2f s, %d needed, refs %d", vm->name, t->width, t->height, t->n, vc->duration, vj->nneed, t->max_ref_frames);
         g_nvjobs++;
     }
     if (max_refs > 16) max_refs = 16;
 
     /* 2. the hardware decoder's memory first (physically contiguous), then the frame-cache arenas */
-    if (g_nvjobs && vdec_global_init(max_w, max_h, max_refs) < 0) {
+    if (navc && vdec_global_init(max_w, max_h, max_refs) < 0) {
         for (int j = 0; j < g_nvjobs; j++) {
+            if (g_vjobs[j].mp4.video.codec == 0x6D703476u) continue;
             snprintf(g_s.m[g_vjobs[j].media].vmsg, sizeof g_s.m[0].vmsg, "video: hardware decoder unavailable (%dx%d, see log)", max_w, max_h);
             mp4_close(&g_vjobs[j].mp4); g_vjobs[j].mp4_ok = 0;
             g_vjobs[j].nneed = 0;

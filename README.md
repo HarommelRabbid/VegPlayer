@@ -65,9 +65,11 @@ Log: `ux0:data/vegplayer/log.txt`.
 | Kind | Formats | Decoder |
 |---|---|---|
 | Video | H.264 in MP4 / MOV / M4V (up to 1920×1088) | **hardware** (`sceAvcdec`) |
+| | MPEG-4 Part 2 (`mp4v`: Simple / Advanced Simple, e.g. PSP videos) in MP4 / MOV / M4V | in code: FFmpeg's mpeg4 decoder (`third_party/ffmpeg`) |
 | Pictures | PNG, JPEG, BMP, GIF (first frame), TGA, PSD, PNM, HDR | stb_image |
 | Audio | AT9 (`.at9`, RIFF) | **hardware** (`SceAtrac`) |
 | | AAC in MP4 / M4A | **hardware** (`sceAudiodec`) |
+| | uncompressed PCM in MP4 / MOV (`ipcm`, `fpcm`, `sowt`, `twos`, `lpcm`, `in24`, `in32`, `fl32`, `fl64`, `raw`) | in code |
 | | MP3 | **hardware** (`sceAudiodec`); Layer I/II streams fall back to dr_mp3 |
 | | WAV (8/16/24/32-bit PCM, float), Ogg Vorbis | in code (stb_vorbis) |
 | | AT3 / AT3plus (`.at3` RIFF, `.oma`/`.aa3` unencrypted) | **hardware** (`SceAudiocodec`) — see below |

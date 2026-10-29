@@ -75,6 +75,9 @@ void vdec_global_term(void);
 struct Mp4File;
 int vdec_fill_cache(struct Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen);
 
+/* video: MPEG-4 Part 2 (mp4v) in software (FFmpeg's decoder), same contract as vdec_fill_cache */
+int vdec_fill_cache_sw(struct Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen);
+
 /* audio: decode into PCM segments covering `ranges` (source frames, sorted, disjoint) */
 typedef struct AudioSrc AudioSrc;
 void adec_global_init(void);

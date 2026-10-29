@@ -174,10 +174,16 @@ static void parse_esds(Mp4Track *t, const uint8_t *p, uint32_t len)
             if (fl & 0x20) q += 2;
             continue;                /* descend into its children */
         } else if (tag == 0x04) {    /* DecoderConfigDescriptor */
+            if (q < len) t->oti = p[q];
             q += 13;
             continue;
-        } else if (tag == 0x05) {    /* DecoderSpecificInfo = AudioSpecificConfig */
-            if (q + l <= len) parse_asc(t, p + q, (int)l);
+        } else if (tag == 0x05) {    /* DecoderSpecificInfo: AudioSpecificConfig, or MPEG-4 Visual VOS/VOL headers */
+            if (q + l > len) return;
+            if (t->codec == FOURCC('m', 'p', '4', 'v')) {
+                free(t->dsi);
+                t->dsi = malloc(l ? l : 1);
+                if (t->dsi) { memcpy(t->dsi, p + q, l); t->dsi_len = (int)l; }
+            } else parse_asc(t, p + q, (int)l);
             return;
         }
         q += l;
@@ -194,6 +200,10 @@ static void scan_entry_children(Mp4Track *t, const uint8_t *p, uint32_t len)
         if (ty == FOURCC('a', 'v', 'c', 'C')) parse_avcc(t, p + q + 8, sz - 8);
         else if (ty == FOURCC('e', 's', 'd', 's')) parse_esds(t, p + q + 8, sz - 8);
         else if (ty == FOURCC('w', 'a', 'v', 'e')) scan_entry_children(t, p + q + 8, sz - 8);
+        else if (ty == FOURCC('p', 'c', 'm', 'C') && sz >= 14) {   /* ISO 23003-5: format flags (bit 0 little-endian), bits */
+            t->pcm_le = p[q + 12] & 1;
+            t->pcm_bits = p[q + 13];
+        } else if (ty == FOURCC('e', 'n', 'd', 'a') && sz >= 10) t->pcm_le = be16(p + q + 8) != 0;   /* QuickTime */
         q += sz;
     }
 }
@@ -207,28 +217,107 @@ static int parse_stsd(Mp4Track *t, const uint8_t *p, uint64_t len, int video)
     uint32_t el = esz - 8;
     t->codec = fmt;
     if (video) {
-        if (fmt != FOURCC('a', 'v', 'c', '1') && fmt != FOURCC('a', 'v', 'c', '3')) return -2;
+        int avc = fmt == FOURCC('a', 'v', 'c', '1') || fmt == FOURCC('a', 'v', 'c', '3');
+        if (!avc && fmt != FOURCC('m', 'p', '4', 'v')) return -2;
         if (el < 78) return -1;
         t->width = be16(e + 24); t->height = be16(e + 26);
         scan_entry_children(t, e + 78, el - 78);
-        if (!t->nal_len || !t->nsps || !t->npps) return -3;
+        if (avc) { if (!t->nal_len || !t->nsps || !t->npps) return -3; }
+        else if (t->oti && t->oti != 0x20) return -2;   /* only MPEG-4 Visual (not MPEG-1/2 in an mp4v entry) */
     } else {
-        if (fmt != FOURCC('m', 'p', '4', 'a')) return -2;
+        int pcm = 1;
+        switch (fmt) {
+        case FOURCC('m', 'p', '4', 'a'): pcm = 0; break;
+        case FOURCC('i', 'p', 'c', 'm'): case FOURCC('f', 'p', 'c', 'm'): case FOURCC('s', 'o', 'w', 't'): case FOURCC('t', 'w', 'o', 's'): case FOURCC('l', 'p', 'c', 'm'):
+        case FOURCC('i', 'n', '2', '4'): case FOURCC('i', 'n', '3', '2'): case FOURCC('f', 'l', '3', '2'): case FOURCC('f', 'l', '6', '4'):
+        case FOURCC('r', 'a', 'w', ' '): break;
+        default: return -2;
+        }
         if (el < 28) return -1;
         uint16_t ver = be16(e + 8);
         t->channels = be16(e + 16);
         t->sample_rate = (int)(be32(e + 24) >> 16);
+        if (pcm) {
+            t->pcm_bits = be16(e + 18);
+            t->pcm_le = fmt == FOURCC('s', 'o', 'w', 't');
+            if (fmt == FOURCC('i', 'n', '2', '4')) t->pcm_bits = 24;
+            if (fmt == FOURCC('i', 'n', '3', '2') || fmt == FOURCC('f', 'l', '3', '2')) t->pcm_bits = 32;
+            if (fmt == FOURCC('f', 'l', '6', '4')) t->pcm_bits = 64;
+            if (fmt == FOURCC('r', 'a', 'w', ' ')) { t->pcm_bits = 8; t->pcm_unsigned = 1; }
+            t->pcm_float = fmt == FOURCC('f', 'l', '3', '2') || fmt == FOURCC('f', 'l', '6', '4') || fmt == FOURCC('f', 'p', 'c', 'm');
+            if (ver == 2 && el >= 64) {   /* QuickTime sound description v2 (lpcm) */
+                uint64_t rb = be64(e + 32);
+                double r;
+                memcpy(&r, &rb, 8);
+                t->sample_rate = (int)(r + 0.5);
+                t->channels = (int)be32(e + 40);
+                t->pcm_bits = (int)be32(e + 48);
+                uint32_t fl = be32(e + 52);
+                t->pcm_float = fl & 1;
+                t->pcm_le = !(fl & 2);
+                t->pcm_unsigned = !t->pcm_float && !(fl & 4) && t->pcm_bits == 8;
+            }
+        }
         uint32_t skip = 28 + (ver == 1 ? 16 : ver == 2 ? 36 : 0);
-        if (skip < el) scan_entry_children(t, e + skip, el - skip);
+        if (skip < el) scan_entry_children(t, e + skip, el - skip);   /* esds, or pcmC / enda */
         if (!t->sample_rate || !t->channels) return -1;
+        if (pcm) {
+            if (t->pcm_bits != 8 && t->pcm_bits != 16 && t->pcm_bits != 24 && t->pcm_bits != 32 && t->pcm_bits != 64) return -2;
+            if ((t->pcm_bits == 64 && !t->pcm_float) || (t->pcm_float && t->pcm_bits != 32 && t->pcm_bits != 64)) return -2;
+            if (t->pcm_bits == 8 && fmt != FOURCC('t', 'w', 'o', 's') && fmt != FOURCC('s', 'o', 'w', 't') && fmt != FOURCC('i', 'p', 'c', 'm') && fmt != FOURCC('f', 'p', 'c', 'm'))
+                t->pcm_unsigned = 1;
+            t->pcm_bpf = t->channels * t->pcm_bits / 8;
+        }
     }
     return 0;
 }
 
 /* ------------------------------------------------------------------ sample table */
 
+/* PCM: one entry per chunk (a chunk is a contiguous run of frames), so hours of audio don't need a table entry
+ * per frame. QuickTime stores a "sample size" of 1 for PCM: the real frame size is the format's. */
+static int build_pcm_chunks(Mp4Track *t, TrakTmp *k)
+{
+    uint32_t fixed = 0, nsz = 0;
+    if (k->stsz && k->stsz_n >= 12) { fixed = be32(k->stsz + 4); nsz = be32(k->stsz + 8); }
+    else return -1;
+    uint64_t nchunks = 0;
+    if (k->stco && k->stco_n >= 8) nchunks = be32(k->stco + 4);
+    else if (k->co64 && k->co64_n >= 8) nchunks = be32(k->co64 + 4);
+    else return -1;
+    uint32_t nsc = k->stsc && k->stsc_n >= 8 ? be32(k->stsc + 4) : 0;
+    if (!nsc || 8 + 12ull * nsc > k->stsc_n || !nchunks || nchunks > 10000000) return -1;
+    t->s = calloc((size_t)nchunks, sizeof(Mp4Sample));
+    if (!t->s) return -1;
+    uint32_t c_out = 0, si = 0;
+    int64_t frames = 0;
+    for (uint32_t e = 0; e < nsc; e++) {
+        uint32_t first = be32(k->stsc + 8 + 12 * e), per = be32(k->stsc + 12 + 12 * e);
+        uint32_t last = e + 1 < nsc ? be32(k->stsc + 8 + 12 * (e + 1)) : (uint32_t)nchunks + 1;
+        for (uint32_t c = first; c < last; c++) {
+            if (c == 0 || c > nchunks) return -1;
+            uint64_t off = k->stco ? be32(k->stco + 8 + 4 * (c - 1)) : be64(k->co64 + 8 + 8 * (c - 1));
+            uint64_t bytes = 0;
+            if (fixed) bytes = (uint64_t)per * (fixed < (uint32_t)t->pcm_bpf ? (uint32_t)t->pcm_bpf : fixed);
+            else for (uint32_t j = 0; j < per && si + j < nsz && 12 + 4ull * (si + j + 1) <= k->stsz_n; j++) bytes += be32(k->stsz + 12 + 4 * (si + j));
+            si += per;
+            bytes -= bytes % (uint32_t)t->pcm_bpf;
+            if (!bytes || bytes > 0xFFFFFFFFu) continue;
+            Mp4Sample *sm = &t->s[c_out++];
+            sm->offset = off; sm->size = (uint32_t)bytes; sm->dts = sm->cts = frames; sm->sync = 1;
+            frames += (int64_t)(bytes / (uint32_t)t->pcm_bpf);
+        }
+    }
+    t->n = c_out;
+    if (!t->n) return -1;
+    t->timescale = (uint32_t)t->sample_rate;   /* dts are in frames */
+    t->duration = frames;
+    return 0;
+}
+
 static int build_samples(Mp4Track *t, TrakTmp *k)
 {
+    if (t->pcm_bpf) return build_pcm_chunks(t, k);
     uint64_t n = 0;
     uint32_t fixed = 0;
     int fs = 0;
@@ -408,6 +497,7 @@ static int walk_moov(Mp4File *m, uint64_t off, uint64_t end)
                     free(t->s);
                     for (int i = 0; i < t->nsps; i++) free(t->sps[i]);
                     for (int i = 0; i < t->npps; i++) free(t->pps[i]);
+                    free(t->dsi);
                     memset(t, 0, sizeof *t);
                 }
             }
@@ -453,11 +543,14 @@ void mp4_close(Mp4File *m)
         free(ts[i]->s);
         for (int k = 0; k < ts[i]->nsps; k++) free(ts[i]->sps[k]);
         for (int k = 0; k < ts[i]->npps; k++) free(ts[i]->pps[k]);
+        free(ts[i]->dsi);
         memset(ts[i], 0, sizeof *ts[i]);
     }
     if (m->f) fclose(m->f);
     m->f = NULL;
 }
+
+int mp4_seek(Mp4File *m, uint64_t off) { return fseek64(m->f, off); }
 
 int mp4_read_sample(Mp4File *m, const Mp4Track *t, uint32_t i, uint8_t *buf)
 {

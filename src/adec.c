@@ -30,7 +30,7 @@
 #define STB_VORBIS_NO_PUSHDATA_API
 #include "../third_party/stb_vorbis.c"
 
-enum { AF_WAV = 1, AF_AT9, AF_AT3, AF_MP3, AF_OGG, AF_AAC };
+enum { AF_WAV = 1, AF_AT9, AF_AT3, AF_MP3, AF_OGG, AF_AAC, AF_MP4PCM };
 
 struct AudioSrc {
     int fmt;
@@ -398,10 +398,10 @@ int adec_open(const char *path, AudioSrc **out, char *err, size_t errlen)
         if (mp4_open(&a->mp4, path) < 0) { snprintf(err, errlen, "%s", a->mp4.err); goto fail; }
         a->mp4_open = 1;
         Mp4Track *t = &a->mp4.audio;
-        if (!t->present) { snprintf(err, errlen, "%s", a->mp4.err[0] ? a->mp4.err : "the file has no AAC audio track"); goto fail; }
+        if (!t->present) { snprintf(err, errlen, "%s", a->mp4.err[0] ? a->mp4.err : "the file has no audio track"); goto fail; }
         a->rate = t->sample_rate; a->ch = t->channels > 2 ? 2 : t->channels;
         a->total = (int64_t)((double)t->duration * a->rate / (t->timescale ? t->timescale : 1) + 0.5);
-        a->fmt = AF_AAC;
+        a->fmt = t->pcm_bpf ? AF_MP4PCM : AF_AAC;
     } else {
         fclose(f); f = NULL;
         a->buf = file_read_all(path, &a->len, 0);
@@ -431,6 +431,7 @@ const char *adec_codec_name(AudioSrc *a)
     case AF_MP3: return "MP3";
     case AF_OGG: return "Ogg Vorbis";
     case AF_AAC: return "AAC (hardware)";
+    case AF_MP4PCM: return "PCM";
     case AF_AT3: return a->atx ? "AT3plus (hardware)" : "AT3 (hardware)";
     default: return "?";
     }
@@ -731,6 +732,61 @@ static int dec_at3(AudioSrc *a, Sink *s, volatile float *prog, volatile int *can
     return 0;
 }
 
+/* uncompressed PCM in an MP4/MOV (ipcm, fpcm, sowt, twos, lpcm, in24, in32, fl32, fl64, raw): chunks of interleaved
+ * frames, any endianness, 8..32-bit integers or 32/64-bit floats; the first two channels are kept */
+static int pcm_sample(const Mp4Track *t, const uint8_t *p)
+{
+    int b = t->pcm_bits / 8;
+    if (t->pcm_float) {
+        uint64_t u = 0;
+        for (int i = 0; i < b; i++) u |= (uint64_t)p[t->pcm_le ? i : b - 1 - i] << (8 * i);
+        double d;
+        if (b == 4) { uint32_t u32 = (uint32_t)u; float f; memcpy(&f, &u32, 4); d = f; }
+        else memcpy(&d, &u, 8);
+        d = d > 1 ? 1 : d < -1 ? -1 : d;
+        return (int)(d * 32767.0);
+    }
+    if (b == 1) return t->pcm_unsigned ? ((int)p[0] - 128) << 8 : (int)(int8_t)p[0] << 8;
+    /* the two most significant bytes */
+    const uint8_t *hi = t->pcm_le ? p + b - 1 : p, *lo = t->pcm_le ? p + b - 2 : p + 1;
+    return (int16_t)(*hi << 8 | *lo);
+}
+
+static int dec_mp4pcm(AudioSrc *a, Sink *s, volatile float *prog, volatile int *cancel, char *err, size_t errlen)
+{
+    Mp4Track *t = &a->mp4.audio;
+    const int CH = 4096;
+    int bpf = t->pcm_bpf, bs = t->pcm_bits / 8;
+    uint8_t *raw = malloc((size_t)CH * (size_t)bpf);
+    int16_t *pcm = malloc((size_t)CH * 2 * sizeof(int16_t));
+    if (!raw || !pcm) { free(raw); free(pcm); snprintf(err, errlen, "out of memory"); return -1; }
+    s->pos = 0;
+    for (uint32_t c = 0; c < t->n && !sink_done(s) && !*cancel; c++) {
+        const Mp4Sample *sm = &t->s[c];
+        int64_t frames = sm->size / (uint32_t)bpf, done = 0;
+        if (sm->dts > s->pos) { /* a gap: silence */
+            memset(pcm, 0, (size_t)CH * 4);
+            while (s->pos < sm->dts) { int64_t n = sm->dts - s->pos; sink_put(s, pcm, (int)(n < CH ? n : CH), 2); }
+        }
+        if (mp4_seek(&a->mp4, sm->offset)) break;
+        while (done < frames && !sink_done(s)) {
+            int n = (int)(frames - done < CH ? frames - done : CH);
+            if (fread(raw, (size_t)bpf, (size_t)n, a->mp4.f) != (size_t)n) { done = frames; break; }
+            for (int i = 0; i < n; i++) {
+                const uint8_t *f = raw + (size_t)i * (size_t)bpf;
+                int l = pcm_sample(t, f);
+                pcm[2 * i] = (int16_t)l;
+                pcm[2 * i + 1] = (int16_t)(t->channels > 1 ? pcm_sample(t, f + bs) : l);
+            }
+            sink_put(s, pcm, n, 2);
+            done += n;
+        }
+        if (prog) *prog = (float)s->pos / (float)(s->end ? s->end : 1);
+    }
+    free(raw); free(pcm);
+    return 0;
+}
+
 static int dec_aac(AudioSrc *a, Sink *s, volatile float *prog, volatile int *cancel, char *err, size_t errlen)
 {
     if (!g_aac_lib) { snprintf(err, errlen, "AAC hardware decoder unavailable"); return -1; }
@@ -811,6 +867,7 @@ int adec_decode(AudioSrc *a, AudioCache *ac, const int64_t (*ranges)[2], int nr,
     case AF_OGG: r = dec_ogg(a, &s, prog, cancel); break;
     case AF_AT9: mutex_lock(&g_at9_mtx); r = dec_at9(a, &s, prog, cancel, err, errlen); mutex_unlock(&g_at9_mtx); break;
     case AF_AAC: r = dec_aac(a, &s, prog, cancel, err, errlen); break;
+    case AF_MP4PCM: r = dec_mp4pcm(a, &s, prog, cancel, err, errlen); break;
     case AF_AT3: mutex_lock(&g_at9_mtx); r = dec_at3(a, &s, prog, cancel, err, errlen); mutex_unlock(&g_at9_mtx); break;
     case AF_MP3:
         r = dec_mp3_hw(a, &s, prog, cancel);
