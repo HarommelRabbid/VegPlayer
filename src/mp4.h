@@ -43,6 +43,7 @@ typedef struct Mp4File {
     FILE *f;
     uint64_t fsize;
     Mp4Track video, audio;
+    uint32_t movie_ts;         /* mvhd timescale */
     char err[160];
 } Mp4File;
 

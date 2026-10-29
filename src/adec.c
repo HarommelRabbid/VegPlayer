@@ -769,6 +769,12 @@ static int dec_mp4pcm(AudioSrc *a, Sink *s, volatile float *prog, volatile int *
             while (s->pos < sm->dts) { int64_t n = sm->dts - s->pos; sink_put(s, pcm, (int)(n < CH ? n : CH), 2); }
         }
         if (mp4_seek(&a->mp4, sm->offset)) break;
+        if (sm->dts + frames <= s->pos) continue;   /* before the edit list's start */
+        if (sm->dts < s->pos) {                     /* starts before it: skip into the chunk */
+            int64_t skip = s->pos - sm->dts;
+            if (mp4_seek(&a->mp4, sm->offset + (uint64_t)skip * (uint64_t)bpf)) break;
+            done = skip;
+        }
         while (done < frames && !sink_done(s)) {
             int n = (int)(frames - done < CH ? frames - done : CH);
             if (fread(raw, (size_t)bpf, (size_t)n, a->mp4.f) != (size_t)n) { done = frames; break; }

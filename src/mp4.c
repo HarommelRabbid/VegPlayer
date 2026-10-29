@@ -34,6 +34,7 @@ typedef struct {
     uint32_t handler;
     uint32_t timescale; int64_t duration;
     int64_t elst_media_time; int64_t elst_empty; int has_elst;
+    uint32_t movie_ts;          /* mvhd timescale: an empty edit's duration is in it */
     uint8_t *stts, *ctts, *stss, *stsc, *stsz, *stz2, *stco, *co64, *stsd;
     uint64_t stts_n, ctts_n, stss_n, stsc_n, stsz_n, stz2_n, stco_n, co64_n, stsd_n;
 } TrakTmp;
@@ -274,6 +275,16 @@ static int parse_stsd(Mp4Track *t, const uint8_t *p, uint64_t len, int video)
 
 /* ------------------------------------------------------------------ sample table */
 
+/* edit list -> shift (in track timescale units `ts`) to add to every time: a leading empty edit delays the track
+ * (its duration is in the movie timescale), a media start time > 0 skips that much of the media */
+static int64_t edit_shift(const TrakTmp *k, double ts)
+{
+    double sh = 0, kts = k->timescale ? k->timescale : 1;
+    if (k->elst_empty > 0 && k->movie_ts) sh += (double)k->elst_empty * ts / k->movie_ts;
+    if (k->has_elst && k->elst_media_time > 0) sh -= (double)k->elst_media_time * ts / kts;
+    return (int64_t)(sh >= 0 ? sh + 0.5 : sh - 0.5);
+}
+
 /* PCM: one entry per chunk (a chunk is a contiguous run of frames), so hours of audio don't need a table entry
  * per frame. QuickTime stores a "sample size" of 1 for PCM: the real frame size is the format's. */
 static int build_pcm_chunks(Mp4Track *t, TrakTmp *k)
@@ -312,6 +323,9 @@ static int build_pcm_chunks(Mp4Track *t, TrakTmp *k)
     if (!t->n) return -1;
     t->timescale = (uint32_t)t->sample_rate;   /* dts are in frames */
     t->duration = frames;
+    int64_t sh = edit_shift(k, t->sample_rate);   /* negative: the decoder skips the first -sh frames */
+    for (uint32_t i = 0; i < t->n; i++) { t->s[i].dts += sh; t->s[i].cts += sh; }
+    t->duration += sh;
     return 0;
 }
 
@@ -379,9 +393,9 @@ static int build_samples(Mp4Track *t, TrakTmp *k)
             for (uint32_t j = 0; j < cnt && si < t->n; j++) { t->s[si].cts = t->s[si].dts + off; si++; }
         }
     }
-    /* edit list: shift so the first presented sample is at 0 */
-    if (k->has_elst && k->elst_media_time > 0)
-        for (uint32_t i = 0; i < t->n; i++) { t->s[i].cts -= k->elst_media_time; t->s[i].dts -= k->elst_media_time; }
+    /* edit list: the first presented sample at 0 (media start skipped), after any leading empty edit */
+    int64_t sh = edit_shift(k, k->timescale ? k->timescale : 1000);
+    if (sh) for (uint32_t i = 0; i < t->n; i++) { t->s[i].cts += sh; t->s[i].dts += sh; }
     /* sync samples */
     if (k->stss && k->stss_n >= 8) {
         uint32_t ns = be32(k->stss + 4);
@@ -482,6 +496,7 @@ static int walk_moov(Mp4File *m, uint64_t off, uint64_t end)
         if (b.type == FOURCC('t', 'r', 'a', 'k')) {
             TrakTmp k;
             memset(&k, 0, sizeof k);
+            k.movie_ts = m->movie_ts;
             if (walk_trak(m, b.off + b.hdr, b.off + b.size, &k) < 0) { trak_free(&k); snprintf(m->err, sizeof m->err, "out of memory"); return -1; }
             Mp4Track *t = NULL;
             int video = 0;
@@ -502,6 +517,10 @@ static int walk_moov(Mp4File *m, uint64_t off, uint64_t end)
                 }
             }
             trak_free(&k);
+        } else if (b.type == FOURCC('m', 'v', 'h', 'd')) {
+            uint8_t *p = read_payload(m, b.off + b.hdr, b.size - b.hdr < 24 ? b.size - b.hdr : 24);
+            if (p && b.size - b.hdr >= 24) m->movie_ts = be32(p + (p[0] == 1 ? 20 : 12));
+            free(p);
         } else if (b.type == FOURCC('m', 'v', 'e', 'x')) {
             snprintf(m->err, sizeof m->err, "fragmented MP4 isn't supported (re-mux it)");
         }
