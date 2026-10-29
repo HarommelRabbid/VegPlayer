@@ -180,7 +180,9 @@ static void pic_setup(Dec *d, SceAvcdecPicture *pic, SceAvcdecPicture **pp, SceA
 {
     memset(pic, 0, sizeof *pic);
     memset(arr, 0, sizeof *arr);
-    pic->size = sizeof *pic;
+    /* MPEG-4's picture is the AVC frame description with a shorter info block: the kernel wants size 0x5C exactly
+     * (else 0x8062090E, invalid argument size) and fills only that much */
+    pic->size = d->codec == &M4V ? 0x5C : sizeof *pic;
     pic->frame.pixelType = SCE_AVCDEC_PIXELFORMAT_RGBA8888;
     pic->frame.framePitch = (uint32_t)d->pitch;
     pic->frame.frameWidth = (uint32_t)d->fw;
@@ -213,7 +215,8 @@ static void got_picture(Ctx *c, Dec *d, const SceAvcdecPicture *pic)
 {
     int k = -1, at = -1;
     uint32_t pts = pic->info.pts.lower;
-    for (int i = 0; i < c->npending; i++) if ((uint32_t)c->pending[i] == pts && pic->info.pts.upper == 0) { at = i; break; }
+    if (d->codec != &M4V)   /* MPEG-4's info block isn't AVC's: its pictures are taken in display order (below) */
+        for (int i = 0; i < c->npending; i++) if ((uint32_t)c->pending[i] == pts && pic->info.pts.upper == 0) { at = i; break; }
     if (at < 0) {   /* no usable PTS: pictures leave in display order, so it's the smallest pending index */
         for (int i = 0; i < c->npending; i++) if (at < 0 || c->pending[i] < c->pending[at]) at = i;
     }
