@@ -49,10 +49,29 @@ void m4v_probe(int w, int h)
     static int done;
     if (done) return;
     done = 1;
-    mkdir_p(PROBE_DIR);
-    dump_module("SceAvcodecUser");
-    static const uint32_t TYPES[] = { 0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1010, 0x1011, 0x2001, 0x2002, 0x3001, 0x0001,
-                                      0x0002, 0x0003, 0x0004 };
+    /* the MPEG-4 type is 0x1002 (its decoder size query answers); find the library init struct it accepts */
+    {
+        uint32_t W = (uint32_t)((w + 15) & ~15), H = (uint32_t)((h + 15) & ~15);
+        static const char *what[] = { "size 0x10 {w,h,streams}", "size 0x10 {w,h,refs}", "size 0x14 {w,h,0,1}", "size 0x14 {w,h,1,1}",
+                                      "size 0x0C {w,h}", "size 0x18 {w,h,2,1,0}", "size 0x14 {w,h,2,1} (AVC)", "size 0x20 {w,h,2,1}" };
+        uint32_t v[8][8] = { { 0x10, W, H, 1 }, { 0x10, W, H, 2 }, { 0x14, W, H, 0, 1 }, { 0x14, W, H, 1, 1 }, { 0x0C, W, H },
+                             { 0x18, W, H, 2, 1, 0 }, { 0x14, W, H, 2, 1 }, { 0x20, W, H, 2, 1 } };
+        for (int i = 0; i < 8; i++) {
+            uint32_t mem[8] = { 0 };
+            int r = sceVideodecQueryMemSize(0x1002, v[i], mem);
+            LOG("m4vprobe: VideodecQueryMemSize(0x1002, %s): 0x%08X (mem %u)", what[i], (unsigned)r, (unsigned)mem[0]);
+        }
+        for (uint32_t refs = 0; refs < 4; refs++) {
+            uint32_t q[8] = { W, H, refs }, info[8] = { 0 };
+            int r = sceM4vdecQueryDecoderMemSize(0x1002, q, info);
+            LOG("m4vprobe: M4vdecQueryDecoderMemSize(0x1002, %ux%u, third word %u): 0x%08X -> %u", (unsigned)W, (unsigned)H, (unsigned)refs,
+                (unsigned)r, (unsigned)info[0]);
+        }
+        uint32_t q2[8] = { 720, 480, 2 }, info2[8] = { 0 };
+        int r = sceM4vdecQueryDecoderMemSize(0x1002, q2, info2);
+        LOG("m4vprobe: M4vdecQueryDecoderMemSize(0x1002, 720x480): 0x%08X -> %u", (unsigned)r, (unsigned)info2[0]);
+    }
+    static const uint32_t TYPES[] = { 0x1001, 0x1002 };
     for (size_t i = 0; i < sizeof TYPES / sizeof *TYPES; i++) {
         uint32_t init[8] = { 0x14, (uint32_t)((w + 15) & ~15), (uint32_t)((h + 15) & ~15), 2, 1 };   /* AVC init layout */
         uint32_t mem[8] = { 0 };

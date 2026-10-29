@@ -8,11 +8,14 @@
 #include "media.h"
 #include "mp4.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
+#include <libavutil/log.h>
 #include <libavutil/mem.h>
 
 /* planar 4:2:0 -> RGBA bytes, BT.601; limited range (16-235) unless the stream says full range (PSP videos do) */
@@ -35,6 +38,18 @@ static void yuv420_to_rgba(const AVFrame *f, int w, int h, uint8_t *dst)
     }
 }
 
+/* FFmpeg's own warnings and errors go to the log */
+static void av_log_to_ours(void *avcl, int level, const char *fmt, va_list vl)
+{
+    (void)avcl;
+    if (level > AV_LOG_WARNING) return;
+    char b[256];
+    vsnprintf(b, sizeof b, fmt, vl);
+    size_t n = strlen(b);
+    while (n && (b[n - 1] == '\n' || b[n - 1] == '\r')) b[--n] = 0;
+    LOG("ffmpeg: %s", b);
+}
+
 typedef struct {
     VideoCache *vc;
     const uint8_t *need;
@@ -42,15 +57,24 @@ typedef struct {
     int w, h;
     int produced;
     int bad_format;
+    int got, rej_range, rej_need, rej_have, rej_full, logged;   /* diagnostics */
 } SwCtx;
 
 static void keep_frame(SwCtx *c, const AVFrame *f)
 {
     int64_t k = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
     VideoCache *vc = c->vc;
-    if (k < 0 || k >= vc->nframes || !c->need[k] || vc->slot[k] >= 0) return;
+    c->got++;
+    if (c->logged < 4) {
+        c->logged++;
+        LOG("vdec_sw: frame out: pts %lld, best effort %lld, format %d, %dx%d, range %d", (long long)f->pts,
+            (long long)f->best_effort_timestamp, f->format, f->width, f->height, (int)f->color_range);
+    }
+    if (k < 0 || k >= vc->nframes) { c->rej_range++; return; }
+    if (!c->need[k]) { c->rej_need++; return; }
+    if (vc->slot[k] >= 0) { c->rej_have++; return; }
     int s = c->produced;   /* cache slots are filled in order */
-    if (s >= vc->nimg) return;
+    if (s >= vc->nimg) { c->rej_full++; return; }
     if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
         if (!c->bad_format++) LOG("vdec_sw: unexpected pixel format %d", f->format);
         return;
@@ -64,10 +88,13 @@ static void keep_frame(SwCtx *c, const AVFrame *f)
 
 static void receive_all(AVCodecContext *ctx, AVFrame *fr, SwCtx *c)
 {
-    while (avcodec_receive_frame(ctx, fr) == 0) {
+    static int logged;
+    int r;
+    while ((r = avcodec_receive_frame(ctx, fr)) == 0) {
         keep_frame(c, fr);
         av_frame_unref(fr);
     }
+    if (r != AVERROR(EAGAIN) && r != AVERROR_EOF && logged++ < 8) LOG("vdec_sw: receive_frame: %d", r);
 }
 
 /* the frames still held back for reordering, then a clean decoder for the next run */
@@ -103,6 +130,7 @@ int vdec_fill_cache_sw(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatil
         memcpy(ctx->extradata, t->dsi, (size_t)t->dsi_len);
         ctx->extradata_size = t->dsi_len;
     }
+    av_log_set_callback(av_log_to_ours);
     ctx->width = w; ctx->height = h;
     ctx->thread_count = 1;
     int r = avcodec_open2(ctx, codec, NULL);
@@ -166,7 +194,9 @@ int vdec_fill_cache_sw(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatil
     }
     sw_drain(ctx, fr, &c);
     av_free(buf);
-    LOG("vdec_sw: MPEG-4 %dx%d: kept %d of %d needed frames (%d errors)", w, h, c.produced, total_need, errors);
+    LOG("vdec_sw: MPEG-4 %dx%d: kept %d of %d needed frames (%d errors); %d frames out (not kept: %d out of range, %d not needed, "
+        "%d already, %d cache full); cache %d slots", w, h, c.produced, total_need, errors, c.got, c.rej_range, c.rej_need, c.rej_have,
+        c.rej_full, vc->nimg);
     if (!c.produced && result == 0) { snprintf(err, errlen, "no frames could be decoded"); result = -1; }
 out:
     if (ctx) avcodec_free_context(&ctx);
