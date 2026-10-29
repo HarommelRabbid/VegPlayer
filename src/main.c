@@ -14,6 +14,7 @@
 #include "scene.h"
 #include "veg.h"
 #include "vexport.h"
+#include "encprobe.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -912,7 +913,7 @@ static void export_frame(void)
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         return;
     }
-    header("Export", "{X} export   {O} back");
+    header("Export", "{X} export   {T} encoder test   {O} back");
     int vid = EXPORTS[g_esel].fmt >= EXPORT_MP4;
     if (vid) {
         textf(40, 66, COL_DIM, 0.8f, "H.264 + AAC at 29.97 fps, made by the system's recorder; saved to ux0:data/vegplayer/vexports.");
@@ -936,6 +937,12 @@ static void export_frame(void)
             if (vexport_start(EXPORTS[g_esel].fmt - EXPORT_MP4) < 0) flash("%s", g_vexp.msg[0] ? g_vexp.msg : "Couldn't start the video export");
             else g_vexp_active = 1;
         } else if (export_start(EXPORTS[g_esel].fmt, EXPORTS[g_esel].kbps) < 0) flash("Couldn't start the export");
+    }
+    if (g_pressed & SCE_CTRL_TRIANGLE) {   /* hardware H.264 encoder test at 960x544; results in the log */
+        static char m[160];
+        audio_play(0);
+        encprobe_run(m, sizeof m);
+        flash("%s", m);
     }
     if (g_pressed & SCE_CTRL_CIRCLE) { g_export_after_prepare = 0; g_state = ST_PROJECT; }
 }
