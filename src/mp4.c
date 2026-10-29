@@ -52,8 +52,9 @@ static uint32_t getbits(Bits *b, int n) { uint32_t v = 0; while (n--) v = v << 1
 static uint32_t ue(Bits *b) { int z = 0; while (!getbit(b) && z < 32) z++; return z ? ((1u << z) - 1 + getbits(b, z)) : 0; }
 static int32_t se(Bits *b) { uint32_t k = ue(b); return (k & 1) ? (int32_t)((k + 1) / 2) : -(int32_t)(k / 2); }
 
-int h264_sps_max_refs(const uint8_t *nal, int len)
+int h264_sps_parse(const uint8_t *nal, int len, int *full_range, int *matrix)
 {
+    *full_range = *matrix = -1;
     /* strip emulation prevention bytes */
     uint8_t rb[256];
     int n = 0;
@@ -91,7 +92,29 @@ int h264_sps_max_refs(const uint8_t *nal, int len)
         for (uint32_t i = 0; i < k && i < 256; i++) se(&b);
     }
     uint32_t refs = ue(&b);
+    /* on to the VUI's video signal type: full range flag and matrix coefficients */
+    getbit(&b);                       /* gaps in frame_num allowed */
+    ue(&b); ue(&b);                   /* picture size in macroblocks */
+    if (!getbit(&b)) getbit(&b);      /* frame_mbs_only, else mb_adaptive_frame_field */
+    getbit(&b);                       /* direct_8x8_inference */
+    if (getbit(&b)) { ue(&b); ue(&b); ue(&b); ue(&b); }   /* cropping */
+    if (b.pos < b.len * 8 && getbit(&b)) {                 /* vui_parameters_present */
+        if (getbit(&b) && getbits(&b, 8) == 255) getbits(&b, 32);   /* aspect ratio (extended SAR) */
+        if (getbit(&b)) getbit(&b);                       /* overscan */
+        if (getbit(&b)) {                                 /* video_signal_type_present */
+            getbits(&b, 3);
+            *full_range = getbit(&b);
+            if (getbit(&b)) { getbits(&b, 16); *matrix = (int)getbits(&b, 8); }
+        }
+        if (b.pos > b.len * 8) *full_range = *matrix = -1;   /* ran off the end: not trustworthy */
+    }
     return refs <= 16 ? (int)refs : 0;
+}
+
+int h264_sps_max_refs(const uint8_t *nal, int len)
+{
+    int fr, mx;
+    return h264_sps_parse(nal, len, &fr, &mx);
 }
 
 static void parse_avcc(Mp4Track *t, const uint8_t *p, uint32_t len)
@@ -120,7 +143,12 @@ static void parse_avcc(Mp4Track *t, const uint8_t *p, uint32_t len)
         }
         q += l;
     }
-    if (t->nsps) t->max_ref_frames = h264_sps_max_refs(t->sps[0], t->sps_len[0]);
+    if (t->nsps) {
+        int fr, mx;
+        t->max_ref_frames = h264_sps_parse(t->sps[0], t->sps_len[0], &fr, &mx);
+        if (fr >= 0) t->full_range = fr;   /* the stream's own flags win over a 'colr' box */
+        if (mx >= 0) t->matrix = mx;
+    }
 }
 
 static uint32_t desc_len(const uint8_t *p, uint32_t len, uint32_t *q)
@@ -204,6 +232,9 @@ static void scan_entry_children(Mp4Track *t, const uint8_t *p, uint32_t len)
         else if (ty == FOURCC('p', 'c', 'm', 'C') && sz >= 14) {   /* ISO 23003-5: format flags (bit 0 little-endian), bits */
             t->pcm_le = p[q + 12] & 1;
             t->pcm_bits = p[q + 13];
+        } else if (ty == FOURCC('c', 'o', 'l', 'r') && sz >= 19 && be32(p + q + 8) == FOURCC('n', 'c', 'l', 'x')) {
+            if (t->matrix < 0) t->matrix = be16(p + q + 16);
+            if (t->full_range < 0) t->full_range = p[q + 18] >> 7;
         } else if (ty == FOURCC('e', 'n', 'd', 'a') && sz >= 10) t->pcm_le = be16(p + q + 8) != 0;   /* QuickTime */
         q += sz;
     }
@@ -217,6 +248,7 @@ static int parse_stsd(Mp4Track *t, const uint8_t *p, uint64_t len, int video)
     const uint8_t *e = p + 16;        /* after the entry's size + type */
     uint32_t el = esz - 8;
     t->codec = fmt;
+    t->full_range = t->matrix = -1;
     if (video) {
         int avc = fmt == FOURCC('a', 'v', 'c', '1') || fmt == FOURCC('a', 'v', 'c', '3');
         if (!avc && fmt != FOURCC('m', 'p', '4', 'v')) return -2;

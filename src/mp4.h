@@ -24,6 +24,7 @@ typedef struct {
     uint8_t *sps[4]; uint16_t sps_len[4]; int nsps;
     uint8_t *pps[4]; uint16_t pps_len[4]; int npps;
     int max_ref_frames;        /* from the SPS, 0 if unknown */
+    int full_range, matrix;    /* colour signalling (SPS VUI, else the 'colr' box): -1 = not stated */
     /* audio (mp4a) */
     int channels, sample_rate; /* from the AudioSpecificConfig when present */
     int aot;                   /* audio object type (2 = AAC-LC, 5 = SBR, 29 = PS) */
@@ -59,5 +60,7 @@ int mp4_avcc_to_annexb(const Mp4Track *t, const uint8_t *in, uint32_t inlen, uin
 void mp4_adts_header(const Mp4Track *t, uint32_t len, uint8_t hdr[7]);
 /* parse an H.264 SPS (without the NAL header byte stripped: pass the whole NAL) for max_num_ref_frames */
 int h264_sps_max_refs(const uint8_t *nal, int len);
+/* the same, also the VUI's video_full_range_flag and matrix_coefficients (-1 when absent) */
+int h264_sps_parse(const uint8_t *nal, int len, int *full_range, int *matrix);
 
 #endif

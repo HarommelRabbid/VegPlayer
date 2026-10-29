@@ -65,7 +65,7 @@ static void m4v_lib_init(int w, int h)
 {
     uint32_t v[8] = { 0x14, (uint32_t)ALIGN16(w), (uint32_t)ALIGN16(h), 2, 1 };
     int r = sceVideodecInitLibraryInternal(TYPE_M4V, v);
-    LOG("vdec: MPEG-4 library set-up (%ux%u): 0x%08X", (unsigned)v[1], (unsigned)v[2], (unsigned)r);
+    if (r < 0) LOG("vdec: MPEG-4 library set-up (%ux%u) failed: 0x%08X", (unsigned)v[1], (unsigned)v[2], (unsigned)r);
     if (r >= 0) g_m4v_inited = 1;
 }
 
@@ -128,6 +128,7 @@ typedef struct {
     int pitch, fw, fh;      /* picture buffer pitch / size in pixels */
     int created;
     int w, h, refs;
+    int csc;                /* SCE_AVCDEC_CSC_COEFFICIENT_* for the RGBA output (0 = decoder default) */
 } Dec;
 
 static void dec_destroy(Dec *d)
@@ -162,7 +163,6 @@ static int dec_create(Dec *d, const Codec *codec, int w, int h, int refs, char *
         d->ctrl.frameBuf.pBuf = base;
         d->ctrl.frameBuf.size = (uint32_t)sz;
         r = sceM4vdecCreateDecoder(TYPE_M4V, &d->ctrl, &q);
-        LOG("vdec: sceM4vdecCreateDecoder(%dx%d, AU buffer %u, %u KB): 0x%08X", w, h, (unsigned)q.numOfRefFrames, (unsigned)(sz >> 10), (unsigned)r);
     } else {
         d->ctrl.frameBuf.pBuf = g_dec_base;
         d->ctrl.frameBuf.size = (uint32_t)g_dec_size;
@@ -188,6 +188,7 @@ static void pic_setup(Dec *d, SceAvcdecPicture *pic, SceAvcdecPicture **pp, SceA
     pic->frame.frameWidth = (uint32_t)d->fw;
     pic->frame.frameHeight = (uint32_t)d->fh;
     pic->frame.opt.rgba.alpha = 0xFF;
+    pic->frame.opt.rgba.cscCoefficient = (uint8_t)d->csc;
     pic->frame.pPicture[0] = d->pic;
     *pp = pic;
     arr->numOfElm = 1;
@@ -202,7 +203,6 @@ typedef struct {
     uint8_t *scratch;
     int src_w, src_h;
     int produced;
-    int logged_m4v;
 } Ctx;
 
 static void pending_add(Ctx *c, int k)
@@ -248,9 +248,11 @@ static void drain(Ctx *c, Dec *d)
     c->npending = 0;
     int w = d->w, h = d->h, refs = d->refs;
     const Codec *codec = d->codec;
+    int csc = d->csc;
     char err[96];
     dec_destroy(d);
     if (dec_create(d, codec, w, h, refs, err, sizeof err) < 0) LOG("vdec: re-create failed: %s", err);
+    d->csc = csc;
 }
 
 int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile float *progress, volatile int *cancel, char *err, size_t errlen)
@@ -300,6 +302,16 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
         free(disp_of); free(samp_of); free(pend); free(es); free(raw); free(c.scratch);
         return -1;
     }
+    /* H.264 colours: the stream's own signalling picks the RGB conversion (ITU-R BT.601 or BT.709, TV or full range);
+     * unstated matrix: BT.709 from 720 lines up, BT.601 below (the usual convention). MPEG-4 keeps the decoder's
+     * default, which already follows the stream. */
+    if (codec == &AVC) {
+        int m709 = t->matrix == 1 || (t->matrix != 5 && t->matrix != 6 && h >= 720);
+        int full = t->full_range == 1;
+        d.csc = m709 ? (full ? 4 : 2) : (full ? 3 : 1);   /* ITU709_FULL / ITU709 / ITU601_FULL / ITU601 */
+        LOG("vdec: H.264 %dx%d colours: %s, %s range (stream: matrix %d, full range %d)", w, h, m709 ? "BT.709" : "BT.601",
+            full ? "full" : "TV", t->matrix, t->full_range);
+    }
     c.vc = vc; c.need = need; c.pending = pend; c.src_w = w; c.src_h = h;
 
     int total_need = 0;
@@ -342,10 +354,6 @@ int vdec_fill_cache(Mp4File *mf, VideoCache *vc, const uint8_t *need, volatile f
             pic_setup(&d, &pic, &pp, &arr);
             pending_add(&c, disp_of[pos]);
             int r = codec->decode(&d.ctrl, &au, &arr);
-            if (codec == &M4V && c.logged_m4v < 3) {
-                c.logged_m4v++;
-                LOG("vdec: sceM4vdecDecode(sample %d, %d bytes): 0x%08X, %u picture(s) out", pos, len, (unsigned)r, (unsigned)arr.numOfOutput);
-            }
             if (r < 0) {
                 errors++;
                 if (errors < 8) LOG("vdec: %s decode error 0x%08X at sample %d", codec->name, r, pos);
