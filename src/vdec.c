@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/sysmodule.h>
 #include <psp2/videodec.h>
@@ -81,6 +82,62 @@ static void m4v_lib_init(int w, int h)
     }
 }
 
+/* TEMPORARY research: find a system library that uses sceM4vdec (its code shows how the decoder is created).
+ * Loads each public system module in turn, looks through every loaded module for the M4vdec function NIDs in its
+ * import tables, logs where they are found and saves those modules to ux0:data/vegplayer/m4vdec/; then unloads
+ * what it loaded. */
+static void m4v_sweep(void)
+{
+    static const uint32_t NIDS[] = { 0x17C6AC9E, 0x4D4CA34E, 0xB4BC325B, 0x624664DB, 0xA8CF1942, 0x7C460D75, 0x87CFD23B, 0xC1CF351F,
+                                     0x8F36574D, 0x0EB2E4E7, 0xC67C1A80, 0x84DC8101 };
+    /* the media-related ones: MP4 (sceMp4 player), AacEnc, Atrac, VideoExport, AudioCodec, VideoSearch, BEISOBMF,
+     * BEMP2SYS, MusicExport, AvPlayer, Mp4Recorder, AvcDec, PhotoExport, ScreenShot */
+    static const int IDS[] = { 0x2D, 0x2E, 0x30, 0x32, 0x37, 0x45, 0x47, 0x48, 0x49, 0x4C, 0x51, 0x54, 0x16, 0x1D };
+    int loaded[0x56] = { 0 };
+    for (size_t i = 0; i < sizeof IDS / sizeof *IDS; i++) {
+        int id = IDS[i];
+        if (sceSysmoduleIsLoaded((SceSysmoduleModuleId)id) == 0) continue;
+        int r = sceSysmoduleLoadModule((SceSysmoduleModuleId)id);
+        LOG("m4vsweep: load sysmodule 0x%02X: 0x%08X", id, (unsigned)r);
+        if (r >= 0) loaded[id] = 1;
+    }
+    mkdir_p(APP_DIR "/m4vdec");
+    SceUID ids[256];
+    SceSize n = 256;
+    if (sceKernelGetModuleList(0xFF, ids, &n) >= 0) {
+        LOG("m4vsweep: %u modules loaded", (unsigned)n);
+        for (SceSize i = 0; i < n; i++) {
+            SceKernelModuleInfo mi;
+            memset(&mi, 0, sizeof mi);
+            mi.size = sizeof mi;
+            if (sceKernelGetModuleInfo(ids[i], &mi) < 0) continue;
+            mi.module_name[sizeof mi.module_name - 1] = 0;
+            if (!strcmp(mi.module_name, "SceAvcodecUser") || !strcmp(mi.module_name, "VegPlayer")) continue;
+            int hits = 0;
+            for (int k = 0; k < 4; k++) {
+                const uint32_t *w = mi.segments[k].vaddr;
+                if (!w || !(mi.segments[k].perms & 4)) continue;   /* readable */
+                for (size_t j = 0; j < mi.segments[k].memsz / 4; j++)
+                    for (size_t q = 0; q < sizeof NIDS / sizeof *NIDS; q++)
+                        if (w[j] == NIDS[q]) hits++;
+            }
+            if (!hits) continue;
+            LOG("m4vsweep: %s (%s) has %d M4vdec NID(s)", mi.module_name, mi.path, hits);
+            for (int k = 0; k < 4; k++) {
+                if (!mi.segments[k].memsz || !mi.segments[k].vaddr) continue;
+                char path[200];
+                snprintf(path, sizeof path, APP_DIR "/m4vdec/%s_seg%d_%08X.bin", mi.module_name, k, (unsigned)(uintptr_t)mi.segments[k].vaddr);
+                FILE *f = fopen(path, "wb");
+                if (!f) continue;
+                fwrite(mi.segments[k].vaddr, 1, mi.segments[k].memsz, f);
+                fclose(f);
+                LOG("m4vsweep: saved %s", path);
+            }
+        }
+    }
+    for (int id = 0x55; id >= 1; id--) if (loaded[id]) sceSysmoduleUnloadModule((SceSysmoduleModuleId)id);
+}
+
 int vdec_global_init(int max_w, int max_h, int max_refs, int with_m4v)
 {
     if (g_vdec_inited) return 0;
@@ -116,6 +173,7 @@ int vdec_global_init(int max_w, int max_h, int max_refs, int with_m4v)
     sceKernelGetMemBlockBase(g_dec_mem, &g_dec_base);
     sceKernelGetMemBlockBase(g_pic_mem, (void **)&g_pic_base);
     LOG("vdec: hardware AVC decoder ready (%dx%d, %d refs, %u KB)", g_max_w, g_max_h, max_refs, (unsigned)(g_dec_size >> 10));
+    if (with_m4v) { static int swept; if (!swept) { swept = 1; m4v_sweep(); } }
     if (with_m4v && !g_m4v_inited) m4v_lib_init(max_w, max_h);
     return 0;
 }
