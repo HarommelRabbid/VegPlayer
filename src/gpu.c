@@ -367,6 +367,7 @@ typedef struct {
     const char *name, *src;
     SceGxmProgram *gxp;
     SceGxmShaderPatcherId id;
+    unsigned fp_failed;   /* blend variants that couldn't be made */
     SceGxmFragmentProgram *fp[BLEND_COUNT];
     const SceGxmProgramParameter *mat[3], *post[3], *tint, *lutp, *dir, *rad, *w[5], *soft, *fxu[4];
     int tex_unit, lut_unit;
@@ -488,6 +489,40 @@ static int unit_of(const SceGxmProgram *p, const char *name)
 }
 
 /* register one fragment program and create its blend variants */
+static int make_fp(FProg *f, int bl)
+{
+    static const struct { int src, dst, func; } BL[BLEND_COUNT] = {
+        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* normal */
+        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_ADD },                   /* add */
+        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT },      /* dst - src */
+        { SCE_GXM_BLEND_FACTOR_DST_COLOR, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* multiply (premultiplied src) */
+        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, SCE_GXM_BLEND_FUNC_ADD },         /* screen (premultiplied src) */
+        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MAX },                         /* lighten (src towards black) */
+        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MIN },                         /* darken (src towards white) */
+        { SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },        /* cut: punch a hole */
+        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FUNC_ADD },                        /* copy */
+    };
+    if (f->fp[bl]) return 1;
+    if (f->fp_failed & (1u << bl)) return 0;
+    SceGxmBlendInfo bi;
+    memset(&bi, 0, sizeof bi);
+    bi.colorMask = SCE_GXM_COLOR_MASK_ALL;
+    bi.colorFunc = (uint8_t)BL[bl].func;
+    bi.alphaFunc = SCE_GXM_BLEND_FUNC_ADD;
+    bi.colorSrc = (uint8_t)BL[bl].src;
+    bi.colorDst = (uint8_t)BL[bl].dst;
+    bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    bi.alphaDst = bl == BLEND_COPY ? SCE_GXM_BLEND_FACTOR_ZERO : SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    if (sceGxmShaderPatcherCreateFragmentProgram(vita2d_get_shader_patcher(), f->id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+                                                 SCE_GXM_MULTISAMPLE_NONE, &bi, g_vprog_gxp, &f->fp[bl]) < 0) {
+        f->fp[bl] = NULL;
+        f->fp_failed |= 1u << bl;
+        LOG("gpu: %s fragment program (blend %d) creation failed", f->name, bl);
+        return 0;
+    }
+    return 1;
+}
+
 static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
 {
     if (!f->gxp || sceGxmProgramCheck(f->gxp) < 0 || sceGxmShaderPatcherRegisterProgram(sp, f->gxp, &f->id) < 0) return -1;
@@ -501,33 +536,9 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
     f->lut_unit = unit_of(f->gxp, "lut");
     int shadow = f == &g_fp[PASS_SHADOW];
     if ((!shadow && (!f->mat[0] || !f->mat[1] || !f->mat[2])) || (shadow && !f->soft) || !f->tint || f->tex_unit < 0) return -1;
-    static const struct { int src, dst, func; } BL[BLEND_COUNT] = {
-        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* normal */
-        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_ADD },                   /* add */
-        { SCE_GXM_BLEND_FACTOR_SRC_ALPHA, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT },      /* dst - src */
-        { SCE_GXM_BLEND_FACTOR_DST_COLOR, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },   /* multiply (premultiplied src) */
-        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, SCE_GXM_BLEND_FUNC_ADD },         /* screen (premultiplied src) */
-        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MAX },                         /* lighten (src towards black) */
-        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MIN },                         /* darken (src towards white) */
-        { SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },        /* cut: punch a hole */
-        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FUNC_ADD },                        /* copy */
-    };
-    for (int i = 0; i < BLEND_COUNT; i++) {
-        SceGxmBlendInfo bi;
-        memset(&bi, 0, sizeof bi);
-        bi.colorMask = SCE_GXM_COLOR_MASK_ALL;
-        bi.colorFunc = (uint8_t)BL[i].func;
-        bi.alphaFunc = SCE_GXM_BLEND_FUNC_ADD;
-        bi.colorSrc = (uint8_t)BL[i].src;
-        bi.colorDst = (uint8_t)BL[i].dst;
-        bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
-        bi.alphaDst = i == BLEND_COPY ? SCE_GXM_BLEND_FACTOR_ZERO : SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        if (sceGxmShaderPatcherCreateFragmentProgram(sp, f->id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
-                                                     &bi, g_vprog_gxp, &f->fp[i]) < 0) {
-            LOG("gpu: %s fragment program (blend %d) creation failed", f->name, i);
-            return -1;
-        }
-    }
+    /* the blend variants are made when first drawn (fp_for): all of them for every pass at once ran the shader
+     * patcher out of room on the console (the 8th and later passes' programs failed). The plain one now, as a check */
+    if (!make_fp(f, BLEND_NORMAL)) return -1;
     f->ok = 1;
     return 0;
 }
@@ -655,9 +666,13 @@ static void draw_layer_v(const GpuLayer *L, vita2d_texture_vertex *v)
 
     int pass = L->pass >= 0 && L->pass < PASS_COUNT && g_fp[L->pass].ok ? L->pass : PASS_MATRIX;
     if (pass == PASS_LUT && !L->lut) pass = PASS_MATRIX;
+    int bl = L->blend >= 0 && L->blend < BLEND_COUNT ? L->blend : BLEND_NORMAL;
+    if (!make_fp(&g_fp[pass], bl)) {   /* no room for that variant: the effect without its pass, or the plain blend */
+        if (make_fp(&g_fp[PASS_MATRIX], bl)) pass = PASS_MATRIX;
+        else bl = BLEND_NORMAL;
+    }
     const FProg *f = &g_fp[pass];
     SceGxmContext *ctx = vita2d_get_context();
-    int bl = L->blend >= 0 && L->blend < BLEND_COUNT ? L->blend : BLEND_NORMAL;
     sceGxmSetVertexProgram(ctx, g_vprog);
     sceGxmSetFragmentProgram(ctx, f->fp[bl]);
     void *vbuf, *fbuf;
