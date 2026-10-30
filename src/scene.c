@@ -422,12 +422,13 @@ static void tm_at(const VegTrack *t, double T, double *x, double *y, double *w, 
  * - when the source has another size, Vegas rescales the window with it, separately in x and y, so the whole
  *   layout takes the new source's shape (a 1:1 source turns a 16:9 grid into a square one);
  * - the window is fitted into the output frame keeping its shape, then Track Motion scales/moves the frame. */
-static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, const VegTmFx *fx,
-                  float ox[4], float oy[4])
+static int place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, const VegTmFx *fx,
+                 float ox[4], float oy[4], float wx[4], float wy[4])
 {
     double W = p->width, H = p->height;
     double px[4] = { 0, (double)pw, 0, (double)pw }, py[4] = { 0, 0, (double)ph, (double)ph };
-    double qx[4], qy[4];
+    double qx[8], qy[8];   /* the picture's corners, then the Pan/Crop window's (what Vegas shows of the picture) */
+    int nq = 4;
     double lx = 1, ly = 1;   /* how much the layout shrank/grew because the source has another shape (see below) */
     if (e->npan) {
         VegPanKey k;
@@ -460,6 +461,12 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
             qx[i] = W / 2 + kk * rx;
             qy[i] = H / 2 + kk * ry;
         }
+        /* the window itself: the event frame shows only what is inside it (a window narrower than the frame leaves
+         * transparent bars at the sides; Red Zone's strips are made that way) */
+        double hw = aw * kk / 2, hh = ah * kk / 2;
+        static const double SX[4] = { -1, 1, -1, 1 }, SY[4] = { -1, -1, 1, 1 };
+        for (int i = 0; i < 4; i++) { qx[4 + i] = W / 2 + SX[i] * hw; qy[4 + i] = H / 2 + SY[i] * hh; }
+        nq = 8;
     } else {
         double fit = fmin(W / pw, H / ph);
         double bw = pw * fit, bh = ph * fit, x0 = (W - bw) / 2, y0 = (H - bh) / 2;
@@ -467,7 +474,7 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
     }
     if (fx) {   /* shadow / glow: moved and scaled inside the track's frame, before Track Motion */
         double cx = W / 2 + fx->x * H / 2 * lx, cy = H / 2 - fx->y * H / 2 * ly;
-        for (int i = 0; i < 4; i++) { qx[i] = cx + (qx[i] - W / 2) * fx->w; qy[i] = cy + (qy[i] - H / 2) * fx->h; }
+        for (int i = 0; i < nq; i++) { qx[i] = cx + (qx[i] - W / 2) * fx->w; qy[i] = cy + (qy[i] - H / 2) * fx->h; }
     }
     if (t->has_motion) {
         double asp = W / H, mx, my, mw, mh, rot;
@@ -476,7 +483,7 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
         double sx = fabs(tw) / asp, sy = fabs(th);
         double cx = W / 2 + mx * H / 2 * lx, cy = H / 2 - my * H / 2 * ly;
         double c = cos(rot), s = sin(rot);   /* counter-clockwise on screen (y points down) */
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < nq; i++) {
             double dx = (qx[i] - W / 2) * sx, dy = (qy[i] - H / 2) * sy;
             if (tw < 0) dx = -dx;
             if (th < 0) dy = -dy;
@@ -485,6 +492,9 @@ static void place(const VegProject *p, const VegEvent *e, const VegTrack *t, dou
     }
     double s = g_vw / W;
     for (int i = 0; i < 4; i++) { ox[i] = (float)(g_vx + qx[i] * s); oy[i] = (float)(g_vy + qy[i] * s); }
+    if (nq < 8 || !wx) return 0;
+    for (int i = 0; i < 4; i++) { wx[i] = (float)(g_vx + qx[4 + i] * s); wy[i] = (float)(g_vy + qy[4 + i] * s); }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ frame lookup */
@@ -548,15 +558,79 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
 
 /* ------------------------------------------------------------------ building */
 
+/* cut a placed layer to its Pan/Crop window (both convex, in screen units; the picture's texcoords are affine across
+ * its quad, so they are interpolated along). Returns -1 when the picture is inside the window anyway, else the number
+ * of pieces (0: nothing left): the clipped polygon (up to 8 corners) as a fan of quads, each in the corner order the
+ * draw uses (0, 1, 2 then 1, 2, 3). */
+typedef struct { float x, y, u, v; } ClipPt;
+static int clip_to_window(const GpuLayer *L, const float wx[4], const float wy[4], GpuLayer out[3])
+{
+    static const int RING[4] = { 0, 1, 3, 2 };
+    float ox[4], oy[4];
+    for (int i = 0; i < 4; i++) { ox[i] = wx[RING[i]]; oy[i] = wy[RING[i]]; }
+    float area = 0;
+    for (int i = 0; i < 4; i++) { int j = (i + 1) & 3; area += ox[i] * oy[j] - ox[j] * oy[i]; }
+    if (fabsf(area) < 1e-3f) return 0;
+    float sg = area > 0 ? 1.0f : -1.0f;
+    ClipPt a[12], b[12];
+    int n = 4, inside_all = 1;
+    for (int i = 0; i < 4; i++) { int c = RING[i]; a[i].x = L->x[c]; a[i].y = L->y[c]; a[i].u = L->u[c]; a[i].v = L->v[c]; }
+    for (int e = 0; e < 4; e++) {
+        float ex = ox[(e + 1) & 3] - ox[e], ey = oy[(e + 1) & 3] - oy[e];
+        for (int i = 0; i < 4; i++)
+            if (sg * (ex * (a[i].y - oy[e]) - ey * (a[i].x - ox[e])) < -0.01f) inside_all = 0;
+    }
+    if (inside_all) return -1;
+    for (int e = 0; e < 4 && n > 0; e++) {
+        float ex = ox[(e + 1) & 3] - ox[e], ey = oy[(e + 1) & 3] - oy[e];
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+            const ClipPt *P = &a[i], *Q = &a[(i + 1) % n];
+            float dp = sg * (ex * (P->y - oy[e]) - ey * (P->x - ox[e]));
+            float dq = sg * (ex * (Q->y - oy[e]) - ey * (Q->x - ox[e]));
+            if (dp >= 0) b[m++] = *P;
+            if ((dp >= 0) != (dq >= 0) && m < 12) {
+                float t = dp / (dp - dq);
+                b[m].x = P->x + (Q->x - P->x) * t; b[m].y = P->y + (Q->y - P->y) * t;
+                b[m].u = P->u + (Q->u - P->u) * t; b[m].v = P->v + (Q->v - P->v) * t;
+                m++;
+            }
+        }
+        n = m > 8 ? 8 : m;
+        memcpy(a, b, sizeof(ClipPt) * (size_t)n);
+    }
+    if (n < 3) return 0;
+    int np = 0;
+    for (int i = 1; i + 1 < n && np < 3; i += 2) {
+        const ClipPt *v[4] = { &a[i], &a[i + 1], &a[0], i + 2 < n ? &a[i + 2] : &a[i + 1] };
+        GpuLayer *O = &out[np++];
+        *O = *L;
+        for (int c = 0; c < 4; c++) { O->x[c] = v[c]->x; O->y[c] = v[c]->y; O->u[c] = v[c]->u; O->v[c] = v[c]->v; }
+        if (np > 1) { O->tex_prev = 1; O->nst = 0; }
+    }
+    return np;
+}
+
 /* a Track Motion shadow / glow layer for the picture img placed for event e: its shape, moved/scaled by fx, with edges
  * softened over the blur width, in the fx colour. Without the shadow shader: a flat, hard-edged quad of the colour. */
 static void tm_fx_layer(const VegProject *p, const VegEvent *e, const VegTrack *tr, double tau, int pw, int ph,
                         const VegTmFx *fx, const GpuImage *img, float alpha, GpuLayer *L)
 {
     memset(L, 0, sizeof *L);
-    place(p, e, tr, tau, pw, ph, fx, L->x, L->y);
+    float wx[4], wy[4];
+    int has_win = place(p, e, tr, tau, pw, ph, fx, L->x, L->y, wx, wy);
     static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
     for (int i = 0; i < 4; i++) { L->u[i] = CU[i]; L->v[i] = CV[i]; }
+    if (has_win) {
+        /* the shadow of the event frame: the picture cut to its Pan/Crop window. Taken as an opaque shape (the cut
+         * picture's own alpha isn't followed): the cut quad, or the window when the cut has more corners */
+        GpuLayer pc[3];
+        int np = clip_to_window(L, wx, wy, pc);
+        if (np == 0) { L->tint[3] = 0; L->tex = &img->tex; return; }
+        if (np == 1) { memcpy(L->x, pc[0].x, sizeof L->x); memcpy(L->y, pc[0].y, sizeof L->y); }
+        else if (np > 1) { memcpy(L->x, wx, sizeof L->x); memcpy(L->y, wy, sizeof L->y); }
+        if (np > 0 && g_s.white.data) img = &g_s.white;
+    }
     cm_identity(L->m);
     cm_identity(L->m2);
     L->blend = BLEND_NORMAL;
@@ -623,9 +697,10 @@ static void build(Scene *sc, int buf, double T)
                 pw = m->vc.src_w; ph = m->vc.src_h;
             }
             if (!img || pw <= 0 || ph <= 0) continue;   /* text / noise generators and missing sources */
-            if (tr->comp_mode == VEG_COMP_CUSTOM && g_cfg.compositing_guess) continue;   /* plug-in compositing (masks): hidden */
             GpuLayer *L = &sc->layer[sc->n];
-            place(p, e, tr, tau, pw, ph, NULL, L->x, L->y);
+            float win_x[4], win_y[4];
+            int has_win = place(p, e, tr, tau, pw, ph, NULL, L->x, L->y, win_x, win_y);
+            L->tex_prev = 0;
             if (vm->type == VEG_MEDIA_FILE && m->vc.imgq && g_cfg.small_copies) {
                 /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
                 float sw = hypotf(L->x[1] - L->x[0], L->y[1] - L->y[0]), sh = hypotf(L->x[2] - L->x[0], L->y[2] - L->y[0]);
@@ -657,6 +732,13 @@ static void build(Scene *sc, int buf, double T)
             if (ch.npre && sc->nstage + ch.npre <= MAX_STAGES) {
                 /* the earlier stages: each drawn over a whole render target of the picture's size (texture space) */
                 L->st0 = sc->nstage; L->nst = ch.npre; L->rt_w = img->w; L->rt_h = img->h;
+                if (img == &g_s.white) {
+                    /* a solid colour is a 1x1 texture: its stages (a Cookie Cutter's shape, say) need a frame-sized target */
+                    double k = fmin(1.0, fmin(960.0 / p->width, 544.0 / p->height));
+                    L->rt_w = (int)(p->width * k + 0.5); L->rt_h = (int)(p->height * k + 0.5);
+                    if (L->rt_w < 8) L->rt_w = 8;
+                    if (L->rt_h < 8) L->rt_h = 8;
+                }
                 for (int k = 0; k < ch.npre; k++) {
                     const Stage *S = &ch.pre[k];
                     GpuLayer *G = &sc->stage[sc->nstage++];
@@ -682,6 +764,7 @@ static void build(Scene *sc, int buf, double T)
                     G->tex = k == 0 ? &img->tex : NULL;
                 }
             }
+            int dodge = 0;
             float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
             /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
              * the fade-out is left out where the next event overlaps, since that one dissolves in on top */
@@ -722,6 +805,13 @@ static void build(Scene *sc, int buf, double T)
                 case VEG_COMP_SCREEN:   L->blend = BLEND_SCREEN; break;
                 case VEG_COMP_LIGHTEN:  L->blend = BLEND_LIGHTEN; break;
                 case VEG_COMP_DARKEN:   L->blend = BLEND_DARKEN; break;
+                case VEG_COMP_CUSTOM:
+                    /* a compositing plug-in. Red Zone's (the only one seen, on white solids for flashes and on a noise
+                     * texture) acts on its VEGAS render like a colour dodge: dark stays dark while the white fades in,
+                     * everything is white at full strength. A solid colour is done that way (below); others are hidden. */
+                    if (vm->type != VEG_MEDIA_SOLID || !gpu_shaders_ok()) { sc->nstage = L->nst ? L->st0 : sc->nstage; continue; }
+                    dodge = 1;
+                    break;
                 default: break;   /* Overlay, Hard Light, Dodge, Burn, Difference: need the picture below (normal) */
                 }
                 if (!gpu_shaders_ok() && L->blend != BLEND_ADD) L->blend = BLEND_NORMAL;   /* vita2d path: add only */
@@ -736,6 +826,36 @@ static void build(Scene *sc, int buf, double T)
                     }
                     L->tint[0] = L->tint[1] = L->tint[2] = 1.0f;
                     L->fx = 1;
+                }
+            }
+            /* the event frame shows only the Pan/Crop window's part of the picture */
+            GpuLayer pieces[8];
+            int npieces = -1;
+            if (has_win && L->pass != PASS_SHADOW) {
+                npieces = clip_to_window(L, win_x, win_y, pieces);
+                if (npieces == 0) { sc->nstage = L->nst ? L->st0 : sc->nstage; continue; }
+                if (npieces > 0) *L = pieces[0];
+            }
+            if (dodge) {
+                /* dodge by a constant colour c at opacity a: the picture below times 1 / (1 - a c), per channel. Done as
+                 * n multiply passes of (1 + s) each (premultiplied multiply with zero alpha: dst * (1 + src)) */
+                float a = L->tint[3], f[3], fmax = 1;
+                for (int c = 0; c < 3; c++) {
+                    float d = 1.0f - a * L->tint[c];
+                    f[c] = d > 1.0f / 256 ? 1.0f / d : 256.0f;
+                    if (f[c] > fmax) fmax = f[c];
+                }
+                if (fmax >= 32.0f) {
+                    L->tint[3] = 1;   /* (nearly) full strength: the colour everywhere, black included, as VEGAS shows it */
+                } else {
+                    int n = (int)ceilf(log2f(fmax) - 1e-4f);
+                    if (n < 1) n = 1;
+                    if (n > 8) n = 8;
+                    L->blend = BLEND_MULTIPLY;
+                    for (int c = 0; c < 3; c++) L->tint[c] = powf(f[c], 1.0f / n) - 1.0f;
+                    L->tint[3] = 0;
+                    npieces = n;
+                    for (int q = 1; q < n; q++) pieces[q] = *L;
                 }
             }
             /* Track Motion glow / shadow: drawn just behind the layer (glow first, then shadow) */
@@ -754,6 +874,7 @@ static void build(Scene *sc, int buf, double T)
                 }
             }
             sc->n++;
+            for (int q = 1; q < npieces && sc->n < MAX_LAYERS; q++) sc->layer[sc->n++] = pieces[q];
         }
     }
     sc->build_us = time_us() - t0;
@@ -804,6 +925,7 @@ int scene_prepass(const Scene *csc)
     int drew = 0;
     for (int i = 0; i < sc->n; i++) {
         GpuLayer *L = &sc->layer[i];
+        if (L->tex_prev && i > 0) { L->tex = sc->layer[i - 1].tex; continue; }
         if (!L->nst) continue;
         const SceGxmTexture *src = sc->stage[L->st0].tex;
         int ok = src != NULL;

@@ -1153,6 +1153,9 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
         } else if (gpre(&c, G_COMP) && bl >= 0x84 && !in_event) {
             t->has_comp = 1; t->comp_a = rd32(b + 0x60); t->comp_b = (int32_t)rd32(b + 0x64);
             if (t->comp_b >= VEG_COMP_CUSTOM && t->comp_b <= VEG_COMP_DIFFSQUARED) t->comp_mode = t->comp_b;
+            /* 12 is 3D Source Alpha, not Lighten as the scripting API's order suggests: every track saved with it
+             * (Red Zone, Porta Mix) has 3D Track Motion (depth, turns about x/y) and no others do */
+            if (t->comp_b == 12) t->comp_mode = VEG_COMP_SRCALPHA3D;
             float lv = rdf(b + 0x68);   /* track Level (opacity) */
             if (lv >= 0 && lv <= 1) t->level = lv;
         } else if (gpre(&c, G_ACOMP) && bl >= 0x10 && !in_event) {

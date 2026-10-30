@@ -63,6 +63,7 @@ typedef struct {
     int st0, nst;       /* effect stages drawn into render targets before this layer (Scene.stage[st0 ..]) */
     int rt_w, rt_h;     /* their size (the picture's) */
     float fxp[16];      /* PASS_HSL .. PASS_COOKIE: uniforms uFx0..uFx3 (see gpu.c) */
+    int tex_prev;       /* another piece of the layer before it (a picture cut to its Pan/Crop window): same texture */
 } GpuLayer;
 
 void gpu_draw_layer(const GpuLayer *L);

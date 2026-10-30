@@ -111,8 +111,13 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   Cookie Cutter's Grate (about 6 px off, VEGAS rounds its cell size).
   Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; the rest is skipped.
 - **Track compositing modes**: Add, Subtract, Cut, Multiply, Screen, Lighten, Darken. Overlay, Hard Light, Dodge, Burn
-  and Difference need the picture underneath in the shader, so they draw normally for now.
-- **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; like Vegas, the window is rescaled to the
+  and Difference need the picture underneath in the shader, so they draw normally for now. 3D Source Alpha draws as
+  Source Alpha (3D Track Motion's depth and x/y turns, and parent tracks' motion, are not followed yet). Custom
+  (a compositing plug-in): on a solid colour, a colour dodge, which matches Red Zone's white flashes in its VEGAS
+  render frame by frame; on anything else hidden.
+- **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; the event
+  frame shows only what is inside the window, so a window narrower than the frame leaves transparent bars beside the
+  picture, as in Red Zone's strips; like Vegas, the window is rescaled to the
   source when the file you pick has another size or shape than the one the project was made with), **Track Motion**
   (keyframes with position, size and 2D rotation, interpolated with the same curve types; when the source has another shape, its moves are scaled with the rescaled layout so moved
   tracks stay on the grid. Vegas doesn't do this; Options can switch it back), generator-track Add/Subtract compositing (guessed, like vegtool).
@@ -158,7 +163,7 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Effect keyframes | legacy: after the static block, per keyframe u32 28, i64 time (100 ns), u32 type (Pan/Crop's numbering), length @0x18, then a full parameter copy; OFX: an animated value is double, u32 key count, then 52-byte keys (double time in frames, u32 type + 1, double value, 4 handle doubles) | both formats compared on a project saved by Vegas 10 and 11: the same values at every time; curve handles not used |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Legacy HSL Adjust (up to Vegas 10) | `1af0e4e6`, GUID `b432972d…`: doubles add-to-hue, saturation, luminance (the keyframe copy) | checked against the same project re-saved by Vegas 11 (OFX HSL Adjust, same values); hue units assumed equal to the OFX ones |
-| Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |
+| Track compositing mode | `69d46c29` @0x64: Add 1, Source Alpha 4 (the default), 3D Source Alpha 12, Custom (a compositing plug-in, its id at @0x6c) -1. The others are taken from the scripting API's order (Subtract 2, Cut 3, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Difference 13, Difference Squared 14) | 1, 4, 12 and -1 are the only values in the test projects; 12 sits on exactly the tracks with 3D Track Motion. @0x0c: 0x40 compositing parent, 0x20 its children (Red Zone); @0x80 the parent's own mode |
 | Pan/Crop / Track Motion keyframe type | Pan/Crop keyframe @16, Track Motion keyframe @4: 0 Linear, 1 Hold, 2 Slow, 3 Fast, 4 Smooth, 5 Sharp | all six checked in VEGAS Pro 11 for both (test projects with one labelled keyframe pair per type) |
 | Keyframe curve shapes | Fast 1−(1−u)², Slow u², Smooth 3u²−2u³, Sharp ½+4(u−½)³, Hold: none | **measured** from a VEGAS Pro 11 render (all within 0.3 % of the move) |
 | Media path | media chunk: the first word is the path's offset (0x50 Vegas 8, 0x60, 0x80) | solid |
