@@ -8,7 +8,8 @@
 #include <psp2/gxm.h>
 
 /* MULTIPLY/SCREEN/LIGHTEN expect the colour premultiplied by the opacity, DARKEN mixed towards white (scene.c) */
-enum { BLEND_NORMAL = 0, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_LIGHTEN, BLEND_DARKEN, BLEND_CUT, BLEND_COUNT };
+/* BLEND_COPY: writes colour and alpha as they are (effect stages drawn into a render target) */
+enum { BLEND_NORMAL = 0, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_LIGHTEN, BLEND_DARKEN, BLEND_CUT, BLEND_COPY, BLEND_COUNT };
 /* layer passes: colour matrix; matrix -> brightness lookup (Gradient Map) -> matrix; blur along a line / towards a centre */
 /* PASS_SHADOW: the picture's shape (its alpha) with softened edges, filled with the tint colour (Track Motion shadow/glow) */
 /* PASS_HSL / PASS_THRESH / PASS_SECCC: matrix -> a non-linear colour effect (HSL Adjust, Threshold, Secondary Color
@@ -59,10 +60,17 @@ typedef struct {
     float rad[4];       /* PASS_BLUR: x = radial strength */
     float w[20];        /* PASS_BLUR: 17 tap weights (sum 1) */
     float soft[4];      /* PASS_SHADOW: 1 / (2 * edge), edge (texcoords, x and y); the quad is enlarged by edge */
+    int st0, nst;       /* effect stages drawn into render targets before this layer (Scene.stage[st0 ..]) */
+    int rt_w, rt_h;     /* their size (the picture's) */
     float fxp[16];      /* PASS_HSL .. PASS_COOKIE: uniforms uFx0..uFx3 (see gpu.c) */
 } GpuLayer;
 
 void gpu_draw_layer(const GpuLayer *L);
+/* the same, with the vertices in gpu.c's own buffer instead of vita2d's pool (render-target passes drawn before the
+ * frame's scene starts: vita2d_start_drawing resets the pool while the GPU may still read them); call
+ * gpu_own_vertices_reset() once per frame, with the GPU idle */
+void gpu_draw_layer_own(const GpuLayer *L);
+void gpu_own_vertices_reset(void);
 
 /* colour-matrix helpers (shared with the CPU fallback) */
 void cm_identity(float m[12]);

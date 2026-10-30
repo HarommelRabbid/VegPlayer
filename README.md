@@ -104,8 +104,9 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
     whole event frame: the amount is relative to the frame and the blur spills past the picture's edges;
   - Swirl, Wave and Deform (each pixel's source position computed in the shader; Deform by a few Newton steps through
     its edge patch) and Cookie Cutter (all seven shapes, border, feather, cut-out, repeats).
-  Effect settings can be animated (keyframes, with the keyframe types of Pan/Crop). One of the effects after the first list per layer (the first in the chain); a later HSL Adjust falls back to a
-  colour-matrix approximation, the others are left out. All the effects in this list were fitted to VEGAS Pro renders
+  Effect settings can be animated (keyframes, with the keyframe types of Pan/Crop). Several of the effects after the first list can be stacked on a layer (up to six): each one past the first is a stage
+  of its own, drawn into an offscreen render target of the picture's size before the frame (48 MB of them at most;
+  past that a layer keeps only its last effect). All the effects in this list were fitted to VEGAS Pro renders
   of every preset (a test image per preset): within 1–2/255 on average, except tightly wound Swirls (3–5) and
   Cookie Cutter's Grate (about 6 px off, VEGAS rounds its cell size).
   Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; the rest is skipped.

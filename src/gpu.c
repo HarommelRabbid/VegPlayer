@@ -487,6 +487,7 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
         { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MAX },                         /* lighten (src towards black) */
         { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FUNC_MIN },                         /* darken (src towards white) */
         { SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, SCE_GXM_BLEND_FUNC_ADD },        /* cut: punch a hole */
+        { SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ZERO, SCE_GXM_BLEND_FUNC_ADD },                        /* copy */
     };
     for (int i = 0; i < BLEND_COUNT; i++) {
         SceGxmBlendInfo bi;
@@ -497,7 +498,7 @@ static int setup_fprog(FProg *f, SceGxmShaderPatcher *sp)
         bi.colorSrc = (uint8_t)BL[i].src;
         bi.colorDst = (uint8_t)BL[i].dst;
         bi.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
-        bi.alphaDst = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        bi.alphaDst = i == BLEND_COPY ? SCE_GXM_BLEND_FACTOR_ZERO : SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         if (sceGxmShaderPatcherCreateFragmentProgram(sp, f->id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
                                                      &bi, g_vprog_gxp, &f->fp[i]) < 0) {
             LOG("gpu: %s fragment program (blend %d) creation failed", f->name, i);
@@ -568,10 +569,45 @@ const char *gpu_status(void) { return g_status; }
 
 /* ------------------------------------------------------------------ drawing */
 
+static void draw_layer_v(const GpuLayer *L, vita2d_texture_vertex *v);
+
 void gpu_draw_layer(const GpuLayer *L)
 {
     vita2d_texture_vertex *v = vita2d_pool_memalign(4 * sizeof(vita2d_texture_vertex), sizeof(vita2d_texture_vertex));
-    if (!v) return;
+    if (v) draw_layer_v(L, v);
+}
+
+/* the render-target passes' vertices: a small mapped block of their own */
+#define OWN_VB (64u << 10)
+static SceUID g_own_uid = -1;
+static uint8_t *g_own;
+static size_t g_own_used;
+
+void gpu_own_vertices_reset(void) { g_own_used = 0; }
+
+void gpu_draw_layer_own(const GpuLayer *L)
+{
+    if (g_own_uid < 0) {
+        g_own_uid = sceKernelAllocMemBlock("vp_vtx", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, OWN_VB, NULL);
+        void *b = NULL;
+        if (g_own_uid < 0 || sceKernelGetMemBlockBase(g_own_uid, &b) < 0 || sceGxmMapMemory(b, OWN_VB, SCE_GXM_MEMORY_ATTRIB_READ) < 0) {
+            if (g_own_uid >= 0) sceKernelFreeMemBlock(g_own_uid);
+            g_own_uid = -2;
+            return;
+        }
+        g_own = b;
+    }
+    if (g_own_uid < 0) return;
+    size_t need = 4 * sizeof(vita2d_texture_vertex);
+    g_own_used = (g_own_used + 15) & ~(size_t)15;
+    if (g_own_used + need > OWN_VB) return;
+    vita2d_texture_vertex *v = (vita2d_texture_vertex *)(g_own + g_own_used);
+    g_own_used += need;
+    draw_layer_v(L, v);
+}
+
+static void draw_layer_v(const GpuLayer *L, vita2d_texture_vertex *v)
+{
     for (int i = 0; i < 4; i++) { v[i].x = L->x[i]; v[i].y = L->y[i]; v[i].z = 0.5f; v[i].u = L->u[i]; v[i].v = L->v[i]; }
 
     if (!g_shaders_ok) {

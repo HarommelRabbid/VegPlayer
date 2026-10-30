@@ -965,6 +965,8 @@ static void seek_rel(double d)
     g_osd_until = time_us() + 2500000;
 }
 
+static const Scene *g_play_scene;
+
 static void play_frame(void)
 {
     VegProject *p = &g_s.proj;
@@ -972,7 +974,7 @@ static void play_frame(void)
     float s = fminf((float)SCREEN_W / p->width, (float)SCREEN_H / p->height);
     float vw = p->width * s, vh = p->height * s, vx = (SCREEN_W - vw) / 2, vy = (SCREEN_H - vh) / 2;
     scene_set_viewport(vx, vy, vw, vh);
-    const Scene *sc = scene_acquire();
+    const Scene *sc = g_play_scene;   /* acquired (and its effect stages drawn) before the frame started */
     vita2d_draw_rectangle(vx, vy, vw, vh, RGBA8(0, 0, 0, 255));
     if (sc) {
         vita2d_enable_clipping();
@@ -1091,6 +1093,10 @@ int main(void)
             vexport_step();
             vita2d_set_clear_color(COL_BG);
             offscreen = 1;
+        }
+        if (g_state == ST_PLAY) {
+            g_play_scene = scene_acquire();
+            if (scene_prepass(g_play_scene)) offscreen = 1;
         }
         vita2d_start_drawing();
         /* the display's own viewport (the render-to-texture pass set its own) */

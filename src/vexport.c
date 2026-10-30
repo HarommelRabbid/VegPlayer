@@ -832,12 +832,13 @@ static void to_screen_space(GpuLayer *L)
 static void render(double T)
 {
     vita2d_pool_reset();   /* the GPU is idle here (the last frame waited for it) */
+    const Scene *sc = scene_build_now(T);
+    scene_prepass(sc);     /* layers' earlier effect stages, into their own render targets */
     vita2d_start_drawing_advanced(X.rt, 0);
     SceGxmContext *ctx = vita2d_get_context();
     sceGxmSetViewport(ctx, X.w * 0.5f, X.w * 0.5f, X.h * 0.5f, -X.h * 0.5f, 0.5f, 0.5f);
     vita2d_set_clear_color(RGBA8(0, 0, 0, 255));
     vita2d_clear_screen();
-    const Scene *sc = scene_build_now(T);
     static GpuLayer L;
     for (int i = 0; i < sc->n; i++) {
         L = sc->layer[i];

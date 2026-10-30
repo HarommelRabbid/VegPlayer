@@ -187,7 +187,11 @@ static void luts_build(void)
  * (m before it, m2 after it); a blur, a warp (Swirl, Wave, Deform) or Cookie Cutter is applied when sampling (they
  * commute with the colour matrix). One special effect per layer: the first one wins; a later HSL Adjust then folds
  * into the matrix as an approximation, the other special effects are left out. */
-typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; VegVfx sp; } Chain;
+#define CHAIN_STAGES 6
+typedef struct { int pass; float m[12], m2[12]; int has_sp; VegVfx sp; } Stage;
+/* the last stage's fields are pass / m / m2 / special (drawn with the layer); the earlier ones (npre) are drawn into
+ * render targets first, each reading the one before */
+typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; VegVfx sp; int npre; Stage pre[CHAIN_STAGES - 1]; } Chain;
 
 static int special_pass(int type)
 {
@@ -208,38 +212,47 @@ static int special_pass(int type)
 /* passes whose shader applies a second matrix after the effect */
 static int pass_has_post(int pass) { return pass == PASS_LUT || pass == PASS_HSL || pass == PASS_THRESH || pass == PASS_SECCC; }
 
-/* tau: time in the event (event effects' keyframes), T: project time (track effects') */
+/* tau: time in the event (event effects' keyframes), T: project time (track effects'). A special effect after another
+ * one starts a new stage (with the shaders; without them, or past CHAIN_STAGES, the old rule: HSL Adjust folds into the
+ * matrix, the rest is left out). */
 static void chain_build(const VegEvent *e, const VegTrack *t, double tau, double T, Chain *c)
 {
-    cm_identity(c->m); cm_identity(c->m2);
-    c->pass = PASS_MATRIX; c->special = NULL;
+    Stage st[CHAIN_STAGES];
+    int n = 1, cur = 0, multi = gpu_shaders_ok();
+    cm_identity(st[0].m); cm_identity(st[0].m2); st[0].pass = PASS_MATRIX; st[0].has_sp = 0;
     for (int pass = 0; pass < 2; pass++) {
         const VegVfx *fx = pass ? t->vfx : e->vfx;
-        int n = pass ? t->nvfx : e->nvfx;
-        for (int i = 0; i < n; i++) {
+        int nf = pass ? t->nvfx : e->nvfx;
+        for (int i = 0; i < nf; i++) {
             VegVfx at;
             const VegVfx *v = veg_vfx_at(&fx[i], pass ? T : tau, &at);
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
             int sp = special_pass(v->type);
-            if (sp == PASS_LUT || sp == PASS_BLUR) {
-                if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
-                    c->sp = *v;
-                    c->special = &c->sp;
-                    c->pass = sp;
-                }
-                continue;
-            }
             if (sp >= 0) {
-                if (!c->special && gpu_pass_ok(sp)) { c->sp = *v; c->special = &c->sp; c->pass = sp; continue; }
+                int usable = (sp == PASS_LUT || sp == PASS_BLUR) ? (v->type != VFX_GRADIENT || v->lut >= 0) : gpu_pass_ok(sp);
+                if (usable && !st[cur].has_sp) { st[cur].pass = sp; st[cur].sp = *v; st[cur].has_sp = 1; continue; }
+                if (usable && multi && gpu_pass_ok(sp) && n < CHAIN_STAGES) {
+                    cur = n++;
+                    cm_identity(st[cur].m); cm_identity(st[cur].m2);
+                    st[cur].pass = sp; st[cur].sp = *v; st[cur].has_sp = 1;
+                    continue;
+                }
                 if (v->type != VFX_HSL) continue;   /* HSL Adjust: the matrix approximation below */
             }
             float f[12], r[12];
             vfx_matrix(v, f);
-            float *dst = pass_has_post(c->pass) ? c->m2 : c->m;
+            float *dst = pass_has_post(st[cur].pass) ? st[cur].m2 : st[cur].m;
             cm_mul(r, f, dst);
             memcpy(dst, r, sizeof r);
         }
     }
+    c->npre = n - 1;
+    for (int k = 0; k < n - 1; k++) c->pre[k] = st[k];
+    const Stage *L = &st[n - 1];
+    c->pass = L->pass;
+    memcpy(c->m, L->m, sizeof c->m); memcpy(c->m2, L->m2, sizeof c->m2);
+    c->sp = L->sp;
+    c->special = L->has_sp ? &c->sp : NULL;
 }
 
 /* Blurs, as Vegas applies event effects: after Pan/Crop, over the whole event frame. So the amount is measured
@@ -583,7 +596,7 @@ static void build(Scene *sc, int buf, double T)
 {
     VegProject *p = &g_s.proj;
     uint64_t t0 = time_us();
-    sc->t = T; sc->n = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = 0;
+    sc->t = T; sc->n = 0; sc->nstage = 0; sc->cpu_fx = 0; sc->nlut = sc->nblur = sc->nshadow = 0;
     sc->vx = g_vx; sc->vy = g_vy; sc->vw = g_vw; sc->vh = g_vh;
     int fb_used = 0;
     /* Vegas: the first track is in front, so draw from the last track up */
@@ -622,6 +635,9 @@ static void build(Scene *sc, int buf, double T)
             }
             L->u[0] = 0; L->u[1] = 1; L->u[2] = 0; L->u[3] = 1;
             L->v[0] = 0; L->v[1] = 0; L->v[2] = 1; L->v[3] = 1;
+            static const float L0U[4] = { 0, 1, 0, 1 }, L0V[4] = { 0, 0, 1, 1 };
+            float placed_x[4], placed_y[4];
+            memcpy(placed_x, L->x, sizeof placed_x); memcpy(placed_y, L->y, sizeof placed_y);
             Chain ch;
             chain_build(e, tr, tau, T, &ch);
             memcpy(L->m, ch.m, sizeof L->m);
@@ -637,6 +653,35 @@ static void build(Scene *sc, int buf, double T)
                 else L->pass = PASS_MATRIX;   /* no blur shader: draw unblurred */
             } else if (ch.pass >= PASS_HSL) fx_params(ch.special, L, pw, ph);
             L->fx = !cm_is_identity(L->m) || ch.pass != PASS_MATRIX;
+            L->st0 = L->nst = 0;
+            if (ch.npre && sc->nstage + ch.npre <= MAX_STAGES) {
+                /* the earlier stages: each drawn over a whole render target of the picture's size (texture space) */
+                L->st0 = sc->nstage; L->nst = ch.npre; L->rt_w = img->w; L->rt_h = img->h;
+                for (int k = 0; k < ch.npre; k++) {
+                    const Stage *S = &ch.pre[k];
+                    GpuLayer *G = &sc->stage[sc->nstage++];
+                    memset(G, 0, sizeof *G);
+                    memcpy(G->x, placed_x, sizeof G->x); memcpy(G->y, placed_y, sizeof G->y);
+                    for (int c = 0; c < 4; c++) { G->u[c] = L0U[c]; G->v[c] = L0V[c]; }
+                    memcpy(G->m, S->m, sizeof G->m); memcpy(G->m2, S->m2, sizeof G->m2);
+                    G->pass = S->pass;
+                    if (S->pass == PASS_LUT) {
+                        const Lut *lu = &g_lut[S->sp.lut];
+                        G->lut = lu->tex ? &lu->tex->gxm_tex : NULL;
+                        if (!G->lut) G->pass = PASS_MATRIX;
+                        G->lutp[0] = (float)S->sp.amount; G->lutp[1] = 255.0f / 256.0f; G->lutp[2] = 0.5f / 256.0f;
+                    } else if (S->pass == PASS_BLUR) blur_params(&S->sp, G, g_vw, g_vw * p->height / p->width, g_vx, g_vy);
+                    else if (S->pass >= PASS_HSL) fx_params(&S->sp, G, pw, ph);
+                    /* the whole target, in screen units (the target's viewport maps them onto its pixels) */
+                    G->x[0] = 0; G->x[1] = SCREEN_W; G->x[2] = 0; G->x[3] = SCREEN_W;
+                    G->y[0] = 0; G->y[1] = 0; G->y[2] = SCREEN_H; G->y[3] = SCREEN_H;
+                    for (int c = 0; c < 4; c++) { G->u[c] = L0U[c]; G->v[c] = L0V[c]; }
+                    G->tint[0] = G->tint[1] = G->tint[2] = G->tint[3] = 1;
+                    G->blend = BLEND_COPY;
+                    G->fx = 1;
+                    G->tex = k == 0 ? &img->tex : NULL;
+                }
+            }
             float a = tint[3] * tr->level * (g_cfg.apply_event_level ? e->level : 1.0f);
             /* fades: the event's own fade-in, or the crossfade with the event before it (whichever is longer);
              * the fade-out is left out where the next event overlaps, since that one dissolves in on top */
@@ -714,6 +759,72 @@ static void build(Scene *sc, int buf, double T)
     sc->build_us = time_us() - t0;
 }
 
+/* ------------------------------------------------------------------ effect stages (render targets) */
+
+#define RT_MAX 24
+#define RT_BUDGET (48u << 20)
+static struct { vita2d_texture *t; int w, h, used; } g_rt[RT_MAX];
+static int g_nrt;
+static size_t g_rt_bytes;
+static int g_rt_failed_logged;
+
+static void rt_free_all(void)
+{
+    if (!g_nrt) return;
+    vita2d_wait_rendering_done();
+    for (int i = 0; i < g_nrt; i++) vita2d_free_texture(g_rt[i].t);
+    g_nrt = 0; g_rt_bytes = 0; g_rt_failed_logged = 0;
+}
+
+static vita2d_texture *rt_get(int w, int h)
+{
+    for (int i = 0; i < g_nrt; i++) if (!g_rt[i].used && g_rt[i].w == w && g_rt[i].h == h) { g_rt[i].used = 1; return g_rt[i].t; }
+    size_t bytes = (size_t)((w + 7) & ~7) * (size_t)h * 4;
+    vita2d_texture *t = NULL;
+    if (g_nrt < RT_MAX && g_rt_bytes + bytes <= RT_BUDGET)
+        t = vita2d_create_empty_texture_rendertarget((unsigned)w, (unsigned)h, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+    if (!t) {
+        if (!g_rt_failed_logged) { g_rt_failed_logged = 1; LOG("scene: no memory for another %dx%d effect stage (%d in use): extra effects dropped", w, h, g_nrt); }
+        return NULL;
+    }
+    vita2d_texture_set_filters(t, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetUAddrMode(&t->gxm_tex, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&t->gxm_tex, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    g_rt[g_nrt].t = t; g_rt[g_nrt].w = w; g_rt[g_nrt].h = h; g_rt[g_nrt].used = 1;
+    g_nrt++; g_rt_bytes += bytes;
+    return t;
+}
+
+int scene_prepass(const Scene *csc)
+{
+    Scene *sc = (Scene *)csc;   /* the render thread owns the acquired scene */
+    if (!sc || !sc->nstage) return 0;
+    for (int i = 0; i < g_nrt; i++) g_rt[i].used = 0;
+    gpu_own_vertices_reset();
+    int drew = 0;
+    for (int i = 0; i < sc->n; i++) {
+        GpuLayer *L = &sc->layer[i];
+        if (!L->nst) continue;
+        const SceGxmTexture *src = sc->stage[L->st0].tex;
+        int ok = src != NULL;
+        for (int k = 0; k < L->nst && ok; k++) {
+            GpuLayer *G = &sc->stage[L->st0 + k];
+            vita2d_texture *rt = rt_get(L->rt_w, L->rt_h);
+            if (!rt) { ok = 0; break; }
+            G->tex = src;
+            vita2d_start_drawing_advanced(rt, 0);
+            sceGxmSetViewport(vita2d_get_context(), L->rt_w * 0.5f, L->rt_w * 0.5f, L->rt_h * 0.5f, -L->rt_h * 0.5f, 0.5f, 0.5f);
+            gpu_draw_layer_own(G);
+            vita2d_end_drawing();
+            src = &rt->gxm_tex;
+            drew = 1;
+        }
+        if (ok) L->tex = src;   /* else: the picture as it is, with the last stage's effect only */
+        L->nst = 0;             /* done (a scene shown twice isn't drawn again) */
+    }
+    return drew;
+}
+
 static int builder(unsigned argc, void *argp)
 {
     (void)argc; (void)argp;
@@ -741,6 +852,7 @@ static void scene_setup(void)
     g_disp = g_ready = -1;
     memset(g_sc, 0, sizeof g_sc);
     luts_build();   /* gradient map textures (main thread: vita2d allocations) */
+    rt_free_all();
     /* scratch images for the CPU effect fallback, sized for the largest cache frame */
     if (!gpu_shaders_ok()) {
         int mw = 0, mh = 0;
