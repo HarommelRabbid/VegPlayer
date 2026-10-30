@@ -175,6 +175,7 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_DEFORM_GUID    "f4205ab4-e8c1-468f-9ad2-4feb8df04538" /* Sony Deform (DXT) */
 #define FX_SWIRL_GUID     "b3a8c4cf-e5ad-4b2f-a603-2f0fcb3b546e" /* Sony Swirl (DXT) */
 #define FX_WAVE_GUID      "ec1a2314-0c38-11d2-9aac-00a0c99b12c5" /* Sony Wave (DXT) */
+#define FX_PINCH_GUID     "c8e20570-4059-4edf-9cae-eef966df3b19" /* Sony Pinch/Punch (DXT) */
 #define FX_COOKIE_GUID    "d76643c7-95bd-4519-9718-4115c692ea7d" /* Sony Cookie Cutter (DXT, up to Vegas 10) */
 #define FX_GBLUR_GUID     "1485b954-eb62-11d1-9aa9-00a0c99b12c5" /* Sony Gaussian Blur (DXT, up to Vegas 10) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
@@ -491,6 +492,15 @@ static void lab_or_blur_ofx(VegVfx *v, const char *id, const OfxParam *ps, int n
         const OfxParam *c = ofx_find(ps, np, "Center");
         v->cx = c && c->nv >= 2 ? c->v[0] : 0.5;
         v->cy = c && c->nv >= 2 ? 1.0 - c->v[1] : 0.5;   /* OFX y points up */
+    } else if (ci_contains(id, ":spherize")) {
+        v->type = VFX_SPHERIZE;
+        const OfxParam *c = ofx_find(ps, np, "Center");
+        v->prm[0] = (float)ofx_get(ps, np, "Amount", 1);
+        v->prm[1] = c && c->nv >= 2 ? (float)c->v[0] : 0.5f;
+        v->prm[2] = c && c->nv >= 2 ? (float)(1.0 - c->v[1]) : 0.5f;   /* OFX y points up */
+        v->prm[3] = (float)ofx_get(ps, np, "ScalingHorizontal", 1);
+        v->prm[4] = (float)ofx_get(ps, np, "ScalingVertical", 1);
+        if (v->prm[0] == 0) v->type = VFX_NOOP;
     } else if (ci_contains(id, ":gaussianblur")) {
         v->type = VFX_GAUSSBLUR;
         v->a = ofx_get(ps, np, "HorizontalRange", 0);
@@ -535,11 +545,21 @@ static void ofx_effect(VegVfx *v, const char *id, const OfxParam *ps, int np)
     } else if (ci_contains(id, ":sepia")) {
         v->type = VFX_SEPIA;
         v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", 1));
+        const OfxParam *c = ofx_find(ps, np, "Color");
+        if (c || ofx_find(ps, np, "BlendingStrength")) {
+            /* VEGAS's own Sepia: a tint colour, Blending Strength, Blending Falloff (scene.c has the model) */
+            v->ip[0] = 1;
+            for (int k = 0; k < 3; k++) v->prm[k] = c && k < c->nv ? (float)c->v[k] : 0.65f;
+            v->prm[3] = (float)ofx_get(ps, np, "BlendingStrength", 0);
+            v->prm[4] = (float)ofx_get(ps, np, "BlendingFalloff", 0);
+            v->amount = fmin(1.0, 1.475 * v->prm[3]);   /* the lookup's mix (with Blending Falloff) */
+            if (v->prm[3] <= 0) v->type = VFX_NOOP;   /* strength 0: the picture as it is (measured) */
+        }
     } else if (ci_contains(id, ":brightnessandcontrast") || ci_contains(id, ":brightnesscontrast")) {
         v->type = VFX_BRICON;
         v->bright = ofx_get(ps, np, "Brightness", 0);
         v->contrast = ofx_get(ps, np, "Contrast", 0);
-    } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur")) {
+    } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur") || ci_contains(id, ":spherize")) {
         lab_or_blur_ofx(v, id, ps, np);
     } else if (ci_contains(id, ":colorcorrectorsecondary")) {
         /* the mask: luminance (0..255: low, high, smooth), hue (degrees, as atan2(Cr, Cb) in BT.601 YCbCr: centre,
@@ -697,6 +717,20 @@ static void parse_vfx_one(St *s, const uint8_t *b, size_t bl, VegVfx *v, int top
                     else if (swirl) zero = v->prm[0] == 0;
                     else zero = (v->prm[2] == 0 || v->prm[0] == 0) && (v->prm[3] == 0 || v->prm[1] == 0);
                     if (zero) v->type = VFX_NOOP;
+                }
+            }
+        } else if (!strcmp(plug, FX_PINCH_GUID)) {
+            /* doubles: amount (-1 pinch .. 1 punch), centre offset x, y (taken like Swirl's: -1..1, y up; 0 in every
+             * preset), scale x, y */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            v->type = VFX_UNKNOWN;
+            if (pp && pl >= 40) {
+                double a = rdd(pp), cx = rdd(pp + 8), cy = rdd(pp + 16), sx = rdd(pp + 24), sy = rdd(pp + 32);
+                if (a >= -10 && a <= 10 && fabs(cx) < 100 && fabs(cy) < 100 && fabs(sx) < 100 && fabs(sy) < 100) {
+                    v->type = a == 0 ? VFX_NOOP : VFX_PINCH;
+                    v->prm[0] = (float)a; v->prm[1] = (float)(0.5 + 0.5 * cx); v->prm[2] = (float)(0.5 - 0.5 * cy);
+                    v->prm[3] = (float)sx; v->prm[4] = (float)sy;
                 }
             }
         } else if (!strcmp(plug, FX_HSL_GUID)) {

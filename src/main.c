@@ -501,6 +501,8 @@ static const char *vfx_type_name(int t)
     case VFX_SWIRL: return "Swirl";
     case VFX_WAVE: return "Wave";
     case VFX_COOKIE: return "Cookie Cutter";
+    case VFX_SPHERIZE: return "Spherize";
+    case VFX_PINCH: return "Pinch/Punch";
     case VFX_NOOP: return "no-op (default settings)";
     }
     return NULL;
@@ -581,12 +583,12 @@ static void info_build(void)
     }
 
     /* Pan/Crop, effects, stretch */
-    int pan_static = 0, pan_anim = 0, vfx[VFX_COOKIE + 1] = { 0 }, afx[AFX_NOOP + 1] = { 0 }, unk_v = 0, unk_a = 0;
+    int pan_static = 0, pan_anim = 0, vfx[VFX_LAST + 1] = { 0 }, afx[AFX_NOOP + 1] = { 0 }, unk_v = 0, unk_a = 0;
     int st[3] = { 0 }, pitched = 0, fades = 0;
     for (int i = 0; i < p->nevents; i++) {
         VegEvent *e = &p->events[i];
         if (e->npan > 1) pan_anim++; else if (e->npan == 1) pan_static++;
-        for (int k = 0; k < e->nvfx; k++) { int t = e->vfx[k].type; if (t > 0 && t <= VFX_COOKIE) vfx[t]++; else unk_v++; }
+        for (int k = 0; k < e->nvfx; k++) { int t = e->vfx[k].type; if (t > 0 && t <= VFX_LAST) vfx[t]++; else unk_v++; }
         for (int k = 0; k < e->nafx; k++) { int t = e->afx[k].type; if (t > 0 && t <= AFX_NOOP) afx[t]++; else unk_a++; }
         if (e->kind == VEG_KIND_AUDIO && e->has_stretch && e->stretch_method >= 0 && e->stretch_method < 3) st[e->stretch_method]++;
         if (e->kind == VEG_KIND_AUDIO && fabs(e->pitch_semis) > 1e-6) pitched++;
@@ -594,14 +596,14 @@ static void info_build(void)
     }
     for (int t = 0; t < p->ntracks; t++) {
         VegTrack *tr = &p->tracks[t];
-        for (int k = 0; k < tr->nvfx; k++) { int ty = tr->vfx[k].type; if (ty > 0 && ty <= VFX_COOKIE) vfx[ty]++; else unk_v++; }
+        for (int k = 0; k < tr->nvfx; k++) { int ty = tr->vfx[k].type; if (ty > 0 && ty <= VFX_LAST) vfx[ty]++; else unk_v++; }
         for (int k = 0; k < tr->nafx; k++) { int ty = tr->afx[k].type; if (ty > 0 && ty <= AFX_NOOP) afx[ty]++; else unk_a++; }
     }
     info_add("Pan/Crop", COL_TEXT, "%d animated event%s, %d still", pan_anim, pan_anim == 1 ? "" : "s", pan_static);
     {
-        const char *names[VFX_COOKIE + 1];
-        for (int t = 0; t <= VFX_COOKIE; t++) names[t] = vfx_type_name(t) ? vfx_type_name(t) : "?";
-        count_list(b, sizeof b, names, vfx, VFX_COOKIE + 1);
+        const char *names[VFX_LAST + 1];
+        for (int t = 0; t <= VFX_LAST; t++) names[t] = vfx_type_name(t) ? vfx_type_name(t) : "?";
+        count_list(b, sizeof b, names, vfx, VFX_LAST + 1);
         info_add("Video FX played", COL_TEXT, "%s", b);
         static const char *an[] = { "?", "Pitch Shift", "Vibrato", "Reverb", "no-op" };
         count_list(b, sizeof b, an, afx, AFX_NOOP + 1);

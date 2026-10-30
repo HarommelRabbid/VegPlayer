@@ -14,9 +14,10 @@ enum { BLEND_NORMAL = 0, BLEND_ADD, BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_SCREEN
 /* PASS_SHADOW: the picture's shape (its alpha) with softened edges, filled with the tint colour (Track Motion shadow/glow) */
 /* PASS_HSL / PASS_THRESH / PASS_SECCC: matrix -> a non-linear colour effect (HSL Adjust, Threshold, Secondary Color
  * Corrector) -> matrix m2. PASS_SWIRL / PASS_WAVE / PASS_DEFORM: where each pixel reads from in the picture, then the
- * matrix. PASS_COOKIE: Cookie Cutter's mask (shape, border, feather, repeats), then the matrix. Parameters in fx[]. */
+ * matrix. PASS_COOKIE: Cookie Cutter's mask (shape, border, feather, repeats), then the matrix. PASS_RADIAL: Spherize and
+ * Pinch/Punch (a radial pull towards / push from a centre). Parameters in fxp[]. */
 enum { PASS_MATRIX = 0, PASS_LUT, PASS_BLUR, PASS_SHADOW, PASS_HSL, PASS_THRESH, PASS_SECCC, PASS_SWIRL, PASS_WAVE,
-       PASS_DEFORM, PASS_COOKIE, PASS_COUNT };
+       PASS_DEFORM, PASS_COOKIE, PASS_RADIAL, PASS_COUNT };
 
 /* ---- memory: big mapped blocks carved into textures (CDRAM first, then main RAM) */
 size_t gpu_arena_reserve(size_t want);       /* main thread; returns bytes actually reserved */

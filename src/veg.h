@@ -52,6 +52,9 @@ enum {
     VFX_SWIRL,       /* Swirl: prm = amount, centre x/y, scale x/y */
     VFX_WAVE,        /* Wave: prm = frequency x/y, amplitude x/y, phase x/y */
     VFX_COOKIE,      /* Cookie Cutter: see veg.c */
+    VFX_SPHERIZE,    /* Spherize: prm = amount, centre x/y (texcoords), scale x/y */
+    VFX_PINCH,       /* Pinch/Punch: prm = amount, centre x/y (texcoords), scale x/y */
+    VFX_LAST = VFX_PINCH
 };
 #define VFX_MAX_STOPS 8
 typedef struct {

@@ -94,16 +94,19 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
 ## What is played
 
 - **Video effects** (event and track level, in chain order), all on the GPU (shaders compiled once with vitaShaRK):
-  - colour effects folded into one matrix per layer: Invert, Black and White, Sepia, Brightness/Contrast,
+  - colour effects folded into one matrix per layer: Invert, Black and White, Brightness/Contrast,
     Channel Blend (e.g. Red/Green/Blue Only), LAB Adjust (lightness, a/b, Invert Luminosity, desaturate; done in
     YCbCr), Color Corrector (saturation, gain, offset) and Color Balance;
   - HSL Adjust (a true HSL conversion, as VEGAS does), Threshold (each channel 0 or 1) and Color Corrector
     (Secondary) (a luminance / hue mask, then hue rotation, saturation, gamma, gain, offset);
+  - Sepia (VEGAS's: desaturate towards the R, G, B average, mix in the tint colour; with Blending Falloff a
+    brightness lookup), fitted to all its presets within 0.5/255 on average;
   - Gradient Map (brightness through a gradient texture, mixed by amount);
   - Linear Blur, Gaussian Blur and Radial Blur (17-tap blur pass). Like Vegas, blurs act after Pan/Crop on the
     whole event frame: the amount is relative to the frame and the blur spills past the picture's edges;
   - Swirl, Wave and Deform (each pixel's source position computed in the shader; Deform by a few Newton steps through
-    its edge patch) and Cookie Cutter (all seven shapes, border, feather, cut-out, repeats).
+    its edge patch), Spherize and Pinch/Punch (a pull along the radius inside an ellipse: 1 - 0.8 amount cos(pi r / 2),
+    squared for Pinch/Punch) and Cookie Cutter (all seven shapes, border, feather, cut-out, repeats).
   Effect settings can be animated (keyframes, with the keyframe types of Pan/Crop). Several of the effects after the first list can be stacked on a layer (up to six): each one past the first is a stage
   of its own, drawn into an offscreen render target of the picture's size before the frame (48 MB of them at most;
   past that a layer keeps only its last effect). All the effects in this list were fitted to VEGAS Pro renders
@@ -163,6 +166,8 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params: output gain (centi-dB), semitones x 100, modulation frequency (mHz), blend graph edges, point count, then (position ‰, height %) pairs; only `count` points are used, the pitch is 0 past the last one | checked against VEGAS renders of all system presets; output gain's unit assumed |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust, Cookie Cutter, Color Corrector (Secondary) (fitted to renders of their presets) |
 | Legacy Threshold / Deform / Swirl / Wave | `1af0e4e6`, GUIDs `c3062be8…` (float) / `f4205ab4…` (amount, u32 flag, -, -, shear x/y, squeeze t/b/l/r, curve t/b/l/r) / `b3a8c4cf…` (amount, centre x/y, scale x/y) / `ec1a2314…` (frequency x/y, amplitude x/y, phase x/y) | fitted to renders of every preset; Swirl's centre offset and Deform's two unused values not seen non-zero |
+| Pinch/Punch (legacy) / Spherize (OFX) | `c8e20570…`: doubles amount, centre offset x/y, scale x/y / `spherize`: Center, Amount, ScalingHorizontal/Vertical | renders of every preset (the "Half Scale" Pinch/Punch presets store scale 1 and render like the others) |
+| Sepia (OFX) | `sepia`: Color, BlendingStrength, BlendingFalloff | renders of every preset |
 | Legacy Cookie Cutter / Gaussian Blur (up to Vegas 10) | `1af0e4e6`, GUIDs `d76643c7…` (floats: centre x/y, six unmapped values, 1.0, repeats x/y, shape, -, keep-inside flag, size) / `1485b954…` (double h range, 4 channel flags, double v range) | checked against the same project re-saved by VEGAS Pro 11 (OFX, same numbers) |
 | Effect keyframes | legacy: after the static block, per keyframe u32 28, i64 time (100 ns), u32 type (Pan/Crop's numbering), length @0x18, then a full parameter copy; OFX: an animated value is double, u32 key count, then 52-byte keys (double time in frames, u32 type + 1, double value, 4 handle doubles) | both formats compared on a project saved by Vegas 10 and 11: the same values at every time; curve handles not used |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |

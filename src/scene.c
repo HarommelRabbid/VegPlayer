@@ -57,7 +57,22 @@ static void vfx_matrix(const VegVfx *v, float m[12])
         cm_from_rows(m, r, zero);
         break;
     }
-    case VFX_SEPIA: {
+    case VFX_SEPIA: if (v->ip[0]) {
+        /* VEGAS's Sepia, fitted to renders of all its presets (within 0.5/255 on average): with s = Blending Strength,
+         * the picture is desaturated towards the plain average of R, G, B by d = 1.475 s (at most 1), then mixed
+         * with the colour C by w = 1.427 s - 0.468 (at least 0). Blending Falloff f fades w out towards bright parts:
+         * w (1 - avg f / 0.578), a lookup on brightness (sepia_w); here just the desaturation goes before it. */
+        float sv = v->prm[3], d = fminf(1.0f, 1.475f * sv), w = fmaxf(0.0f, 1.427f * sv - 0.468f);
+        float r[3][3], off[3];
+        int lut = v->prm[4] > 0;
+        if (lut) { if (d < 0.999f) d = 0; w = 0; }   /* the lookup mixes by d (scene.c, lut_fill) */
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) r[i][j] = (1.0f - w) * (d / 3.0f + (i == j ? 1.0f - d : 0.0f));
+            off[i] = w * v->prm[i];
+        }
+        cm_from_rows(m, r, off);
+        break;
+    } else {
         float a = (float)v->amount, k = 1.0f - a;
         const float S[3][3] = { { 0.393f, 0.769f, 0.189f }, { 0.349f, 0.686f, 0.168f }, { 0.272f, 0.534f, 0.131f } };
         float r[3][3];
@@ -122,6 +137,14 @@ static int g_nlut;
 
 static void lut_fill(const VegVfx *v, uint8_t out[256][3])
 {
+    if (v->type == VFX_SEPIA) {   /* Sepia with Blending Falloff: brightness l -> (1 - w(l)) l + w(l) C (see vfx_matrix) */
+        float sv = v->prm[3], w0 = fmaxf(0.0f, 1.427f * sv - 0.468f);
+        for (int i = 0; i < 256; i++) {
+            float l = i / 255.0f, w = w0 * fmaxf(0.0f, 1.0f - l * v->prm[4] / 0.578f);
+            for (int j = 0; j < 3; j++) { float c = (1.0f - w) * l + w * v->prm[j]; out[i][j] = (uint8_t)(fminf(fmaxf(c, 0), 1) * 255.0f + 0.5f); }
+        }
+        return;
+    }
     for (int i = 0; i < 256; i++) {
         float x = i / 255.0f, c[3];
         int k = 0;
@@ -138,6 +161,8 @@ static void lut_fill(const VegVfx *v, uint8_t out[256][3])
 
 static int same_gradient(const VegVfx *a, const VegVfx *b)
 {
+    if (a->type != b->type) return 0;
+    if (a->type == VFX_SEPIA) { for (int k = 0; k < 5; k++) if (fabsf(a->prm[k] - b->prm[k]) > 1e-4f) return 0; return 1; }
     if (a->nstops != b->nstops) return 0;
     for (int i = 0; i < a->nstops; i++) {
         if (fabsf(a->stop_pos[i] - b->stop_pos[i]) > 1e-4f) return 0;
@@ -154,9 +179,10 @@ static void luts_free(void)
     g_nlut = 0;
 }
 
+static int special_pass(const VegVfx *v);
 static void lut_assign(VegVfx *v)
 {
-    if (v->type != VFX_GRADIENT) return;
+    if (v->type != VFX_GRADIENT && special_pass(v) != PASS_LUT) return;
     for (int i = 0; i < g_nlut; i++) if (same_gradient(g_lut[i].ref, v)) { v->lut = i; return; }
     if (g_nlut >= MAX_LUTS) { v->lut = -1; return; }
     Lut *L = &g_lut[g_nlut];
@@ -193,9 +219,10 @@ typedef struct { int pass; float m[12], m2[12]; int has_sp; VegVfx sp; } Stage;
  * render targets first, each reading the one before */
 typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; VegVfx sp; int npre; Stage pre[CHAIN_STAGES - 1]; } Chain;
 
-static int special_pass(int type)
+static int special_pass(const VegVfx *v)
 {
-    switch (type) {
+    switch (v->type) {
+    case VFX_SEPIA: return v->ip[0] && v->prm[4] > 0 ? PASS_LUT : -1;   /* with Blending Falloff: a lookup */
     case VFX_GRADIENT: return PASS_LUT;
     case VFX_LINEARBLUR: case VFX_RADIALBLUR: case VFX_GAUSSBLUR: return PASS_BLUR;
     case VFX_HSL: return PASS_HSL;
@@ -205,6 +232,7 @@ static int special_pass(int type)
     case VFX_WAVE: return PASS_WAVE;
     case VFX_DEFORM: return PASS_DEFORM;
     case VFX_COOKIE: return PASS_COOKIE;
+    case VFX_SPHERIZE: case VFX_PINCH: return PASS_RADIAL;
     }
     return -1;
 }
@@ -227,16 +255,27 @@ static void chain_build(const VegEvent *e, const VegTrack *t, double tau, double
             VegVfx at;
             const VegVfx *v = veg_vfx_at(&fx[i], pass ? T : tau, &at);
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
-            int sp = special_pass(v->type);
+            int sp = special_pass(v);
             if (sp >= 0) {
-                int usable = (sp == PASS_LUT || sp == PASS_BLUR) ? (v->type != VFX_GRADIENT || v->lut >= 0) : gpu_pass_ok(sp);
-                if (usable && !st[cur].has_sp) { st[cur].pass = sp; st[cur].sp = *v; st[cur].has_sp = 1; continue; }
-                if (usable && multi && gpu_pass_ok(sp) && n < CHAIN_STAGES) {
+                int usable = (sp == PASS_LUT || sp == PASS_BLUR) ? (sp != PASS_LUT || v->lut >= 0) : gpu_pass_ok(sp);
+                int placed = 0;
+                if (usable && !st[cur].has_sp) { st[cur].pass = sp; st[cur].sp = *v; st[cur].has_sp = 1; placed = 1; }
+                else if (usable && multi && gpu_pass_ok(sp) && n < CHAIN_STAGES) {
                     cur = n++;
                     cm_identity(st[cur].m); cm_identity(st[cur].m2);
                     st[cur].pass = sp; st[cur].sp = *v; st[cur].has_sp = 1;
+                    placed = 1;
+                }
+                if (placed) {
+                    if (v->type == VFX_SEPIA) {   /* its desaturation goes before the lookup */
+                        float f[12], r[12];
+                        vfx_matrix(v, f);
+                        cm_mul(r, f, st[cur].m);
+                        memcpy(st[cur].m, r, sizeof r);
+                    }
                     continue;
                 }
+                if (v->type == VFX_SEPIA) continue;   /* no lookup: left out */
                 if (v->type != VFX_HSL) continue;   /* HSL Adjust: the matrix approximation below */
             }
             float f[12], r[12];
@@ -331,6 +370,11 @@ static void fx_params(const VegVfx *v, GpuLayer *L, int pw, int ph)
         f[4] = -15.0f * q[0];
         break;
     }
+    case VFX_SPHERIZE: case VFX_PINCH:
+        f[0] = q[1]; f[1] = q[2];
+        f[2] = 0.5f * fmaxf(fabsf(q[3]), 0.001f); f[3] = 0.5f * fmaxf(fabsf(q[4]), 0.001f);
+        f[4] = 0.8f * q[0]; f[5] = v->type == VFX_PINCH ? 2.0f : 1.0f;
+        break;
     case VFX_WAVE:
         f[0] = (float)M_PI * q[0]; f[1] = (float)M_PI * q[1]; f[2] = q[2]; f[3] = q[3]; f[4] = q[4]; f[5] = q[5];
         break;
@@ -1056,6 +1100,12 @@ int scene_prepass(const Scene *csc)
             drew = 1;
         }
         if (ok) L->tex = src;   /* else: the picture as it is, with the last stage's effect only */
+        static int logged;
+        if (logged < 3) {   /* a few lines for the log: which stages run, and how they ended */
+            logged++;
+            LOG("scene: layer %d: %d effect stage(s) into %dx%d targets, first pass %d, final pass %d: %s", i, L->nst,
+                L->rt_w, L->rt_h, sc->stage[L->st0].pass, L->pass, ok ? "drawn" : "FAILED (no target)");
+        }
         L->nst = 0;             /* done (a scene shown twice isn't drawn again) */
     }
     return drew;

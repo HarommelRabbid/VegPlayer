@@ -339,6 +339,18 @@ static const char FRAG_COOKIE_SRC[] = WARP_HEAD
     "    return float4(saturate(o), c.a * al) * uTint;\n"
     "}\n";
 
+/* PASS_RADIAL: Spherize (uFx1.y = 1) and Pinch/Punch (2). Inside the ellipse of radii uFx0.zw around uFx0.xy, a point
+ * at elliptical radius r reads the picture at (1 - uFx1.x cos(pi r / 2)^uFx1.y) times its offset from the centre;
+ * fitted to VEGAS renders of every preset of both (uFx1.x = 0.8 x amount; within 0.2-0.8/255 on average) */
+static const char FRAG_RADIAL_SRC[] = WARP_HEAD
+    "    float2 d = vTexcoord - uFx0.xy;\n"
+    "    float r = length(d / uFx0.zw);\n"
+    "    float h = r < 1.0f ? cos(1.5707963f * r) : 0.0f;\n"
+    "    if (uFx1.y > 1.5f) h = h * h;\n"
+    "    float2 t = saturate(uFx0.xy + d * (1.0f - uFx1.x * h));\n"
+    "    float4 c = tex2D(tex, t);\n"
+    WARP_TAIL;
+
 #define SHADER_VERSION 5   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
@@ -363,6 +375,7 @@ static FProg g_fp[PASS_COUNT] = {
     { .name = "wave", .src = FRAG_WAVE_SRC },
     { .name = "deform", .src = FRAG_DEFORM_SRC },
     { .name = "cookie", .src = FRAG_COOKIE_SRC },
+    { .name = "radial", .src = FRAG_RADIAL_SRC },
 };
 static SceGxmProgram *g_vprog_gxp;
 static SceGxmShaderPatcherId g_vid;
