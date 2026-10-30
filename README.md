@@ -110,11 +110,15 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
   of every preset (a test image per preset): within 1–2/255 on average, except tightly wound Swirls (3–5) and
   Cookie Cutter's Grate (about 6 px off, VEGAS rounds its cell size).
   Without `libshacccg.suprx` the colour effects and Gradient Map run on the CPU; the rest is skipped.
-- **Track compositing modes**: Add, Subtract, Cut, Multiply, Screen, Lighten, Darken. Overlay, Hard Light, Dodge, Burn
-  and Difference need the picture underneath in the shader, so they draw normally for now. 3D Source Alpha draws as
-  Source Alpha (3D Track Motion's depth and x/y turns, and parent tracks' motion, are not followed yet). Custom
-  (a compositing plug-in): on a solid colour, a colour dodge, which matches Red Zone's white flashes in its VEGAS
-  render frame by frame; on anything else hidden.
+- **Track compositing modes** (each checked against a VEGAS Pro 11 render of a test project per mode): Add,
+  Subtract, Cut, Multiply (Mask), Screen, Lighten, Darken. Dodge: exact on a solid colour (a constant factor; Red Zone's
+  white flashes), drawn added on a picture. Overlay, Hard Light, Burn, Difference and Difference Squared need the picture
+  underneath in the shader, so they draw normally for now (their formulas are confirmed: Overlay and Hard Light are the
+  usual pair, Burn is 1 - (1 - below) / this). Custom (Bump Map, Displacement Map, Height Map plug-ins) is left out.
+- **3D Source Alpha / 3D Track Motion**: position with depth, size, and orientation (any turn, interpolated as a steady
+  turn), seen in perspective with the texture following it; matched to a VEGAS render of a keyframed track (forward,
+  turned 25.7 degrees, then flipped over). Compositing parents' Parent Motion moves their children as a group, and the
+  children's frames take the parent's shape (Red Zone's square cards).
 - **Pan/Crop** keyframes (Linear, Fast, Slow, Smooth, Sharp and Hold interpolation, mirroring, rotation; the event
   frame shows only what is inside the window, so a window narrower than the frame leaves transparent bars beside the
   picture, as in Red Zone's strips; like Vegas, the window is rescaled to the
@@ -163,7 +167,8 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Effect keyframes | legacy: after the static block, per keyframe u32 28, i64 time (100 ns), u32 type (Pan/Crop's numbering), length @0x18, then a full parameter copy; OFX: an animated value is double, u32 key count, then 52-byte keys (double time in frames, u32 type + 1, double value, 4 handle doubles) | both formats compared on a project saved by Vegas 10 and 11: the same values at every time; curve handles not used |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Legacy HSL Adjust (up to Vegas 10) | `1af0e4e6`, GUID `b432972d…`: doubles add-to-hue, saturation, luminance (the keyframe copy) | checked against the same project re-saved by Vegas 11 (OFX HSL Adjust, same values); hue units assumed equal to the OFX ones |
-| Track compositing mode | `69d46c29` @0x64: Add 1, Source Alpha 4 (the default), 3D Source Alpha 12, Custom (a compositing plug-in, its id at @0x6c) -1. The others are taken from the scripting API's order (Subtract 2, Cut 3, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Difference 13, Difference Squared 14) | 1, 4, 12 and -1 are the only values in the test projects; 12 sits on exactly the tracks with 3D Track Motion. @0x0c: 0x40 compositing parent, 0x20 its children (Red Zone); @0x80 the parent's own mode |
+| Track compositing mode | `69d46c29` @0x64: 1 Add, 2 Subtract, 3 Multiply (Mask), 4 Source Alpha (the default), 12 3D Source Alpha, 1000 Custom; -1: a compositing plug-in whose id is @0x6c: Cut 41bbf5a0, Screen ff881323, Overlay 4d6f7103, Hard Light 7d97a03f, Dodge c7dcb7e6, Burn f7382d2c, Darken 12189503, Lighten 3e85b55c, Difference c8c5f00a, Difference Squared 7826f660. @0x0c: 0x40 compositing parent, 0x20 its children | a test project per mode saved by VEGAS Pro 11, each with its render (the formulas fitted to within 1-3/255) |
+| Track Motion unit / 3D | `cd6915d8` @0x14 (double): the unit width (1.78 in a 16:9 project, the picture's aspect when the track was sized to it, 1 for Parent Motion, list `b12f5229`); keyframe depth @s+0x40, orientation quaternion w, x, y, z @s+0x90..0xa8; the viewer 2.17 half-heights in front of the frame | the 3D Source Alpha test render: sizes and turned edges within about 1 % |
 | Pan/Crop / Track Motion keyframe type | Pan/Crop keyframe @16, Track Motion keyframe @4: 0 Linear, 1 Hold, 2 Slow, 3 Fast, 4 Smooth, 5 Sharp | all six checked in VEGAS Pro 11 for both (test projects with one labelled keyframe pair per type) |
 | Keyframe curve shapes | Fast 1−(1−u)², Slow u², Smooth 3u²−2u³, Sharp ½+4(u−½)³, Hold: none | **measured** from a VEGAS Pro 11 render (all within 0.3 % of the move) |
 | Media path | media chunk: the first word is the path's offset (0x50 Vegas 8, 0x60, 0x80) | solid |

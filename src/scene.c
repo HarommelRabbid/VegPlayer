@@ -416,6 +416,58 @@ static void tm_at(const VegTrack *t, double T, double *x, double *y, double *w, 
     *rot = a->rot + (b->rot - a->rot) * u;
 }
 
+/* a keyframe list at time T, every field interpolated (orientation: spherical blend of the quaternions) */
+static void tm_key_at(const VegTmKey *k, int n, double T, VegTmKey *o)
+{
+    if (n == 1 || T <= k[0].t) { *o = k[0]; return; }
+    int i = 0;
+    while (i + 1 < n && T > k[i + 1].t) i++;
+    if (i + 1 >= n) { *o = k[n - 1]; return; }
+    const VegTmKey *a = &k[i], *b = &k[i + 1];
+    double u = b->t > a->t ? (T - a->t) / (b->t - a->t) : 1.0;
+    switch (a->curve) {
+    case VEG_KEY_FAST:   u = veg_fade_shape(VEG_CURVE_FAST, u); break;
+    case VEG_KEY_SLOW:   u = veg_fade_shape(VEG_CURVE_SLOW, u); break;
+    case VEG_KEY_SMOOTH: u = veg_fade_shape(VEG_CURVE_SMOOTH, u); break;
+    case VEG_KEY_SHARP:  u = veg_fade_shape(VEG_CURVE_SHARP, u); break;
+    case VEG_KEY_HOLD:   u = 0; break;
+    default: break;
+    }
+    *o = *a;
+    o->t = T;
+    o->x = a->x + (b->x - a->x) * u; o->y = a->y + (b->y - a->y) * u; o->z = a->z + (b->z - a->z) * u;
+    o->w = a->w + (b->w - a->w) * u; o->h = a->h + (b->h - a->h) * u;
+    o->rot = a->rot + (b->rot - a->rot) * u;
+    double d = 0, qb[4];
+    for (int c = 0; c < 4; c++) d += a->q[c] * b->q[c];
+    for (int c = 0; c < 4; c++) qb[c] = d < 0 ? -b->q[c] : b->q[c];   /* the short way round */
+    double len = 0, ad = fabs(d), wa = 1 - u, wb = u;
+    if (ad < 0.9995) {   /* spherical: a steady turn */
+        double th = acos(ad), sn = sin(th);
+        wa = sin((1 - u) * th) / sn; wb = sin(u * th) / sn;
+    }
+    for (int c = 0; c < 4; c++) { o->q[c] = a->q[c] * wa + qb[c] * wb; len += o->q[c] * o->q[c]; }
+    len = sqrt(len);
+    if (len > 1e-9) for (int c = 0; c < 4; c++) o->q[c] /= len;
+    else { o->q[0] = 1; o->q[1] = o->q[2] = o->q[3] = 0; }
+}
+
+/* rotate v by the unit quaternion q (w, x, y, z) */
+static void q_rotate(const double q[4], double v[3])
+{
+    double w = q[0], x = q[1], y = q[2], z = q[3];
+    double m[9] = { 1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                    2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                    2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y) };
+    double r[3];
+    for (int i = 0; i < 3; i++) r[i] = m[i * 3] * v[0] + m[i * 3 + 1] * v[1] + m[i * 3 + 2] * v[2];
+    v[0] = r[0]; v[1] = r[1]; v[2] = r[2];
+}
+
+/* 3D Track Motion's camera: the viewer this far in front of the frame (units of half the frame height), fitted to a
+ * VEGAS Pro 11 render of a track pulled forward, then turned 25.7 degrees about y (both sizes within 1 %) */
+#define TM3D_EYE 2.17
+
 /* corners of the source picture in project-frame pixels (W x H). Vegas's model:
  * - the Pan/Crop window (centre, size, rotation, negative size = mirror) is stored in the pixels of the media the
  *   project was made with (the frame size recorded in the Pan/Crop chunk);
@@ -423,8 +475,9 @@ static void tm_at(const VegTrack *t, double T, double *x, double *y, double *w, 
  *   layout takes the new source's shape (a 1:1 source turns a 16:9 grid into a square one);
  * - the window is fitted into the output frame keeping its shape, then Track Motion scales/moves the frame. */
 static int place(const VegProject *p, const VegEvent *e, const VegTrack *t, double tau, int pw, int ph, const VegTmFx *fx,
-                 float ox[4], float oy[4], float wx[4], float wy[4])
+                 float ox[4], float oy[4], float wx[4], float wy[4], float oq[4])
 {
+    if (oq) for (int i = 0; i < 4; i++) oq[i] = 1;
     double W = p->width, H = p->height;
     double px[4] = { 0, (double)pw, 0, (double)pw }, py[4] = { 0, 0, (double)ph, (double)ph };
     double qx[8], qy[8];   /* the picture's corners, then the Pan/Crop window's (what Vegas shows of the picture) */
@@ -476,12 +529,58 @@ static int place(const VegProject *p, const VegEvent *e, const VegTrack *t, doub
         double cx = W / 2 + fx->x * H / 2 * lx, cy = H / 2 - fx->y * H / 2 * ly;
         for (int i = 0; i < nq; i++) { qx[i] = cx + (qx[i] - W / 2) * fx->w; qy[i] = cy + (qy[i] - H / 2) * fx->h; }
     }
-    if (t->has_motion) {
-        double asp = W / H, mx, my, mw, mh, rot;
+    const VegTrack *par = t->parent >= 0 && t->parent < p->ntracks && p->tracks[t->parent].pmk ? &p->tracks[t->parent] : NULL;
+    if (par) {
+        /* a compositing child's frame has its parent's shape (Parent Motion's unit width; 1 = square): the picture is
+         * cut to it, centred (Red Zone's cards: 16:9 pictures shown as squares, uncompressed) */
+        double pb = par->pm_base > 0 ? par->pm_base : 1, hw = fmin(W / 2, pb * H / 2), hh = H / 2;
+        static const double SX[4] = { -1, 1, -1, 1 }, SY[4] = { -1, -1, 1, 1 };
+        if (nq < 8) { for (int i = 0; i < 4; i++) { qx[4 + i] = W / 2 + SX[i] * hw; qy[4 + i] = H / 2 + SY[i] * hh; } nq = 8; }
+        else for (int i = 0; i < 4; i++) {
+            qx[4 + i] = W / 2 + SX[i] * fmin(fabs(qx[4 + i] - W / 2), hw);
+            qy[4 + i] = H / 2 + SY[i] * fmin(fabs(qy[4 + i] - H / 2), hh);
+        }
+    }
+    if ((t->has_motion && t->tm3d && t->tmk) || par) {
+        /* 3D: the track's frame is a plane, sized, turned (quaternion) and moved (x, y, depth) by its Track Motion,
+         * then by its compositing parent's Parent Motion (sizes there are scale factors), then seen in perspective.
+         * Units: half the frame height, y up, z towards the viewer; across, Track Motion's own unit (tm_base). */
+        double asp = W / H, T = e->start + tau, base = t->tm_base > 0 ? t->tm_base : asp;
+        VegTmKey k;
+        if (t->has_motion && t->tmk) tm_key_at(t->tmk, t->ntmk, T, &k);
+        else { memset(&k, 0, sizeof k); k.w = base; k.h = 1; k.q[0] = 1; }
+        double tw = k.w != 0 ? k.w : base, th = k.h != 0 ? k.h : 1.0;
+        double sx = fabs(tw) / base, sy = fabs(th);
+        double xs = asp / base;
+        if (!t->has_motion || !t->tm3d) k.q[0] = cos(k.rot / 2), k.q[1] = k.q[2] = 0, k.q[3] = sin(k.rot / 2);
+        VegTmKey pk;
+        if (par) tm_key_at(par->pmk, par->npmk, T, &pk);
+        double qq[8];
+        for (int i = 0; i < nq; i++) {
+            double v[3] = { (qx[i] - W / 2) * sx / (H / 2), -(qy[i] - H / 2) * sy / (H / 2), 0 };
+            if (tw < 0) v[0] = -v[0];
+            if (th < 0) v[1] = -v[1];
+            q_rotate(k.q, v);
+            v[0] += k.x * lx * xs; v[1] += k.y * ly; v[2] -= k.z;
+            if (par) {
+                double pb = par->pm_base > 0 ? par->pm_base : 1;
+                v[0] *= pk.w != 0 ? pk.w / pb : 1; v[1] *= pk.h != 0 ? pk.h : 1;
+                q_rotate(pk.q, v);
+                v[0] += pk.x * asp / pb; v[1] += pk.y; v[2] -= pk.z;
+            }
+            double d = TM3D_EYE - v[2];   /* distance from the viewer */
+            if (d < 0.05) d = 0.05;
+            double f = TM3D_EYE / d;
+            qx[i] = W / 2 + v[0] * f * H / 2; qy[i] = H / 2 - v[1] * f * H / 2;
+            qq[i] = 1.0 / f;
+        }
+        if (oq) for (int i = 0; i < 4; i++) oq[i] = (float)qq[i];
+    } else if (t->has_motion) {
+        double asp = W / H, mx, my, mw, mh, rot, base = t->tm_base > 0 ? t->tm_base : asp;
         tm_at(t, e->start + tau, &mx, &my, &mw, &mh, &rot);   /* keyframes are on the project timeline */
-        double tw = mw != 0 ? mw : asp, th = mh != 0 ? mh : 1.0;
-        double sx = fabs(tw) / asp, sy = fabs(th);
-        double cx = W / 2 + mx * H / 2 * lx, cy = H / 2 - my * H / 2 * ly;
+        double tw = mw != 0 ? mw : base, th = mh != 0 ? mh : 1.0;
+        double sx = fabs(tw) / base, sy = fabs(th);
+        double cx = W / 2 + mx * W / 2 / base * lx, cy = H / 2 - my * H / 2 * ly;
         double c = cos(rot), s = sin(rot);   /* counter-clockwise on screen (y points down) */
         for (int i = 0; i < nq; i++) {
             double dx = (qx[i] - W / 2) * sx, dy = (qy[i] - H / 2) * sy;
@@ -562,7 +661,7 @@ static const GpuImage *cpu_fx(const GpuImage *src, const float m[12], const uint
  * its quad, so they are interpolated along). Returns -1 when the picture is inside the window anyway, else the number
  * of pieces (0: nothing left): the clipped polygon (up to 8 corners) as a fan of quads, each in the corner order the
  * draw uses (0, 1, 2 then 1, 2, 3). */
-typedef struct { float x, y, u, v; } ClipPt;
+typedef struct { float x, y, u, v, iq; } ClipPt;   /* u, v premultiplied by iq = 1 / depth (linear on screen) */
 static int clip_to_window(const GpuLayer *L, const float wx[4], const float wy[4], GpuLayer out[3])
 {
     static const int RING[4] = { 0, 1, 3, 2 };
@@ -574,7 +673,11 @@ static int clip_to_window(const GpuLayer *L, const float wx[4], const float wy[4
     float sg = area > 0 ? 1.0f : -1.0f;
     ClipPt a[12], b[12];
     int n = 4, inside_all = 1;
-    for (int i = 0; i < 4; i++) { int c = RING[i]; a[i].x = L->x[c]; a[i].y = L->y[c]; a[i].u = L->u[c]; a[i].v = L->v[c]; }
+    for (int i = 0; i < 4; i++) {
+        int c = RING[i];
+        float iq = L->q[c] > 0 ? 1.0f / L->q[c] : 1.0f;
+        a[i].x = L->x[c]; a[i].y = L->y[c]; a[i].u = L->u[c] * iq; a[i].v = L->v[c] * iq; a[i].iq = iq;
+    }
     for (int e = 0; e < 4; e++) {
         float ex = ox[(e + 1) & 3] - ox[e], ey = oy[(e + 1) & 3] - oy[e];
         for (int i = 0; i < 4; i++)
@@ -592,7 +695,7 @@ static int clip_to_window(const GpuLayer *L, const float wx[4], const float wy[4
             if ((dp >= 0) != (dq >= 0) && m < 12) {
                 float t = dp / (dp - dq);
                 b[m].x = P->x + (Q->x - P->x) * t; b[m].y = P->y + (Q->y - P->y) * t;
-                b[m].u = P->u + (Q->u - P->u) * t; b[m].v = P->v + (Q->v - P->v) * t;
+                b[m].u = P->u + (Q->u - P->u) * t; b[m].v = P->v + (Q->v - P->v) * t; b[m].iq = P->iq + (Q->iq - P->iq) * t;
                 m++;
             }
         }
@@ -605,7 +708,10 @@ static int clip_to_window(const GpuLayer *L, const float wx[4], const float wy[4
         const ClipPt *v[4] = { &a[i], &a[i + 1], &a[0], i + 2 < n ? &a[i + 2] : &a[i + 1] };
         GpuLayer *O = &out[np++];
         *O = *L;
-        for (int c = 0; c < 4; c++) { O->x[c] = v[c]->x; O->y[c] = v[c]->y; O->u[c] = v[c]->u; O->v[c] = v[c]->v; }
+        for (int c = 0; c < 4; c++) {
+            float iq = v[c]->iq > 1e-6f ? v[c]->iq : 1e-6f;
+            O->x[c] = v[c]->x; O->y[c] = v[c]->y; O->u[c] = v[c]->u / iq; O->v[c] = v[c]->v / iq; O->q[c] = 1.0f / iq;
+        }
         if (np > 1) { O->tex_prev = 1; O->nst = 0; }
     }
     return np;
@@ -618,18 +724,21 @@ static void tm_fx_layer(const VegProject *p, const VegEvent *e, const VegTrack *
 {
     memset(L, 0, sizeof *L);
     float wx[4], wy[4];
-    int has_win = place(p, e, tr, tau, pw, ph, fx, L->x, L->y, wx, wy);
+    int has_win = place(p, e, tr, tau, pw, ph, fx, L->x, L->y, wx, wy, NULL);
     static const float CU[4] = { 0, 1, 0, 1 }, CV[4] = { 0, 0, 1, 1 };
     for (int i = 0; i < 4; i++) { L->u[i] = CU[i]; L->v[i] = CV[i]; }
     if (has_win) {
-        /* the shadow of the event frame: the picture cut to its Pan/Crop window. Taken as an opaque shape (the cut
-         * picture's own alpha isn't followed): the cut quad, or the window when the cut has more corners */
+        /* the shadow of the event frame: the picture cut to its Pan/Crop window. When the cut is a quad (an unrotated
+         * window), that quad, taken as an opaque shape (the cut picture's own alpha isn't followed). When it has more
+         * corners (a turned window cutting off a corner of the picture), the whole picture's shape, uncut: the
+         * window itself would light up the full frame (Porta Mix's drum, reaching a corner of a zoomed-out window). */
         GpuLayer pc[3];
         int np = clip_to_window(L, wx, wy, pc);
         if (np == 0) { L->tint[3] = 0; L->tex = &img->tex; return; }
-        if (np == 1) { memcpy(L->x, pc[0].x, sizeof L->x); memcpy(L->y, pc[0].y, sizeof L->y); }
-        else if (np > 1) { memcpy(L->x, wx, sizeof L->x); memcpy(L->y, wy, sizeof L->y); }
-        if (np > 0 && g_s.white.data) img = &g_s.white;
+        if (np == 1) {
+            memcpy(L->x, pc[0].x, sizeof L->x); memcpy(L->y, pc[0].y, sizeof L->y);
+            if (g_s.white.data) img = &g_s.white;
+        }
     }
     cm_identity(L->m);
     cm_identity(L->m2);
@@ -699,7 +808,7 @@ static void build(Scene *sc, int buf, double T)
             if (!img || pw <= 0 || ph <= 0) continue;   /* text / noise generators and missing sources */
             GpuLayer *L = &sc->layer[sc->n];
             float win_x[4], win_y[4];
-            int has_win = place(p, e, tr, tau, pw, ph, NULL, L->x, L->y, win_x, win_y);
+            int has_win = place(p, e, tr, tau, pw, ph, NULL, L->x, L->y, win_x, win_y, L->q);
             L->tex_prev = 0;
             if (vm->type == VEG_MEDIA_FILE && m->vc.imgq && g_cfg.small_copies) {
                 /* drawn at <= 40 % of the cached size: sample the quarter-size copy (texture-cache friendly, no shimmer) */
@@ -805,14 +914,19 @@ static void build(Scene *sc, int buf, double T)
                 case VEG_COMP_SCREEN:   L->blend = BLEND_SCREEN; break;
                 case VEG_COMP_LIGHTEN:  L->blend = BLEND_LIGHTEN; break;
                 case VEG_COMP_DARKEN:   L->blend = BLEND_DARKEN; break;
-                case VEG_COMP_CUSTOM:
-                    /* a compositing plug-in. Red Zone's (the only one seen, on white solids for flashes and on a noise
-                     * texture) acts on its VEGAS render like a colour dodge: dark stays dark while the white fades in,
-                     * everything is white at full strength. A solid colour is done that way (below); others are hidden. */
-                    if (vm->type != VEG_MEDIA_SOLID || !gpu_shaders_ok()) { sc->nstage = L->nst ? L->st0 : sc->nstage; continue; }
-                    dodge = 1;
+                case VEG_COMP_DODGE:
+                    /* the picture below / (1 - this one). Exact for a solid colour (below: a constant factor); a picture
+                     * is drawn added, the closest the blend unit gets (4/255 off on the test image, against 18 drawn
+                     * normally) */
+                    if (vm->type == VEG_MEDIA_SOLID && gpu_shaders_ok()) dodge = 1;
+                    else L->blend = BLEND_ADD;
                     break;
-                default: break;   /* Overlay, Hard Light, Dodge, Burn, Difference: need the picture below (normal) */
+                case VEG_COMP_CUSTOM:
+                    /* Custom: a Bump Map, Displacement Map or Height Map plug-in, which uses this track to change the
+                     * picture below; not done, so the track is left out */
+                    sc->nstage = L->nst ? L->st0 : sc->nstage;
+                    continue;
+                default: break;   /* Overlay, Hard Light, Burn, Difference (Squared): need the picture below; drawn normally */
                 }
                 if (!gpu_shaders_ok() && L->blend != BLEND_ADD) L->blend = BLEND_NORMAL;   /* vita2d path: add only */
                 if (L->blend == BLEND_MULTIPLY || L->blend == BLEND_SCREEN || L->blend == BLEND_LIGHTEN) {

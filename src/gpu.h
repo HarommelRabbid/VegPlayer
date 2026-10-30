@@ -64,6 +64,7 @@ typedef struct {
     int rt_w, rt_h;     /* their size (the picture's) */
     float fxp[16];      /* PASS_HSL .. PASS_COOKIE: uniforms uFx0..uFx3 (see gpu.c) */
     int tex_prev;       /* another piece of the layer before it (a picture cut to its Pan/Crop window): same texture */
+    float q[4];         /* perspective depth of each corner (3D Track Motion; 0 = 1): texcoords follow the perspective */
 } GpuLayer;
 
 void gpu_draw_layer(const GpuLayer *L);

@@ -143,8 +143,9 @@ typedef struct {
 } VegTmFx;
 
 /* a Track Motion keyframe: t in seconds of the project timeline; x, y position; w, h size (Track Motion units);
- * rot in radians (counter-clockwise); curve VEG_KEY_* (the way to the next keyframe) */
-typedef struct { double t, x, y, w, h, rot; int curve; } VegTmKey;
+ * rot in radians (counter-clockwise); curve VEG_KEY_* (the way to the next keyframe). 3D: z depth (away from the
+ * viewer), orientation quaternion q (w, x, y, z; x right, y up, z towards the viewer) */
+typedef struct { double t, x, y, w, h, rot; int curve; double z, q[4]; } VegTmKey;
 
 typedef struct {
     int kind;              /* VEG_KIND_AUDIO / VEG_KIND_VIDEO (from the track header; OTHER if unknown) */
@@ -152,7 +153,14 @@ typedef struct {
     int has_motion; double tm_x, tm_y, tm_w, tm_h;  /* Track Motion (first keyframe) */
     VegTmKey *tmk; int ntmk;   /* Track Motion position keyframes (time-sorted; ntmk >= 1 when has_motion) */
     VegTmFx shadow, glow;  /* Track Motion 2D Shadow / 2D Glow (first keyframe; .on = enabled) */
+    int tm3d;              /* the keyframes leave the plane (depth, turns about x / y) */
+    double tm_base;        /* Track Motion's unit width (the frame's half width; its height is 1): usually the frame's
+                            * aspect, the picture's when the track was made for it (0: the frame's aspect) */
+    VegTmKey *pmk; int npmk;   /* a compositing parent's Parent Motion (applied to its children) */
+    double pm_base;        /* the same, for Parent Motion (1: its sizes are scale factors) */
+    int parent;            /* video track: index of its compositing parent, -1 if none */
     int has_comp; uint32_t comp_a; int32_t comp_b;  /* compositing chunk words @0x60 / @0x64 */
+    uint32_t comp_flags;   /* compositing chunk @0x0c: 0x40 compositing parent, 0x20 compositing child */
     int comp_mode;         /* VEG_COMP_* (Source Alpha when absent) */
     float level;           /* video track: opacity (Level); audio track: volume, linear gain (1 = 0 dB); the UI can change it */
     float level_veg;       /* the project's own value (the sliders' reset) */

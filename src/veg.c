@@ -147,7 +147,10 @@ const char *veg_ext(const char *path)
 #define G_COMP       "69d46c29"
 #define G_ACOMP      "69d46c27"   /* audio track settings: volume (float, linear) @0x0c */
 #define G_TRACKMOTION "cd6915d8"
+#define G_PARENT_MOTION "b12f5229"
 static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t);
+static int tm_keys(const uint8_t *b, size_t bl, VegTmKey **keys, int *nkeys);
+static double tm_base_of(const uint8_t *b);
 #define G_TRACKFX    "f79298f4"   /* audio track FX chain (Track Noise Gate/EQ/Compressor + inserted plug-ins) */
 
 typedef struct { char name[64]; double v[4]; int nv; int nk; float kt[8], kv[8]; int ki[8]; } OfxParam;
@@ -213,6 +216,7 @@ typedef struct {
     int evcap, mcap;
     int cur;            /* event receiving sub-chunks, -1 if none */
     int track;          /* current track */
+    int in_pmotion;     /* inside a track's Parent Motion list */
     char unk[1024];
 } St;
 
@@ -1128,6 +1132,31 @@ static int event_chunk(St *s, const Chunk *c)
     return 0;
 }
 
+/* track compositing mode, from the compositing chunk: @0x64 a built-in mode (1 Add, 2 Subtract, 3 Multiply (Mask),
+ * 4 Source Alpha, 12 3D Source Alpha, 1000 Custom), or -1 and the mode's plug-in id @0x6c: the other modes are
+ * compositing plug-ins. All from a test project per mode saved by VEGAS Pro 11. */
+static int comp_mode_of(int32_t v, const uint8_t *guid)
+{
+    switch (v) {
+    case 1: return VEG_COMP_ADD;
+    case 2: return VEG_COMP_SUBTRACT;
+    case 3: return VEG_COMP_MULTIPLY;
+    case 4: return VEG_COMP_SRCALPHA;
+    case 12: return VEG_COMP_SRCALPHA3D;
+    case -1: break;
+    default: return v == 1000 ? VEG_COMP_CUSTOM : VEG_COMP_SRCALPHA;
+    }
+    static const struct { uint32_t d1; int mode; } PLUG[] = {   /* first GUID word of each plug-in */
+        { 0x41bbf5a0, VEG_COMP_CUT },     { 0xff881323, VEG_COMP_SCREEN },  { 0x4d6f7103, VEG_COMP_OVERLAY },
+        { 0x7d97a03f, VEG_COMP_HARDLIGHT }, { 0xc7dcb7e6, VEG_COMP_DODGE }, { 0xf7382d2c, VEG_COMP_BURN },
+        { 0x12189503, VEG_COMP_DARKEN },  { 0x3e85b55c, VEG_COMP_LIGHTEN }, { 0xc8c5f00a, VEG_COMP_DIFFERENCE },
+        { 0x7826f660, VEG_COMP_DIFFSQUARED },
+    };
+    uint32_t d1 = rd32(guid);
+    for (size_t i = 0; i < sizeof PLUG / sizeof PLUG[0]; i++) if (PLUG[i].d1 == d1) return PLUG[i].mode;
+    return VEG_COMP_CUSTOM;
+}
+
 static int walk_track(St *s, size_t off, size_t end, int in_event)
 {
     VegProject *p = s->p;
@@ -1140,7 +1169,13 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
                 s->cur = -1;
                 if (walk_track(s, c.body, c.body + c.blen, 1) < 0) return -1;
                 s->cur = in_event ? saved : -1;
-            } else if (walk_track(s, c.body, c.body + c.blen, in_event) < 0) return -1;
+            } else {
+                int pm = !strncmp(c.g, G_PARENT_MOTION, 8), saved = s->in_pmotion;
+                if (pm) s->in_pmotion = 1;
+                int r = walk_track(s, c.body, c.body + c.blen, in_event);
+                s->in_pmotion = saved;
+                if (r < 0) return -1;
+            }
             continue;
         }
         const uint8_t *b = s->d + c.body;
@@ -1152,15 +1187,16 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
             t->kind = ty == 3 ? VEG_KIND_VIDEO : ty == 2 ? VEG_KIND_AUDIO : VEG_KIND_OTHER;
         } else if (gpre(&c, G_COMP) && bl >= 0x84 && !in_event) {
             t->has_comp = 1; t->comp_a = rd32(b + 0x60); t->comp_b = (int32_t)rd32(b + 0x64);
-            if (t->comp_b >= VEG_COMP_CUSTOM && t->comp_b <= VEG_COMP_DIFFSQUARED) t->comp_mode = t->comp_b;
-            /* 12 is 3D Source Alpha, not Lighten as the scripting API's order suggests: every track saved with it
-             * (Red Zone, Porta Mix) has 3D Track Motion (depth, turns about x/y) and no others do */
-            if (t->comp_b == 12) t->comp_mode = VEG_COMP_SRCALPHA3D;
+            t->comp_flags = rd32(b + 0x0c);
+            t->comp_mode = comp_mode_of(t->comp_b, b + 0x6c);
             float lv = rdf(b + 0x68);   /* track Level (opacity) */
             if (lv >= 0 && lv <= 1) t->level = lv;
         } else if (gpre(&c, G_ACOMP) && bl >= 0x10 && !in_event) {
             float vol = rdf(b + 0x0c);   /* linear gain: Vegas's -inf..+12 dB slider = 0..3.98 */
             if (vol >= 0 && vol <= 4.5f) t->level = vol;
+        } else if (gpre(&c, G_TRACKMOTION) && bl >= 136 && !in_event && s->in_pmotion) {
+            tm_keys(b, bl, &t->pmk, &t->npmk);
+            t->pm_base = tm_base_of(b);
         } else if (gpre(&c, G_TRACKMOTION) && bl >= 136 && !in_event) {
             t->has_motion = 1;
             t->tm_x = rdd(b + 88); t->tm_y = rdd(b + 96); t->tm_w = rdd(b + 120); t->tm_h = rdd(b + 128);
@@ -1188,41 +1224,74 @@ static int walk_track(St *s, size_t off, size_t end, int in_event)
  * shadow/glow colour @+0xb0 (4 floats, B G R A) and blur @+0xc0 (double). Position keyframes also: interpolation
  * type @s+4 (VEG_KEY_*, as Pan/Crop), time @s+8 (u64, 100 ns, project timeline), rotation as a quaternion
  * (w @s+0x90, x, y, z @s+0xa8; only z turns a 2D track: angle = 2 atan2(z, w)). Shadow/glow: first keyframe only. */
+/* Track Motion's unit width, a double @0x14 of the chunk: 1.78 in 16:9 projects, 1.40 in a test project whose track
+ * was sized to an 860x615 picture (its moves across then go 1.27 times further than 1.78 would give), 1 for Parent
+ * Motion */
+static double tm_base_of(const uint8_t *b)
+{
+    double v = rdd(b + 0x14);
+    return isfinite(v) && v > 0.05 && v < 20 ? v : 0;
+}
+
+/* the position keyframe list (the first of the three) into *keys */
+static int tm_keys(const uint8_t *b, size_t bl, VegTmKey **keys, int *nkeys)
+{
+    size_t p = 0x24;
+    if (p + 8 > bl) return 0;
+    uint32_t n = rd32(b + p);
+    p += 4;
+    if (n == 0 || n >= 100000) return 0;
+    free(*keys);
+    *keys = calloc(n, sizeof(VegTmKey));
+    *nkeys = 0;
+    VegTmKey *K = *keys;
+    int is3d = 0;
+    for (uint32_t k = 0; k < n && K; k++) {
+        uint32_t sz = rd32(b + p);
+        if (sz < 8 || sz > bl - p) break;
+        if (sz >= 0xb0) {
+            VegTmKey key;
+            const uint8_t *q = b + p;
+            key.curve = veg_key_type(rd32(q + 4));   /* same numbering as Pan/Crop */
+            key.t = (double)rd64(q + 8) * 1e-7;
+            key.x = rdd(q + 0x30); key.y = rdd(q + 0x38); key.z = rdd(q + 0x40); key.w = rdd(q + 0x50); key.h = rdd(q + 0x58);
+            for (int c = 0; c < 4; c++) key.q[c] = rdd(q + 0x90 + 8 * c);
+            double qw = key.q[0], qz = key.q[3];
+            int qok = 1;
+            for (int c = 0; c < 4; c++) if (!isfinite(key.q[c]) || fabs(key.q[c]) > 2) qok = 0;
+            if (!qok || (key.q[0] == 0 && key.q[1] == 0 && key.q[2] == 0 && key.q[3] == 0)) { key.q[0] = 1; key.q[1] = key.q[2] = key.q[3] = 0; qw = 1; qz = 0; }
+            key.rot = 2.0 * atan2(qz, qw);
+            if (!isfinite(key.z) || fabs(key.z) > 1000) key.z = 0;
+            if (isfinite(key.t) && isfinite(key.x) && isfinite(key.y) && isfinite(key.w) && isfinite(key.h) &&
+                fabs(key.x) < 1000 && fabs(key.y) < 1000 && fabs(key.w) < 1000 && fabs(key.h) < 1000) {
+                if (key.z != 0 || fabs(key.q[1]) > 1e-6 || fabs(key.q[2]) > 1e-6) is3d = 1;
+                K[(*nkeys)++] = key;
+            }
+        }
+        p += sz;
+    }
+    /* time order (insertion sort: few keyframes) */
+    for (int i = 1; i < *nkeys; i++)
+        for (int j = i; j > 0 && K[j].t < K[j - 1].t; j--) { VegTmKey x = K[j]; K[j] = K[j - 1]; K[j - 1] = x; }
+    if (!*nkeys) { free(*keys); *keys = NULL; }
+    return is3d;
+}
+
 static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t)
 {
     uint32_t flags = rd32(b + 4);
+    t->tm3d = tm_keys(b, bl, &t->tmk, &t->ntmk);
+    t->tm_base = tm_base_of(b);
     size_t p = 0x24;
     for (int blk = 0; blk < 3; blk++) {
         if (p + 8 > bl) return;
         uint32_t n = rd32(b + p);
         p += 4;
         size_t s = p;   /* first keyframe */
-        if (blk == 0 && n > 0 && n < 100000) {
-            free(t->tmk);
-            t->tmk = calloc(n, sizeof(VegTmKey));
-            t->ntmk = 0;
-        }
         for (uint32_t k = 0; k < n; k++) {
             uint32_t sz = rd32(b + p);
             if (sz < 8 || sz > bl - p) return;
-            if (blk == 0 && t->tmk && sz >= 0xb0) {
-                VegTmKey key;
-                const uint8_t *q = b + p;
-                key.curve = veg_key_type(rd32(q + 4));   /* same numbering as Pan/Crop */
-                key.t = (double)rd64(q + 8) * 1e-7;
-                key.x = rdd(q + 0x30); key.y = rdd(q + 0x38); key.w = rdd(q + 0x50); key.h = rdd(q + 0x58);
-                double qw = rdd(q + 0x90), qz = rdd(q + 0xa8);
-                key.rot = isfinite(qw) && isfinite(qz) && (qw != 0 || qz != 0) ? 2.0 * atan2(qz, qw) : 0;
-                if (isfinite(key.t) && isfinite(key.x) && isfinite(key.y) && isfinite(key.w) && isfinite(key.h) &&
-                    fabs(key.x) < 1000 && fabs(key.y) < 1000 && fabs(key.w) < 1000 && fabs(key.h) < 1000)
-                    t->tmk[t->ntmk++] = key;
-            }
             p += sz;
-        }
-        if (blk == 0 && t->tmk) {   /* time order (insertion sort: few keyframes) */
-            for (int i = 1; i < t->ntmk; i++)
-                for (int j = i; j > 0 && t->tmk[j].t < t->tmk[j - 1].t; j--) { VegTmKey x = t->tmk[j]; t->tmk[j] = t->tmk[j - 1]; t->tmk[j - 1] = x; }
-            if (!t->ntmk) { free(t->tmk); t->tmk = NULL; }
         }
         if (blk == 0 || n == 0 || s + 0xc8 > bl || rd32(b + s) < 0xc8) continue;
         VegTmFx *f = blk == 1 ? &t->shadow : &t->glow;
@@ -1336,6 +1405,16 @@ int veg_parse(const uint8_t *data, size_t len, VegProject *p, char *err, size_t 
     }
     if (!p->width) { p->width = 1280; p->height = 720; }
     if (!p->sample_rate) p->sample_rate = 48000;
+    /* compositing parents and children: a parent (flag 0x40) owns the video tracks right below it that are marked as
+     * children (0x20); its Parent Motion moves them as a group */
+    for (int i = 0, par = -1; i < p->ntracks; i++) {
+        VegTrack *t = &p->tracks[i];
+        t->parent = -1;
+        if (t->kind != VEG_KIND_VIDEO) continue;
+        if (t->comp_flags & 0x40) par = i;
+        else if ((t->comp_flags & 0x20) && par >= 0) t->parent = par;
+        else par = -1;
+    }
 
     /* drop events without a take (empty events), resolve media, sort per track */
     int w = 0;
@@ -1415,7 +1494,7 @@ int veg_load_file(const char *path, VegProject *p, char *err, size_t errlen)
 void veg_free(VegProject *p)
 {
     for (int i = 0; i < p->nevents; i++) { veg_vfx_free_keys(p->events[i].vfx, p->events[i].nvfx); free(p->events[i].pan); free(p->events[i].vfx); free(p->events[i].afx); }
-    for (int t = 0; t < p->ntracks; t++) { veg_vfx_free_keys(p->tracks[t].vfx, p->tracks[t].nvfx); free(p->tracks[t].vfx); free(p->tracks[t].afx); free(p->tracks[t].tmk); }
+    for (int t = 0; t < p->ntracks; t++) { veg_vfx_free_keys(p->tracks[t].vfx, p->tracks[t].nvfx); free(p->tracks[t].vfx); free(p->tracks[t].afx); free(p->tracks[t].tmk); free(p->tracks[t].pmk); }
     free(p->events); free(p->tracks); free(p->media);
     memset(p, 0, sizeof *p);
 }

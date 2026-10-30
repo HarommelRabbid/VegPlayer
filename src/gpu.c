@@ -112,7 +112,7 @@ static const char VERTEX_SRC[] =
     "void main(float3 aPosition, float2 aTexcoord, uniform float4x4 wvp,\n"
     "          float4 out vPosition : POSITION, float2 out vTexcoord : TEXCOORD0)\n"
     "{\n"
-    "    vPosition = mul(float4(aPosition, 1.f), wvp);\n"
+    "    vPosition = mul(float4(aPosition.xy, 0.5f, 1.f), wvp) * aPosition.z;\n"
     "    vTexcoord = aTexcoord;\n"
     "}\n";
 
@@ -339,7 +339,7 @@ static const char FRAG_COOKIE_SRC[] = WARP_HEAD
     "    return float4(saturate(o), c.a * al) * uTint;\n"
     "}\n";
 
-#define SHADER_VERSION 4   /* bump when a shader's source changes (new shaders just get compiled once) */
+#define SHADER_VERSION 5   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
     const char *name, *src;
@@ -608,7 +608,12 @@ void gpu_draw_layer_own(const GpuLayer *L)
 
 static void draw_layer_v(const GpuLayer *L, vita2d_texture_vertex *v)
 {
-    for (int i = 0; i < 4; i++) { v[i].x = L->x[i]; v[i].y = L->y[i]; v[i].z = 0.5f; v[i].u = L->u[i]; v[i].v = L->v[i]; }
+    /* z carries the corner's perspective depth: the vertex program scales the whole clip position by it, so the
+     * picture lands where it did and its texcoords are interpolated in perspective (3D Track Motion) */
+    for (int i = 0; i < 4; i++) {
+        v[i].x = L->x[i]; v[i].y = L->y[i]; v[i].z = g_shaders_ok && L->q[i] > 0 ? L->q[i] : (g_shaders_ok ? 1.0f : 0.5f);
+        v[i].u = L->u[i]; v[i].v = L->v[i];
+    }
 
     if (!g_shaders_ok) {
         /* vita2d's own textured program: transforms, opacity and add-blend only (effects were baked on the CPU) */
