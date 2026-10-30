@@ -187,7 +187,7 @@ static void luts_build(void)
  * (m before it, m2 after it); a blur, a warp (Swirl, Wave, Deform) or Cookie Cutter is applied when sampling (they
  * commute with the colour matrix). One special effect per layer: the first one wins; a later HSL Adjust then folds
  * into the matrix as an approximation, the other special effects are left out. */
-typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; } Chain;
+typedef struct { int pass; float m[12], m2[12]; const VegVfx *special; VegVfx sp; } Chain;
 
 static int special_pass(int type)
 {
@@ -208,7 +208,8 @@ static int special_pass(int type)
 /* passes whose shader applies a second matrix after the effect */
 static int pass_has_post(int pass) { return pass == PASS_LUT || pass == PASS_HSL || pass == PASS_THRESH || pass == PASS_SECCC; }
 
-static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
+/* tau: time in the event (event effects' keyframes), T: project time (track effects') */
+static void chain_build(const VegEvent *e, const VegTrack *t, double tau, double T, Chain *c)
 {
     cm_identity(c->m); cm_identity(c->m2);
     c->pass = PASS_MATRIX; c->special = NULL;
@@ -216,18 +217,20 @@ static void chain_build(const VegEvent *e, const VegTrack *t, Chain *c)
         const VegVfx *fx = pass ? t->vfx : e->vfx;
         int n = pass ? t->nvfx : e->nvfx;
         for (int i = 0; i < n; i++) {
-            const VegVfx *v = &fx[i];
+            VegVfx at;
+            const VegVfx *v = veg_vfx_at(&fx[i], pass ? T : tau, &at);
             if (v->type == VFX_UNKNOWN || v->type == VFX_NOOP) continue;
             int sp = special_pass(v->type);
             if (sp == PASS_LUT || sp == PASS_BLUR) {
                 if (!c->special && (v->type != VFX_GRADIENT || v->lut >= 0)) {
-                    c->special = v;
+                    c->sp = *v;
+                    c->special = &c->sp;
                     c->pass = sp;
                 }
                 continue;
             }
             if (sp >= 0) {
-                if (!c->special && gpu_pass_ok(sp)) { c->special = v; c->pass = sp; continue; }
+                if (!c->special && gpu_pass_ok(sp)) { c->sp = *v; c->special = &c->sp; c->pass = sp; continue; }
                 if (v->type != VFX_HSL) continue;   /* HSL Adjust: the matrix approximation below */
             }
             float f[12], r[12];
@@ -620,7 +623,7 @@ static void build(Scene *sc, int buf, double T)
             L->u[0] = 0; L->u[1] = 1; L->u[2] = 0; L->u[3] = 1;
             L->v[0] = 0; L->v[1] = 0; L->v[2] = 1; L->v[3] = 1;
             Chain ch;
-            chain_build(e, tr, &ch);
+            chain_build(e, tr, tau, T, &ch);
             memcpy(L->m, ch.m, sizeof L->m);
             memcpy(L->m2, ch.m2, sizeof L->m2);
             L->pass = ch.pass;

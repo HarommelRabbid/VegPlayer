@@ -150,7 +150,7 @@ const char *veg_ext(const char *path)
 static void track_motion_fx(const uint8_t *b, size_t bl, VegTrack *t);
 #define G_TRACKFX    "f79298f4"   /* audio track FX chain (Track Noise Gate/EQ/Compressor + inserted plug-ins) */
 
-typedef struct { char name[64]; double v[4]; int nv; } OfxParam;
+typedef struct { char name[64]; double v[4]; int nv; int nk; float kt[8], kv[8]; int ki[8]; } OfxParam;
 static int ofx_params(const uint8_t *b, size_t bl, char *id, size_t idsz, OfxParam *out, int maxp);
 static const OfxParam *ofx_find(const OfxParam *ps, int n, const char *name);
 /* a2fc1a41-01f6-460e-ae5a-2be4af57b92e as stored */
@@ -172,6 +172,8 @@ static const uint8_t PRESET_MARK[12] = { 0x0b,0,0,0, 0x06,0x01,0,0, 0x01,0,0,0 }
 #define FX_DEFORM_GUID    "f4205ab4-e8c1-468f-9ad2-4feb8df04538" /* Sony Deform (DXT) */
 #define FX_SWIRL_GUID     "b3a8c4cf-e5ad-4b2f-a603-2f0fcb3b546e" /* Sony Swirl (DXT) */
 #define FX_WAVE_GUID      "ec1a2314-0c38-11d2-9aac-00a0c99b12c5" /* Sony Wave (DXT) */
+#define FX_COOKIE_GUID    "d76643c7-95bd-4519-9718-4115c692ea7d" /* Sony Cookie Cutter (DXT, up to Vegas 10) */
+#define FX_GBLUR_GUID     "1485b954-eb62-11d1-9aa9-00a0c99b12c5" /* Sony Gaussian Blur (DXT, up to Vegas 10) */
 #define AFX_PITCH_GUID "ed1b4100-93be-11d0-aebc-00a0c9053912"   /* Sony Pitch Shift (DirectX) */
 #define AFX_REVERB_GUID "607682e0-6e21-11d0-aebc-00a0c9053912"  /* Sony Reverb (DirectX) */
 
@@ -418,6 +420,17 @@ static int ofx_params(const uint8_t *b, size_t bl, char *id, size_t idsz, OfxPar
         u16_utf8(b + q + 8, nl, pr->name, sizeof pr->name);
         const uint8_t *v = b + q + 8 + nl;
         if (vs == 8) { pr->v[0] = (double)(int32_t)rd32(v); pr->nv = 1; }
+        else if (vs >= 12 + 52 && (vs - 12) % 52 == 0 && rd32(v + 8) == (vs - 12) / 52) {
+            /* an animated value: the value, u32 key count, then per key: double time (frames), u32 interpolation
+             * (the stored keyframe type + 1), double value, 4 doubles of curve handles */
+            pr->v[0] = rdd(v); pr->nv = 1;
+            uint32_t n = rd32(v + 8);
+            for (uint32_t k = 0; k < n && k < 8; k++) {
+                const uint8_t *r = v + 12 + k * 52;
+                pr->kt[k] = (float)rdd(r); pr->ki[k] = (int)rd32(r + 8); pr->kv[k] = (float)rdd(r + 12);
+                pr->nk++;
+            }
+        }
         else for (uint32_t k = 0; k + 8 <= vs && pr->nv < 4; k += 8) pr->v[pr->nv++] = rdd(v + k);
         q += 8 + nl + vs;
     }
@@ -482,7 +495,101 @@ static void lab_or_blur_ofx(VegVfx *v, const char *id, const OfxParam *ps, int n
     }
 }
 
-static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
+/* an OFX effect from its id and parameters (ps: the values at one time) */
+static void ofx_effect(VegVfx *v, const char *id, const OfxParam *ps, int np)
+{
+    if (ci_contains(id, ":hsladjust")) {
+        v->type = VFX_HSL;
+        v->hue = ofx_get(ps, np, "AddToHue", 0);
+        v->sat = ofx_get(ps, np, "Saturation", 1);
+        v->lum = ofx_get(ps, np, "Luminance", 1);
+        if (fabs(v->hue) < 1e-9 && fabs(v->sat - 1) < 1e-9 && fabs(v->lum - 1) < 1e-9) v->type = VFX_NOOP;
+    } else if (ci_contains(id, ":invert")) {
+        v->type = VFX_INVERT;
+        v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", ofx_get(ps, np, "BlendAmount", 1)));
+    } else if (ci_contains(id, ":channelblend")) {
+        /* VEGAS 20 Channel Blend (OFX): "<OUT> weight R/G/B/A/Offset" for OUT = RED, GREEN, BLUE, ALPHA, and Normalize */
+        static const char *OUT[3] = { "RED", "GREEN", "BLUE" }, *IN[4] = { "R", "G", "B", "Offset" };
+        int norm = ofx_get(ps, np, "Normalize", 0) != 0;
+        v->type = VFX_MATRIX;
+        for (int o = 0; o < 3; o++) {
+            double w[4], sum = 0;
+            for (int k = 0; k < 4; k++) {
+                char nm[48];
+                snprintf(nm, sizeof nm, "%s weight %s", OUT[o], IN[k]);
+                w[k] = ofx_get(ps, np, nm, k == o ? 1 : 0);
+                if (!(w[k] > -16 && w[k] < 16)) w[k] = 0;
+                if (k < 3) sum += w[k];
+            }
+            double d = norm && fabs(sum) > 1e-9 ? sum : 1;
+            for (int k = 0; k < 3; k++) v->mtx[o * 4 + k] = (float)(w[k] / d);
+            v->mtx[o * 4 + 3] = (float)w[3];
+        }
+    } else if (ci_contains(id, ":blackandwhite") || ci_contains(id, ":monochrome") || ci_contains(id, ":grayscale")) {
+        v->type = VFX_GRAYSCALE;
+        v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", 1));
+    } else if (ci_contains(id, ":sepia")) {
+        v->type = VFX_SEPIA;
+        v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", 1));
+    } else if (ci_contains(id, ":brightnessandcontrast") || ci_contains(id, ":brightnesscontrast")) {
+        v->type = VFX_BRICON;
+        v->bright = ofx_get(ps, np, "Brightness", 0);
+        v->contrast = ofx_get(ps, np, "Contrast", 0);
+    } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur")) {
+        lab_or_blur_ofx(v, id, ps, np);
+    } else if (ci_contains(id, ":colorcorrectorsecondary")) {
+        /* the mask: luminance (0..255: low, high, smooth), hue (degrees, as atan2(Cr, Cb) in BT.601 YCbCr: centre,
+         * width, smooth), each smoothstep-edged; inside it: hue rotation and saturation in YCbCr, then gamma (1/g on
+         * RGB), gain and offset. All checked against VEGAS renders of the presets (within 1/255 on average). The
+         * saturation limit and Alpha are not applied. */
+        float *q = v->prm;
+        q[0] = (float)ofx_get(ps, np, "RotateHue", 0); q[1] = (float)ofx_get(ps, np, "Saturation", 1);
+        q[2] = (float)ofx_get(ps, np, "Gamma", 1); q[3] = (float)ofx_get(ps, np, "Gain", 1); q[4] = (float)ofx_get(ps, np, "Offset", 0);
+        int el = ofx_get(ps, np, "EnableLimitLuminance", 1) != 0, eh = ofx_get(ps, np, "EnableLimitHue", 1) != 0;
+        q[5] = el ? (float)ofx_get(ps, np, "LimitLuminanceLow", 0) : 0; q[6] = el ? (float)ofx_get(ps, np, "LimitLuminanceHigh", 255) : 255;
+        q[7] = el ? (float)ofx_get(ps, np, "LimitLuminanceSmooth", 0) : 0;
+        q[8] = (float)ofx_get(ps, np, "LimitHueCenter", 180); q[9] = eh ? (float)ofx_get(ps, np, "LimitHueWidth", 360) : 360;
+        q[10] = (float)ofx_get(ps, np, "LimitHueSmooth", 0);
+        if (q[9] >= 360) q[9] = 1000;   /* every hue */
+        int noop = fabsf(q[0]) < 1e-6f && fabsf(q[1] - 1) < 1e-6f && fabsf(q[2] - 1) < 1e-6f && fabsf(q[3] - 1) < 1e-6f && fabsf(q[4]) < 1e-6f;
+        v->type = noop ? VFX_NOOP : VFX_SECCC;
+    } else if (ci_contains(id, ":cookiecutter")) {
+        /* Shape (0 circle, 1 oval, 2 portrait oval, 3 rectangle, 4 diamond, 5 square, 6 triangle), Method (0 keep the
+         * inside, 1 cut it out), Feather, Border (+ Color, three doubles), RepeatX/Y, Size, Center (x right, y up).
+         * Measured on VEGAS renders: the circle's radius is Size x the frame diagonal; the square has the circle's
+         * area; the rectangle is Size x the frame; the border (Border x half the frame width) is drawn inside the
+         * shape; the feather is a Gaussian edge (sigma = 0.1465 x Feather x half the width); repeats divide the frame
+         * into cells and scale the shape with them. */
+        float *q = v->prm;
+        const OfxParam *col = ofx_find(ps, np, "Color"), *cen = ofx_find(ps, np, "Center");
+        v->ip[0] = (int)ofx_get(ps, np, "Shape", 0); v->ip[1] = (int)ofx_get(ps, np, "Method", 0);
+        q[0] = (float)ofx_get(ps, np, "Size", 0.25); q[1] = (float)ofx_get(ps, np, "Feather", 0); q[2] = (float)ofx_get(ps, np, "Border", 0);
+        q[3] = (float)ofx_get(ps, np, "RepeatX", 1); q[4] = (float)ofx_get(ps, np, "RepeatY", 1);
+        q[5] = cen && cen->nv >= 2 ? (float)cen->v[0] : 0.5f; q[6] = cen && cen->nv >= 2 ? (float)cen->v[1] : 0.5f;
+        for (int k = 0; k < 3; k++) q[7 + k] = col && col->nv >= 3 ? (float)col->v[k] : 0;
+        if (q[3] < 1) q[3] = 1;
+        if (q[4] < 1) q[4] = 1;
+        v->type = VFX_COOKIE;
+    } else if (ci_contains(id, ":colorcorrector") && !ci_contains(id, "secondary")) {
+        /* saturation around luma, then gain and offset; the colour wheels and gamma are not applied */
+        double sat = ofx_get(ps, np, "Saturation", 1), gain = ofx_get(ps, np, "Gain", 1), off = ofx_get(ps, np, "Offset", 0);
+        v->type = fabs(sat - 1) < 1e-6 && fabs(gain - 1) < 1e-6 && fabs(off) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
+        const double L[3] = { 0.299, 0.587, 0.114 };
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) v->mtx[i * 4 + j] = (float)(gain * ((1 - sat) * L[j] + (i == j ? sat : 0)));
+            v->mtx[i * 4 + 3] = (float)off;
+        }
+    } else if (ci_contains(id, ":colorbalance")) {
+        double r = ofx_get(ps, np, "Red", 0), g = ofx_get(ps, np, "Green", 0), bb = ofx_get(ps, np, "Blue", 0);
+        v->type = fabs(r) + fabs(g) + fabs(bb) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
+        for (int i = 0; i < 12; i++) v->mtx[i] = i % 5 == 0 ? 1.0f : 0.0f;
+        v->mtx[3] = (float)(r * 0.5); v->mtx[7] = (float)(g * 0.5); v->mtx[11] = (float)(bb * 0.5);   /* scale guessed */
+    } else {
+        v->type = VFX_UNKNOWN;
+    }
+}
+
+static void parse_vfx_one(St *s, const uint8_t *b, size_t bl, VegVfx *v, int top)
 {
     vfx_defaults(v);
     if (bl < 0x20) return;
@@ -493,95 +600,7 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
         OfxParam ps[48];
         int np = ofx_params(b, bl, id, sizeof id, ps, 48);
         snprintf(v->name, sizeof v->name, "%s", id);
-        if (ci_contains(id, ":hsladjust")) {
-            v->type = VFX_HSL;
-            v->hue = ofx_get(ps, np, "AddToHue", 0);
-            v->sat = ofx_get(ps, np, "Saturation", 1);
-            v->lum = ofx_get(ps, np, "Luminance", 1);
-            if (fabs(v->hue) < 1e-9 && fabs(v->sat - 1) < 1e-9 && fabs(v->lum - 1) < 1e-9) v->type = VFX_NOOP;
-        } else if (ci_contains(id, ":invert")) {
-            v->type = VFX_INVERT;
-            v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", ofx_get(ps, np, "BlendAmount", 1)));
-        } else if (ci_contains(id, ":channelblend")) {
-            /* VEGAS 20 Channel Blend (OFX): "<OUT> weight R/G/B/A/Offset" for OUT = RED, GREEN, BLUE, ALPHA, and Normalize */
-            static const char *OUT[3] = { "RED", "GREEN", "BLUE" }, *IN[4] = { "R", "G", "B", "Offset" };
-            int norm = ofx_get(ps, np, "Normalize", 0) != 0;
-            v->type = VFX_MATRIX;
-            for (int o = 0; o < 3; o++) {
-                double w[4], sum = 0;
-                for (int k = 0; k < 4; k++) {
-                    char nm[48];
-                    snprintf(nm, sizeof nm, "%s weight %s", OUT[o], IN[k]);
-                    w[k] = ofx_get(ps, np, nm, k == o ? 1 : 0);
-                    if (!(w[k] > -16 && w[k] < 16)) w[k] = 0;
-                    if (k < 3) sum += w[k];
-                }
-                double d = norm && fabs(sum) > 1e-9 ? sum : 1;
-                for (int k = 0; k < 3; k++) v->mtx[o * 4 + k] = (float)(w[k] / d);
-                v->mtx[o * 4 + 3] = (float)w[3];
-            }
-        } else if (ci_contains(id, ":blackandwhite") || ci_contains(id, ":monochrome") || ci_contains(id, ":grayscale")) {
-            v->type = VFX_GRAYSCALE;
-            v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", 1));
-        } else if (ci_contains(id, ":sepia")) {
-            v->type = VFX_SEPIA;
-            v->amount = ofx_get(ps, np, "Amount", ofx_get(ps, np, "Blend", 1));
-        } else if (ci_contains(id, ":brightnessandcontrast") || ci_contains(id, ":brightnesscontrast")) {
-            v->type = VFX_BRICON;
-            v->bright = ofx_get(ps, np, "Brightness", 0);
-            v->contrast = ofx_get(ps, np, "Contrast", 0);
-        } else if (ci_contains(id, ":labadjust") || ci_contains(id, ":linearblur") || ci_contains(id, ":radialblur") || ci_contains(id, ":gaussianblur")) {
-            lab_or_blur_ofx(v, id, ps, np);
-        } else if (ci_contains(id, ":colorcorrectorsecondary")) {
-            /* the mask: luminance (0..255: low, high, smooth), hue (degrees, as atan2(Cr, Cb) in BT.601 YCbCr: centre,
-             * width, smooth), each smoothstep-edged; inside it: hue rotation and saturation in YCbCr, then gamma (1/g on
-             * RGB), gain and offset. All checked against VEGAS renders of the presets (within 1/255 on average). The
-             * saturation limit and Alpha are not applied. */
-            float *q = v->prm;
-            q[0] = (float)ofx_get(ps, np, "RotateHue", 0); q[1] = (float)ofx_get(ps, np, "Saturation", 1);
-            q[2] = (float)ofx_get(ps, np, "Gamma", 1); q[3] = (float)ofx_get(ps, np, "Gain", 1); q[4] = (float)ofx_get(ps, np, "Offset", 0);
-            int el = ofx_get(ps, np, "EnableLimitLuminance", 1) != 0, eh = ofx_get(ps, np, "EnableLimitHue", 1) != 0;
-            q[5] = el ? (float)ofx_get(ps, np, "LimitLuminanceLow", 0) : 0; q[6] = el ? (float)ofx_get(ps, np, "LimitLuminanceHigh", 255) : 255;
-            q[7] = el ? (float)ofx_get(ps, np, "LimitLuminanceSmooth", 0) : 0;
-            q[8] = (float)ofx_get(ps, np, "LimitHueCenter", 180); q[9] = eh ? (float)ofx_get(ps, np, "LimitHueWidth", 360) : 360;
-            q[10] = (float)ofx_get(ps, np, "LimitHueSmooth", 0);
-            if (q[9] >= 360) q[9] = 1000;   /* every hue */
-            int noop = fabsf(q[0]) < 1e-6f && fabsf(q[1] - 1) < 1e-6f && fabsf(q[2] - 1) < 1e-6f && fabsf(q[3] - 1) < 1e-6f && fabsf(q[4]) < 1e-6f;
-            v->type = noop ? VFX_NOOP : VFX_SECCC;
-        } else if (ci_contains(id, ":cookiecutter")) {
-            /* Shape (0 circle, 1 oval, 2 portrait oval, 3 rectangle, 4 diamond, 5 square, 6 triangle), Method (0 keep the
-             * inside, 1 cut it out), Feather, Border (+ Color, three doubles), RepeatX/Y, Size, Center (x right, y up).
-             * Measured on VEGAS renders: the circle's radius is Size x the frame diagonal; the square has the circle's
-             * area; the rectangle is Size x the frame; the border (Border x half the frame width) is drawn inside the
-             * shape; the feather is a Gaussian edge (sigma = 0.1465 x Feather x half the width); repeats divide the frame
-             * into cells and scale the shape with them. */
-            float *q = v->prm;
-            const OfxParam *col = ofx_find(ps, np, "Color"), *cen = ofx_find(ps, np, "Center");
-            v->ip[0] = (int)ofx_get(ps, np, "Shape", 0); v->ip[1] = (int)ofx_get(ps, np, "Method", 0);
-            q[0] = (float)ofx_get(ps, np, "Size", 0.25); q[1] = (float)ofx_get(ps, np, "Feather", 0); q[2] = (float)ofx_get(ps, np, "Border", 0);
-            q[3] = (float)ofx_get(ps, np, "RepeatX", 1); q[4] = (float)ofx_get(ps, np, "RepeatY", 1);
-            q[5] = cen && cen->nv >= 2 ? (float)cen->v[0] : 0.5f; q[6] = cen && cen->nv >= 2 ? (float)cen->v[1] : 0.5f;
-            for (int k = 0; k < 3; k++) q[7 + k] = col && col->nv >= 3 ? (float)col->v[k] : 0;
-            if (q[3] < 1) q[3] = 1;
-            if (q[4] < 1) q[4] = 1;
-            v->type = VFX_COOKIE;
-        } else if (ci_contains(id, ":colorcorrector") && !ci_contains(id, "secondary")) {
-            /* saturation around luma, then gain and offset; the colour wheels and gamma are not applied */
-            double sat = ofx_get(ps, np, "Saturation", 1), gain = ofx_get(ps, np, "Gain", 1), off = ofx_get(ps, np, "Offset", 0);
-            v->type = fabs(sat - 1) < 1e-6 && fabs(gain - 1) < 1e-6 && fabs(off) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
-            const double L[3] = { 0.299, 0.587, 0.114 };
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) v->mtx[i * 4 + j] = (float)(gain * ((1 - sat) * L[j] + (i == j ? sat : 0)));
-                v->mtx[i * 4 + 3] = (float)off;
-            }
-        } else if (ci_contains(id, ":colorbalance")) {
-            double r = ofx_get(ps, np, "Red", 0), g = ofx_get(ps, np, "Green", 0), bb = ofx_get(ps, np, "Blue", 0);
-            v->type = fabs(r) + fabs(g) + fabs(bb) < 1e-6 ? VFX_NOOP : VFX_COLORCORR;
-            for (int i = 0; i < 12; i++) v->mtx[i] = i % 5 == 0 ? 1.0f : 0.0f;
-            v->mtx[3] = (float)(r * 0.5); v->mtx[7] = (float)(g * 0.5); v->mtx[11] = (float)(bb * 0.5);   /* scale guessed */
-        } else {
-            v->type = VFX_UNKNOWN;
-        }
+        ofx_effect(v, id, ps, np);
     } else {
         uint32_t n = bl >= 0x38 ? rd32(b + 0x34) : 0;
         char preset[128] = "";
@@ -615,6 +634,36 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
                     v->mtx[o * 4 + 3] = (float)(row[3] / norm);
                 }
             } else v->type = VFX_UNKNOWN;
+        } else if (!strcmp(plug, FX_COOKIE_GUID)) {
+            /* floats: centre x, y, six values (zero in the projects seen; feather/border/colour not mapped), 1.0,
+             * repeats x, y (u32), shape (u32, as the OFX one), u32, keep-inside flag (u32: 1 = Method 0), size. VEGAS 11
+             * converts these to the OFX Cookie Cutter with the same numbers (checked on a project saved by both). */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            v->type = VFX_UNKNOWN;
+            if (pp && pl >= 60) {
+                float *q = v->prm;
+                q[0] = rdf(pp + 56); q[1] = 0; q[2] = 0;
+                q[3] = (float)rd32(pp + 36); q[4] = (float)rd32(pp + 40);
+                q[5] = rdf(pp); q[6] = rdf(pp + 4);
+                v->ip[0] = (int)rd32(pp + 44); v->ip[1] = rd32(pp + 52) ? 0 : 1;
+                if (q[3] < 1 || q[3] > 100) q[3] = 1;
+                if (q[4] < 1 || q[4] > 100) q[4] = 1;
+                if (v->ip[0] < 0 || v->ip[0] > 6) v->ip[0] = 0;
+                if (q[0] >= 0 && q[0] <= 10) v->type = VFX_COOKIE;
+            }
+        } else if (!strcmp(plug, FX_GBLUR_GUID)) {
+            /* double horizontal range, u32 x 4 (channels R, G, B, A), double vertical range: as the OFX Gaussian Blur */
+            size_t pl;
+            const uint8_t *pp = dxt_params(b, bl, &pl);
+            v->type = VFX_UNKNOWN;
+            if (pp && pl >= 32) {
+                double h = rdd(pp), vv = rdd(pp + 24);
+                if (h >= 0 && h <= 10 && vv >= 0 && vv <= 10) {
+                    v->type = h > 0 || vv > 0 ? VFX_GAUSSBLUR : VFX_NOOP;
+                    v->a = h; v->b = vv;
+                }
+            }
         } else if (!strcmp(plug, FX_THRESH_GUID)) {
             /* a float after the preset name (0..1), repeated in the keyframe (u32 4 + float): each channel becomes 1
              * where value >= threshold, else 0 (exact against VEGAS renders of the 25..75 % presets) */
@@ -702,7 +751,167 @@ static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
     if (v->amount < 0) v->amount = 0;
     if (v->amount > 1) v->amount = 1;
     if (v->type == VFX_NOOP) return;
-    if (v->type == VFX_UNKNOWN) { s->p->n_unknown_vfx++; note_unknown(s, v->name); }
+    if (v->type == VFX_UNKNOWN && top) { s->p->n_unknown_vfx++; note_unknown(s, v->name); }
+}
+
+/* ------------------------------------------------------------------ animated effects */
+
+static double key_shape(int k, double u)
+{
+    switch (k) {
+    case VEG_KEY_FAST:   return veg_fade_shape(VEG_CURVE_FAST, u);
+    case VEG_KEY_SLOW:   return veg_fade_shape(VEG_CURVE_SLOW, u);
+    case VEG_KEY_SMOOTH: return veg_fade_shape(VEG_CURVE_SMOOTH, u);
+    case VEG_KEY_SHARP:  return veg_fade_shape(VEG_CURVE_SHARP, u);
+    case VEG_KEY_HOLD:   return 0;
+    default:             return u;
+    }
+}
+
+static VegVfxKeys *keys_new(int n)
+{
+    VegVfxKeys *k = calloc(1, sizeof *k);
+    if (!k) return NULL;
+    k->t = calloc((size_t)n, sizeof(double)); k->curve = calloc((size_t)n, sizeof(int)); k->v = calloc((size_t)n, sizeof(VegVfx));
+    if (!k->t || !k->curve || !k->v) { free(k->t); free(k->curve); free(k->v); free(k); return NULL; }
+    k->n = n;
+    return k;
+}
+
+/* Legacy (DXT) effect keyframes: after the static block, one block per keyframe: u32 28, i64 time (100 ns from the
+ * event's start), u32 type (as Pan/Crop's), ..., u32 length @0x18, then a full copy of the parameters. Each copy is
+ * read like the effect itself. */
+static void dxt_keys(St *s, const uint8_t *b, size_t bl, VegVfx *v)
+{
+    uint32_t nn = rd32(b + 0x34);
+    if (nn >= 400 || 0x38 + nn > bl) return;
+    size_t q = 0x38 + nn, k0 = 0;
+    uint32_t S = 0;
+    for (size_t k = q + 4; k + 0x1c <= bl; k += 4)
+        if (rd32(b + k) == 0x1c) { uint32_t L = rd32(b + k + 0x18); if (L >= 4 && L <= 4096 && k + 0x1c + L <= bl && (L == k - q || k - q < 32)) { k0 = k; S = L; break; } }
+    if (!k0) return;
+    int n = 0;
+    for (size_t k = k0; k + 0x1c + S <= bl && rd32(b + k) == 0x1c && rd32(b + k + 0x18) == S && n < 64; k += 0x1c + S) n++;
+    if (n < 2) return;
+    VegVfxKeys *K = keys_new(n);
+    uint8_t *buf = malloc(q + S);
+    if (!K || !buf) { free(buf); if (K) { free(K->t); free(K->curve); free(K->v); free(K); } return; }
+    memcpy(buf, b, q);
+    size_t k = k0;
+    for (int i = 0; i < n; i++, k += 0x1c + S) {
+        K->t[i] = (double)(int64_t)rd64(b + k + 4) / 1e7;
+        K->curve[i] = veg_key_type(rd32(b + k + 12));
+        memcpy(buf + q, b + k + 0x1c, S);
+        parse_vfx_one(s, buf, q + S, &K->v[i], 0);
+    }
+    free(buf);
+    v->keys = K;
+}
+
+static float ofx_eval(const OfxParam *p, float t)
+{
+    if (t <= p->kt[0]) return p->kv[0];
+    for (int i = 0; i + 1 < p->nk; i++)
+        if (t <= p->kt[i + 1]) {
+            double span = p->kt[i + 1] - p->kt[i], u = span > 1e-9 ? (t - p->kt[i]) / span : 1;
+            u = key_shape(veg_key_type((uint32_t)(p->ki[i] > 0 ? p->ki[i] - 1 : 0)), u);
+            return (float)(p->kv[i] + (p->kv[i + 1] - p->kv[i]) * u);
+        }
+    return p->kv[p->nk - 1];
+}
+
+/* OFX keyframes are per parameter: a snapshot at every parameter's key time (times in frames until the project's
+ * frame rate is known, see veg_parse) */
+static void ofx_keys(const uint8_t *b, size_t bl, VegVfx *v)
+{
+    char id[200] = "";
+    OfxParam ps[48], tmp[48];
+    int np = ofx_params(b, bl, id, sizeof id, ps, 48);
+    float ts[64]; int nt = 0, curve0 = 0;
+    for (int i = 0; i < np; i++)
+        for (int k = 0; k < ps[i].nk; k++) {
+            int dup = 0;
+            for (int j = 0; j < nt; j++) if (fabsf(ts[j] - ps[i].kt[k]) < 1e-4f) dup = 1;
+            if (!dup && nt < 64) ts[nt++] = ps[i].kt[k];
+            if (!curve0 && ps[i].nk > 1) curve0 = ps[i].ki[0];
+        }
+    if (nt < 2) return;
+    for (int i = 1; i < nt; i++) for (int j = i; j > 0 && ts[j] < ts[j - 1]; j--) { float x = ts[j]; ts[j] = ts[j - 1]; ts[j - 1] = x; }
+    VegVfxKeys *K = keys_new(nt);
+    if (!K) return;
+    K->in_frames = 1;
+    for (int i = 0; i < nt; i++) {
+        memcpy(tmp, ps, sizeof(OfxParam) * (size_t)np);
+        int ty = curve0;
+        for (int j = 0; j < np; j++) if (tmp[j].nk) {
+            tmp[j].v[0] = ofx_eval(&ps[j], ts[i]);
+            for (int k = 0; k < ps[j].nk; k++) if (fabsf(ps[j].kt[k] - ts[i]) < 1e-4f) ty = ps[j].ki[k];
+        }
+        vfx_defaults(&K->v[i]);
+        ofx_effect(&K->v[i], id, tmp, np);
+        snprintf(K->v[i].name, sizeof K->v[i].name, "%s", id);
+        K->t[i] = ts[i];
+        K->curve[i] = veg_key_type((uint32_t)(ty > 0 ? ty - 1 : 0));
+    }
+    v->keys = K;
+}
+
+static void parse_vfx(St *s, const uint8_t *b, size_t bl, VegVfx *v)
+{
+    parse_vfx_one(s, b, bl, v, 1);
+    v->keys = NULL;
+    if (bl < 0x38) return;
+    char plug[37];
+    guid_str(b + 4, plug);
+    if (!strcmp(plug, FX_OFX_GUID)) ofx_keys(b, bl, v);
+    else dxt_keys(s, b, bl, v);
+    if (v->keys && v->type == VFX_NOOP)   /* still at its defaults at the start, animated later */
+        for (int i = 0; i < v->keys->n; i++) if (v->keys->v[i].type != VFX_NOOP && v->keys->v[i].type != VFX_UNKNOWN) { v->type = v->keys->v[i].type; break; }
+}
+
+static double lerpd(double a, double b, double u) { return a + (b - a) * u; }
+
+const VegVfx *veg_vfx_at(const VegVfx *v, double t, VegVfx *tmp)
+{
+    const VegVfxKeys *K = v->keys;
+    if (!K || K->n < 1) return v;
+    int i = 0;
+    if (t <= K->t[0]) { *tmp = K->v[0]; }
+    else if (t >= K->t[K->n - 1]) { *tmp = K->v[K->n - 1]; }
+    else {
+        while (i + 1 < K->n && t > K->t[i + 1]) i++;
+        const VegVfx *a = &K->v[i], *b = &K->v[i + 1];
+        double span = K->t[i + 1] - K->t[i], u = span > 1e-9 ? key_shape(K->curve[i], (t - K->t[i]) / span) : 1;
+        *tmp = *a;
+        if (a->type == VFX_NOOP || a->type == VFX_UNKNOWN) tmp->type = b->type;
+        tmp->amount = lerpd(a->amount, b->amount, u);
+        tmp->hue = lerpd(a->hue, b->hue, u); tmp->sat = lerpd(a->sat, b->sat, u); tmp->lum = lerpd(a->lum, b->lum, u);
+        tmp->bright = lerpd(a->bright, b->bright, u); tmp->contrast = lerpd(a->contrast, b->contrast, u);
+        tmp->a = lerpd(a->a, b->a, u); tmp->b = lerpd(a->b, b->b, u);
+        tmp->angle = lerpd(a->angle, b->angle, u); tmp->cx = lerpd(a->cx, b->cx, u); tmp->cy = lerpd(a->cy, b->cy, u);
+        for (int k = 0; k < 12; k++) tmp->mtx[k] = (float)lerpd(a->mtx[k], b->mtx[k], u);
+        for (int k = 0; k < 24; k++) tmp->prm[k] = (float)lerpd(a->prm[k], b->prm[k], u);
+        if (a->nstops == b->nstops)
+            for (int k = 0; k < a->nstops; k++) {
+                tmp->stop_pos[k] = (float)lerpd(a->stop_pos[k], b->stop_pos[k], u);
+                for (int c = 0; c < 3; c++) tmp->stop_rgb[k][c] = (float)lerpd(a->stop_rgb[k][c], b->stop_rgb[k][c], u);
+            }
+    }
+    tmp->keys = NULL;
+    tmp->lut = v->lut;
+    /* a blur or effect that fades to zero: nothing to draw */
+    if (tmp->type == VFX_GAUSSBLUR && tmp->a <= 0 && tmp->b <= 0) tmp->type = VFX_NOOP;
+    return tmp;
+}
+
+void veg_vfx_free_keys(VegVfx *v, int n)
+{
+    for (int i = 0; i < n; i++) {
+        VegVfxKeys *k = v[i].keys;
+        if (!k) continue;
+        free(k->t); free(k->curve); free(k->v); free(k);
+        v[i].keys = NULL;
+    }
 }
 
 /* ------------------------------------------------------------------ audio plug-in chain */
@@ -1110,6 +1319,18 @@ int veg_parse(const uint8_t *data, size_t len, VegProject *p, char *err, size_t 
     }
     if (!p->ntracks) { snprintf(err, errlen, "no tracks found - unsupported Vegas version?"); veg_free(p); return -1; }
     if (!p->fps) p->fps = 29.97;
+    /* OFX effect keyframe times are in frames */
+    for (int pass = 0; pass < 2; pass++) {
+        int n = pass ? p->ntracks : p->nevents;
+        for (int i = 0; i < n; i++) {
+            VegVfx *fx = pass ? p->tracks[i].vfx : p->events[i].vfx;
+            int nf = pass ? p->tracks[i].nvfx : p->events[i].nvfx;
+            for (int k = 0; k < nf; k++) if (fx[k].keys && fx[k].keys->in_frames) {
+                for (int j = 0; j < fx[k].keys->n; j++) fx[k].keys->t[j] /= p->fps;
+                fx[k].keys->in_frames = 0;
+            }
+        }
+    }
     if (!p->width) { p->width = 1280; p->height = 720; }
     if (!p->sample_rate) p->sample_rate = 48000;
 
@@ -1118,6 +1339,7 @@ int veg_parse(const uint8_t *data, size_t len, VegProject *p, char *err, size_t 
     for (int i = 0; i < p->nevents; i++) {
         VegEvent *e = &p->events[i];
         if (!e->has_take || e->length <= 0 || e->kind == VEG_KIND_OTHER) {
+            veg_vfx_free_keys(e->vfx, e->nvfx);
             free(e->pan); free(e->vfx); free(e->afx);
             continue;
         }
@@ -1189,8 +1411,8 @@ int veg_load_file(const char *path, VegProject *p, char *err, size_t errlen)
 
 void veg_free(VegProject *p)
 {
-    for (int i = 0; i < p->nevents; i++) { free(p->events[i].pan); free(p->events[i].vfx); free(p->events[i].afx); }
-    for (int t = 0; t < p->ntracks; t++) { free(p->tracks[t].vfx); free(p->tracks[t].afx); free(p->tracks[t].tmk); }
+    for (int i = 0; i < p->nevents; i++) { veg_vfx_free_keys(p->events[i].vfx, p->events[i].nvfx); free(p->events[i].pan); free(p->events[i].vfx); free(p->events[i].afx); }
+    for (int t = 0; t < p->ntracks; t++) { veg_vfx_free_keys(p->tracks[t].vfx, p->tracks[t].nvfx); free(p->tracks[t].vfx); free(p->tracks[t].afx); free(p->tracks[t].tmk); }
     free(p->events); free(p->tracks); free(p->media);
     memset(p, 0, sizeof *p);
 }

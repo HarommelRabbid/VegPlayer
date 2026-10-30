@@ -66,7 +66,16 @@ typedef struct {
     int nstops; float stop_pos[VFX_MAX_STOPS], stop_rgb[VFX_MAX_STOPS][3];   /* Gradient Map */
     int lut;                          /* player side: gradient texture slot (-1 = none) */
     float prm[24]; int ip[4];         /* the effects above from VFX_THRESHOLD on */
+    struct VegVfxKeys *keys;          /* animated: the effect's settings at each keyframe (NULL if not animated) */
 } VegVfx;
+
+/* an animated effect: n snapshots (keys[i] has the effect's settings at time t[i], seconds from the event's start; for
+ * track effects from the project's start) and the interpolation to the next one (VEG_KEY_*) */
+typedef struct VegVfxKeys { int n; double *t; int *curve; VegVfx *v; int in_frames; } VegVfxKeys;
+/* the effect at time t: v itself if it isn't animated, else the interpolated settings in *tmp */
+const VegVfx *veg_vfx_at(const VegVfx *v, double t, VegVfx *tmp);
+/* frees the keyframes of n effects (not the array) */
+void veg_vfx_free_keys(VegVfx *v, int n);
 
 /* track compositing modes (Vegas's CompositeMode order; the track compositing chunk @0x64) */
 enum {

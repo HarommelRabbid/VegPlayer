@@ -104,7 +104,7 @@ Text and noise generators are skipped (as asked). Solid-colour generators are dr
     whole event frame: the amount is relative to the frame and the blur spills past the picture's edges;
   - Swirl, Wave and Deform (each pixel's source position computed in the shader; Deform by a few Newton steps through
     its edge patch) and Cookie Cutter (all seven shapes, border, feather, cut-out, repeats).
-  One of the effects after the first list per layer (the first in the chain); a later HSL Adjust falls back to a
+  Effect settings can be animated (keyframes, with the keyframe types of Pan/Crop). One of the effects after the first list per layer (the first in the chain); a later HSL Adjust falls back to a
   colour-matrix approximation, the others are left out. All the effects in this list were fitted to VEGAS Pro renders
   of every preset (a test image per preset): within 1–2/255 on average, except tightly wound Swirls (3–5) and
   Cookie Cutter's Grate (about 6 px off, VEGAS rounds its cell size).
@@ -153,6 +153,8 @@ The format is reverse-engineered; these offsets came from comparing three Sparta
 | Vibrato plug-in | Sony Vibrato `d6802ba0`: i32 params: output gain (centi-dB), semitones x 100, modulation frequency (mHz), blend graph edges, point count, then (position ‰, height %) pairs; only `count` points are used, the pitch is 0 past the last one | checked against VEGAS renders of all system presets; output gain's unit assumed |
 | OFX effects | `1af0e4e6` with the OFX wrapper GUID: named parameters | solid for HSL Adjust, Cookie Cutter, Color Corrector (Secondary) (fitted to renders of their presets) |
 | Legacy Threshold / Deform / Swirl / Wave | `1af0e4e6`, GUIDs `c3062be8…` (float) / `f4205ab4…` (amount, u32 flag, -, -, shear x/y, squeeze t/b/l/r, curve t/b/l/r) / `b3a8c4cf…` (amount, centre x/y, scale x/y) / `ec1a2314…` (frequency x/y, amplitude x/y, phase x/y) | fitted to renders of every preset; Swirl's centre offset and Deform's two unused values not seen non-zero |
+| Legacy Cookie Cutter / Gaussian Blur (up to Vegas 10) | `1af0e4e6`, GUIDs `d76643c7…` (floats: centre x/y, six unmapped values, 1.0, repeats x/y, shape, -, keep-inside flag, size) / `1485b954…` (double h range, 4 channel flags, double v range) | checked against the same project re-saved by VEGAS Pro 11 (OFX, same numbers) |
+| Effect keyframes | legacy: after the static block, per keyframe u32 28, i64 time (100 ns), u32 type (Pan/Crop's numbering), length @0x18, then a full parameter copy; OFX: an animated value is double, u32 key count, then 52-byte keys (double time in frames, u32 type + 1, double value, 4 handle doubles) | both formats compared on a project saved by Vegas 10 and 11: the same values at every time; curve handles not used |
 | Legacy Invert / B&W | `1af0e4e6`, GUIDs `c3062be7…` / `e87674d5…` | solid |
 | Legacy HSL Adjust (up to Vegas 10) | `1af0e4e6`, GUID `b432972d…`: doubles add-to-hue, saturation, luminance (the keyframe copy) | checked against the same project re-saved by Vegas 11 (OFX HSL Adjust, same values); hue units assumed equal to the OFX ones |
 | Track compositing mode | `69d46c29` @0x64: Vegas's CompositeMode order (3D Source Alpha 0, Add 1, Subtract 2, Cut 3, Source Alpha 4, Multiply 5, Overlay 6, Screen 7, Hard Light 8, Dodge 9, Burn 10, Darken 11, Lighten 12, Difference 13, Difference Squared 14; Custom -1) | order from the scripting API; 4 is the default everywhere, which fits |
