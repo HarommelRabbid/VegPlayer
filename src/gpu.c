@@ -318,24 +318,34 @@ static const char FRAG_COOKIE_SRC[] = WARP_HEAD
     "    float2 cell = clamp(floor(l), float2(0.0f, 0.0f), uFx0.zw - 1.0f);\n"
     "    float2 cs = uFx0.xy / uFx0.zw;\n"
     "    float2 d = (l - cell - 0.5f) * cs;\n"
-    "    float R = uFx1.z, sh = uFx2.y, dist;\n"
+    "    float R = uFx1.z, sh = uFx2.y;\n"
     "    float2 a = abs(d);\n"
-    "    if (sh < 0.5f) dist = length(d) - R;\n"
-    "    else if (sh < 1.5f) dist = (length(d / float2(1.511f, 1.084f)) - R) * 1.084f;\n"
-    "    else if (sh < 2.5f) dist = (length(d / float2(1.084f, 1.511f)) - R) * 1.084f;\n"
-    "    else if (sh < 3.5f) dist = (max(a.x / cs.x, a.y / cs.y) - R) * min(cs.x, cs.y);\n"
-    "    else if (sh < 4.5f) dist = (a.x + a.y - R * 1.3445f) * 0.70710678f;\n"
-    "    else if (sh < 5.5f) dist = max(a.x, a.y) - R * 0.8862f;\n"
-    "    else dist = max(d.y, max(0.8660254f * d.x - 0.5f * d.y, -0.8660254f * d.x - 0.5f * d.y)) - R * 1.02715f;\n"
+    /* every shape's distance, then the chosen one picked arithmetically (no branches, no uninitialised variables) */
+    "    float d0 = length(d) - R;\n"
+    "    float d1 = (length(d / float2(1.511f, 1.084f)) - R) * 1.084f;\n"
+    "    float d2 = (length(d / float2(1.084f, 1.511f)) - R) * 1.084f;\n"
+    "    float d3 = (max(a.x / cs.x, a.y / cs.y) - R) * min(cs.x, cs.y);\n"
+    "    float d4 = (a.x + a.y - R * 1.3445f) * 0.70710678f;\n"
+    "    float d5 = max(a.x, a.y) - R * 0.8862f;\n"
+    "    float d6 = max(d.y, max(0.8660254f * d.x - 0.5f * d.y, -0.8660254f * d.x - 0.5f * d.y)) - R * 1.02715f;\n"
+    "    float dist = d0;\n"
+    "    dist = lerp(dist, d1, step(0.5f, sh));\n"
+    "    dist = lerp(dist, d2, step(1.5f, sh));\n"
+    "    dist = lerp(dist, d3, step(2.5f, sh));\n"
+    "    dist = lerp(dist, d4, step(3.5f, sh));\n"
+    "    dist = lerp(dist, d5, step(4.5f, sh));\n"
+    "    dist = lerp(dist, d6, step(5.5f, sh));\n"
     "    float k = 1.702f / uFx2.x;\n"
     "    float inner = 1.0f / (1.0f + exp(clamp((dist + uFx1.w) * k, -60.0f, 60.0f)));\n"
     "    float outer = 1.0f / (1.0f + exp(clamp(dist * k, -60.0f, 60.0f)));\n"
     "    float ring = saturate(outer - inner);\n"
     "    float4 p = float4(c.rgb, 1.0f);\n"
     "    float3 o = saturate(float3(dot(uMatR, p), dot(uMatG, p), dot(uMatB, p)));\n"
-    "    float al;\n"
-    "    if (uFx2.z < 0.5f) { al = outer; o = (o * inner + uFx3.rgb * ring) / max(outer, 0.0001f); }\n"
-    "    else { al = 1.0f - inner; o = (o * (1.0f - outer) + uFx3.rgb * ring) / max(al, 0.0001f); }\n"
+    "    float cut = step(0.5f, uFx2.z);\n"
+    "    float al = lerp(outer, 1.0f - inner, cut);\n"
+    "    float3 keep = (o * inner + uFx3.rgb * ring) / max(outer, 0.0001f);\n"
+    "    float3 hole = (o * (1.0f - outer) + uFx3.rgb * ring) / max(1.0f - inner, 0.0001f);\n"
+    "    o = lerp(keep, hole, cut);\n"
     "    return float4(saturate(o), c.a * al) * uTint;\n"
     "}\n";
 
@@ -351,7 +361,7 @@ static const char FRAG_RADIAL_SRC[] = WARP_HEAD
     "    float4 c = tex2D(tex, t);\n"
     WARP_TAIL;
 
-#define SHADER_VERSION 5   /* bump when a shader's source changes (new shaders just get compiled once) */
+#define SHADER_VERSION 6   /* bump when a shader's source changes (new shaders just get compiled once) */
 
 typedef struct {
     const char *name, *src;
